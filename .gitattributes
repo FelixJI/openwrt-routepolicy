@@ -1,0 +1,2 @@
+# OpenWrt shell/ucode files must retain Unix line endings on every platform.
+* text=auto eol=lf

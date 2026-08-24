@@ -1,0 +1,63 @@
+#!/bin/sh
+
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+tmp=$(mktemp "${TMPDIR:-/tmp}/routepolicy-validate.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+
+errors=0
+{
+	[ -f "$RP_UCI_CONFIG" ] || { rp_err "配置文件不存在: $RP_UCI_CONFIG"; errors=$((errors + 1)); }
+	if [ "$errors" -eq 0 ]; then
+		uci -q show routepolicy >/dev/null 2>&1 || { rp_err 'UCI 配置无法加载'; errors=$((errors + 1)); }
+	fi
+	rp_validate_main || errors=$((errors + 1))
+	rp_validate_sources || errors=$((errors + 1))
+
+	for mapping in \
+		'domain-policy:plain-domain' 'domain-default:plain-domain' \
+		'ipv4-policy:plain-ipv4' 'ipv4-default:plain-ipv4'; do
+		name=${mapping%%:*}
+		format=${mapping#*:}
+		file="$RP_USER_DIR/$name.list"
+		[ -e "$file" ] || continue
+		[ -f "$file" ] && [ ! -L "$file" ] || { rp_err "$file 必须是普通文件且不能是符号链接"; errors=$((errors + 1)); continue; }
+		[ -s "$file" ] || continue
+		ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$format" "$file" >/dev/null 2>&1 || { rp_err "$file 包含非法条目或没有可用条目"; errors=$((errors + 1)); }
+	done
+
+	lan=$(rp_uci_get main lan_interface '')
+	default_if=$(rp_uci_get main default_interface '')
+	policy_if=$(rp_uci_get main policy_interface '')
+	for iface in "$lan" "$default_if" "$policy_if"; do
+		rp_interface_json "$iface" >/dev/null 2>&1 || { rp_err "逻辑接口不存在或 ubus 不可用: $iface"; errors=$((errors + 1)); }
+	done
+
+	mark=$(rp_uci_get main mark 0x100)
+	mask=$(rp_uci_get main mark_mask 0x100)
+	table=$(rp_uci_get main route_table 200)
+	priority=$(rp_uci_get main rule_priority 12000)
+	if rp_is_hex32 "$mark" && rp_is_hex32 "$mask" && rp_is_uint "$table" && rp_is_uint "$priority"; then
+		old_mark=$(rp_state_get mark 2>/dev/null) || old_mark=
+		old_mask=$(rp_state_get mark_mask 2>/dev/null) || old_mask=
+		old_priority=$(rp_state_get rule_priority 2>/dev/null) || old_priority=
+		old_table=$(rp_state_get route_table 2>/dev/null) || old_table=
+		if rp_is_hex32 "$old_mark" && rp_is_hex32 "$old_mask" && rp_is_uint "$old_priority" && rp_is_uint "$old_table"; then
+			conflicts=$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table" "$old_mark" "$old_mask" "$old_priority" "$old_table")
+		else
+			conflicts=$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table")
+		fi
+		[ -z "$conflicts" ] || { rp_err "mark/mask 与其他 ip rule 冲突: $conflicts"; errors=$((errors + 1)); }
+	fi
+} 2>"$tmp"
+
+if [ "$errors" -eq 0 ]; then
+	rp_output_ok validate '配置与输入校验通过'
+	exit 0
+fi
+details=$(sed ':a;N;$!ba;s/\n/; /g' "$tmp" 2>/dev/null)
+[ -n "$details" ] || details='配置校验失败'
+rp_output_error validate "$details"
+exit 1

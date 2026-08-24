@@ -1,0 +1,38 @@
+{
+  "admin/services/routepolicy": {
+    "title": "路由策略",
+    "order": 60,
+    "action": { "type": "firstchild" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
+  "admin/services/routepolicy/status": {
+    "title": "运行状态",
+    "order": 10,
+    "action": { "type": "view", "path": "routepolicy/status" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
+  "admin/services/routepolicy/settings": {
+    "title": "基础设置",
+    "order": 20,
+    "action": { "type": "view", "path": "routepolicy/settings" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
+  "admin/services/routepolicy/sources": {
+    "title": "清单来源",
+    "order": 30,
+    "action": { "type": "view", "path": "routepolicy/sources" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
+  "admin/services/routepolicy/rules": {
+    "title": "人工规则",
+    "order": 40,
+    "action": { "type": "view", "path": "routepolicy/rules" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
+  "admin/services/routepolicy/diagnostics": {
+    "title": "诊断与迁移",
+    "order": 50,
+    "action": { "type": "view", "path": "routepolicy/diagnostics" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  }
+}

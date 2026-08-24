@@ -1,0 +1,92 @@
+name: Build OpenWrt packages
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+# 同一分支的新提交应替代已过时的构建，节省 SDK 编译时间。
+concurrency:
+  group: routepolicy-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_VERSION: 25.12.0
+  OPENWRT_TARGET: x86-64
+  OPENWRT_SDK_ARCHIVE: openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  OPENWRT_SDK_BASE: https://downloads.openwrt.org/releases/25.12.0/targets/x86/64
+
+jobs:
+  static:
+    name: Static checks
+    runs-on: ubuntu-24.04
+    steps:
+      # 官方 actions 使用稳定主版本；其余步骤均为 runner 内置命令，减少供应链面。
+      - uses: actions/checkout@v4
+      - name: Install offline check tools
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Check shell, ucode and JavaScript
+        run: sh tests/ci/static-checks.sh
+      - name: Run package contract tests
+        run: sh tests/ci/package-contract-tests.sh
+      - name: Run converter and core unit tests
+        run: |
+          sh tests/converters/run.sh
+          sh tests/core/run.sh
+      - name: Run LuCI static contract tests
+        run: pwsh -File tests/luci/check-static.ps1
+      - name: Parse workflow YAML
+        run: sh tests/ci/validate-workflows.sh
+
+  sdk-build:
+    name: OpenWrt 25.12 x86_64 SDK build
+    runs-on: ubuntu-24.04
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SDK extractor
+        run: sudo apt-get update && sudo apt-get install --yes zstd
+      - name: Download and verify fixed OpenWrt SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --output sdk.tar.zst "$OPENWRT_SDK_BASE/$OPENWRT_SDK_ARCHIVE"
+          curl --fail --location --retry 3 --output sha256sums "$OPENWRT_SDK_BASE/sha256sums"
+          awk -v file="$OPENWRT_SDK_ARCHIVE" '$2 == file || $2 == "*" file { print; found = 1 } END { exit !found }' sha256sums | sha256sum --check --status
+          tar --use-compress-program=unzstd -xf sdk.tar.zst
+          mv "${OPENWRT_SDK_ARCHIVE%.tar.zst}" sdk
+      - name: Install official release feeds
+        working-directory: sdk
+        run: |
+          set -eu
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+      - name: Build routepolicy and LuCI APKs
+        working-directory: sdk
+        run: |
+          set -eu
+          cp -a ../routepolicy package/routepolicy
+          cp -a ../luci-app-routepolicy package/luci-app-routepolicy
+          make defconfig
+          printf '%s\n' 'CONFIG_PACKAGE_routepolicy=m' 'CONFIG_PACKAGE_luci-app-routepolicy=m' >> .config
+          make defconfig
+          make package/ucode/host/compile V=s
+          staging_dir/host/bin/ucode -c ../luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
+          make package/routepolicy/compile package/luci-app-routepolicy/compile V=s -j"$(nproc)"
+          make package/index V=s
+      - name: Collect release files
+        run: |
+          set -eu
+          OPENWRT_SDK_VERSION="$OPENWRT_VERSION" GITHUB_SHA="$(git rev-parse HEAD)" sh scripts/ci/prepare-release.sh sdk release-assets
+      - name: Upload APK and package index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-25.12-x86_64-apks
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14

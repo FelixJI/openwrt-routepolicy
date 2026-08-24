@@ -1,0 +1,47 @@
+#!/bin/sh
+
+set -eu
+
+LIBEXEC="${ROUTEPOLICY_LIBEXEC:-/usr/libexec/routepolicy}"
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollback} [--json]
+       routepolicyctl import-legacy DIRECTORY [--json]
+       routepolicyctl user-list {read|write} {domain-policy|domain-default|ipv4-policy|ipv4-default} [--json]
+EOF
+	exit 2
+}
+
+[ "$#" -ge 1 ] || usage
+command_name=$1
+shift
+
+case "$command_name" in
+	validate|render|apply|reload|status|diagnose|update|rollback)
+		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then
+			export ROUTEPOLICY_OUTPUT=json
+		elif [ "$#" -ne 0 ]; then
+			usage
+		fi
+		[ "$command_name" = reload ] && command_name=apply
+		exec "$LIBEXEC/$command_name"
+		;;
+	import-legacy)
+		if [ "$#" -eq 2 ] && [ "$2" = --json ]; then
+			export ROUTEPOLICY_OUTPUT=json
+		elif [ "$#" -ne 1 ]; then
+			usage
+		fi
+		exec "$LIBEXEC/import-legacy" "$1"
+		;;
+	user-list)
+		if [ "$#" -eq 3 ] && [ "$3" = --json ]; then
+			export ROUTEPOLICY_OUTPUT=json
+		elif [ "$#" -ne 2 ]; then
+			usage
+		fi
+		exec "$LIBEXEC/user-list" "$1" "$2"
+		;;
+	*) usage ;;
+esac

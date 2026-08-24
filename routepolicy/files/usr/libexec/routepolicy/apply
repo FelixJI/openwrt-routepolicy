@@ -1,0 +1,282 @@
+#!/bin/sh
+
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+mode=${1:-apply}
+case "$mode" in apply|teardown) ;; *) rp_die '内部 apply 模式非法' ;; esac
+
+remove_owned_rule() {
+	priority=$1 mark=$2 mask=$3 table=$4
+	ip -4 rule del priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || true
+}
+
+if [ "$mode" = teardown ]; then
+	rp_ensure_dirs
+	if [ "$(rp_uci_get main warm_restore 1)" = 1 ] && nft list table inet routepolicy >/dev/null 2>&1; then
+		"$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
+	fi
+	# Stop must remove what was actually applied, even when UCI identifiers were
+	# edited at the same time as enabled=0. Without a complete valid ownership
+	# record, never guess and flush a possibly user-owned policy table.
+	table=$(rp_state_get route_table 2>/dev/null) || table=
+	priority=$(rp_state_get rule_priority 2>/dev/null) || priority=
+	mark=$(rp_state_get mark 2>/dev/null) || mark=
+	mask=$(rp_state_get mark_mask 2>/dev/null) || mask=
+	state_present=0
+	if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ]; then state_present=1; fi
+	have_applied=1
+	if ! rp_uint_between "$table" 1 252 || ! rp_uint_between "$priority" 1 32765 || \
+		! rp_is_mark_bit "$mark" || ! rp_is_mark_bit "$mask" || [ "$mark" != "$mask" ]; then
+		have_applied=0
+	fi
+	smartdns_backup="$RP_SMARTDNS_FILE.teardown.$$"
+	if [ -e "$RP_SMARTDNS_FILE" ]; then
+		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
+		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
+		mv "$RP_SMARTDNS_FILE" "$smartdns_backup" || { rp_output_error apply '无法暂存 SmartDNS 片段'; exit 1; }
+		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1; then
+			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
+			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+			rp_output_error apply 'SmartDNS 重载失败；已恢复原片段且未拆除策略规则'
+			exit 1
+		fi
+	fi
+	cleanup_failed=
+	if [ "$have_applied" -eq 1 ]; then
+		remove_owned_rule "$priority" "$mark" "$mask" "$table"
+		if rules_after=$(ip -4 rule show 2>/dev/null); then
+			if printf '%s\n' "$rules_after" | awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" \
+				'$1==p && index($0,m)>0 && ($0~("lookup "t"([[:space:]]|$)")||$0~("table "t"([[:space:]]|$)")){found=1} END{exit !found}'; then
+				cleanup_failed='无法删除已应用的策略 ip rule'
+			fi
+		else
+			cleanup_failed='无法验证策略 ip rule 是否已删除'
+		fi
+		ip -4 route flush table "$table" >/dev/null 2>&1 || true
+		if routes_after=$(ip -4 route show table "$table" 2>/dev/null); then
+			[ -z "$routes_after" ] || cleanup_failed="${cleanup_failed:+$cleanup_failed；}策略路由表仍有残留"
+		else
+			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法验证策略路由表是否已清空"
+		fi
+	fi
+	if ! nft delete table inet routepolicy >/dev/null 2>&1; then
+		if nft list table inet routepolicy >/dev/null 2>&1; then
+			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法删除 routepolicy nft 表"
+		elif ! nft list tables >/dev/null 2>&1; then
+			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法验证 routepolicy nft 表是否已删除"
+		fi
+	fi
+	rm -f "$smartdns_backup"
+	if [ -n "$cleanup_failed" ]; then
+		rp_output_error apply "$cleanup_failed；已保留 applied 状态供下次精确清理"
+		exit 1
+	fi
+	if [ "$have_applied" -eq 0 ] && [ "$state_present" -eq 1 ]; then
+		rp_output_error apply 'applied 状态不完整或不合法；未猜测清理任何策略路由表，且已保留状态供人工诊断'
+		exit 1
+	fi
+	[ "$have_applied" -eq 0 ] || rm -f "$RP_STATE_DIR/applied"
+	rp_output_ok apply '已删除 routepolicy 自有表、规则、路由和 SmartDNS 片段'
+	exit 0
+fi
+
+validation=$(ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" 2>&1)
+if [ "$?" -ne 0 ]; then
+	rp_output_error apply "应用前校验失败: $validation"
+	exit 1
+fi
+
+enabled=$(rp_uci_get main enabled 0)
+if [ "$enabled" != 1 ]; then
+	rp_output_error apply 'routepolicy.main.enabled 仍为 0；未改变系统状态'
+	exit 1
+fi
+
+rp_ensure_dirs
+lock="$RP_RUN_DIR/apply.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+	rp_output_error apply '另一个应用操作正在进行'
+	exit 1
+fi
+work=$(mktemp -d "$RP_RUN_DIR/apply.XXXXXX") || { rmdir "$lock"; exit 1; }
+cleanup() { rm -rf "$work"; rmdir "$lock" 2>/dev/null || true; }
+trap cleanup EXIT HUP INT TERM
+
+old_table=$(rp_state_get route_table 2>/dev/null) || old_table=
+old_priority=$(rp_state_get rule_priority 2>/dev/null) || old_priority=
+old_mark=$(rp_state_get mark 2>/dev/null) || old_mark=
+old_mask=$(rp_state_get mark_mask 2>/dev/null) || old_mask=
+old_policy_device=$(rp_state_get policy_device 2>/dev/null) || old_policy_device=
+old_policy_cidr=$(rp_state_get policy_cidr 2>/dev/null) || old_policy_cidr=
+
+if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/render" >"$work/render.log" 2>&1; then
+	rp_output_error apply "候选配置生成失败: $(tr '\n' ';' <"$work/render.log")"
+	exit 1
+fi
+
+incremental=1
+for object in \
+	'set domain_policy4' 'set domain_default4' 'set static_policy4' 'set static_default4' 'chain classify'; do
+	type=${object%% *}; name=${object#* }
+	nft "list" "$type" inet routepolicy "$name" >/dev/null 2>&1 || incremental=0
+done
+if [ "$incremental" -eq 1 ]; then
+	candidate="$RP_RUN_DIR/update.nft"
+else
+	if nft list table inet routepolicy >"$work/nft.previous" 2>/dev/null; then
+		{ printf 'delete table inet routepolicy\n'; cat "$RP_NFT_FILE"; } >"$work/nft.full"
+		candidate="$work/nft.full"
+	else
+		: >"$work/nft.previous.absent"
+		candidate="$RP_NFT_FILE"
+	fi
+fi
+
+if ! nft -c -f "$candidate" >"$work/nft-check.log" 2>&1; then
+	rp_output_error apply "nft 候选语法检查失败: $(tr '\n' ';' <"$work/nft-check.log")"
+	exit 1
+fi
+
+table=$(rp_uci_get main route_table 200)
+priority=$(rp_uci_get main rule_priority 12000)
+mark=$(rp_uci_get main mark 0x100)
+mask=$(rp_uci_get main mark_mask 0x100)
+strict=$(rp_uci_get main strict_enforcement 1)
+policy_if=$(rp_uci_get main policy_interface usbwan)
+policy_device=$(rp_interface_device "$policy_if" 2>/dev/null) || policy_device=
+policy_gateway=$(rp_interface_gateway "$policy_if" 2>/dev/null) || policy_gateway=
+policy_address=$(rp_interface_address "$policy_if" 2>/dev/null) || policy_address=
+policy_prefix=$(rp_interface_prefix "$policy_if" 2>/dev/null) || policy_prefix=
+policy_cidr=
+
+ip -4 route show table "$table" >"$work/routes.previous" 2>/dev/null || : >"$work/routes.previous"
+ip -4 rule show >"$work/rules.previous" 2>/dev/null || : >"$work/rules.previous"
+if nft list table inet routepolicy >"$work/nft.previous" 2>/dev/null; then :; else : >"$work/nft.previous.absent"; fi
+if [ -e "$RP_SMARTDNS_FILE" ]; then
+	[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply '现有 SmartDNS 片段不是安全的普通文件'; exit 1; }
+	cp "$RP_SMARTDNS_FILE" "$work/smartdns.previous"
+else
+	: >"$work/smartdns.previous.absent"
+fi
+
+restore_previous() {
+	if [ -s "$work/nft.previous" ]; then
+		{ printf 'delete table inet routepolicy\n'; cat "$work/nft.previous"; } >"$work/nft.restore"
+		nft -f "$work/nft.restore" >/dev/null 2>&1 || true
+	else
+		nft delete table inet routepolicy >/dev/null 2>&1 || true
+	fi
+	ip -4 route flush table "$table" >/dev/null 2>&1 || true
+	while IFS= read -r route; do
+		[ -n "$route" ] || continue
+		set -f
+		# Kernel-produced tokens are passed as argv; no eval or shell reparse occurs.
+		set -- $route
+		ip -4 route add table "$table" "$@" >/dev/null 2>&1 || true
+	done <"$work/routes.previous"
+	remove_owned_rule "$priority" "$mark" "$mask" "$table"
+	previous_owned=$(awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" '$1==p && index($0,m)>0 && ($0~("lookup "t"([[:space:]]|$)")||$0~("table "t"([[:space:]]|$)")){print;exit}' "$work/rules.previous")
+	[ -z "$previous_owned" ] || ip -4 rule add priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || true
+	if [ -f "$work/smartdns.previous" ]; then
+		mkdir -p "$(dirname "$RP_SMARTDNS_FILE")"
+		cp "$work/smartdns.previous" "$RP_SMARTDNS_FILE"
+	else
+		rm -f "$RP_SMARTDNS_FILE"
+	fi
+}
+
+failed=
+if ! nft -f "$candidate" >"$work/nft-apply.log" 2>&1; then
+	failed="nft 原子事务失败: $(tr '\n' ';' <"$work/nft-apply.log")"
+fi
+
+if [ -z "$failed" ] && [ "$incremental" -eq 0 ] && [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
+	if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
+		printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
+	fi
+fi
+
+if [ -z "$failed" ]; then
+	if ! ip -4 rule show | awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" '$1==p&&index($0,m)>0&&($0~("lookup "t"([[:space:]]|$)")||$0~("table "t"([[:space:]]|$)")){found=1} END{exit !found}'; then
+		ip -4 rule add priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || failed='无法安装策略 ip rule'
+	fi
+fi
+if [ -z "$failed" ]; then
+	if [ "$strict" = 1 ]; then
+		ip -4 route replace blackhole default table "$table" metric 32760 >/dev/null 2>&1 || failed='无法安装严格阻断 blackhole default'
+	else
+		ip -4 route del blackhole default table "$table" metric 32760 >/dev/null 2>&1 || true
+	fi
+fi
+if [ -z "$failed" ]; then
+	ip -4 route del table "$table" default metric 10 >/dev/null 2>&1 || true
+	if [ "$old_table" = "$table" ] && rp_is_device "$old_policy_device" && printf '%s\n' "$old_policy_cidr" | grep -Eq '^[0-9.]+/[0-9]+$'; then
+		ip -4 route del table "$table" "$old_policy_cidr" dev "$old_policy_device" metric 10 >/dev/null 2>&1 || true
+	fi
+	if rp_interface_up "$policy_if" && rp_is_device "$policy_device"; then
+		if rp_is_ipv4 "$policy_address" && rp_uint_between "$policy_prefix" 0 32; then
+			policy_cidr=$(rp_network_cidr "$policy_address" "$policy_prefix")
+			ip -4 route replace table "$table" "$policy_cidr" dev "$policy_device" scope link src "$policy_address" metric 10 >/dev/null 2>&1 || failed='无法安装策略接口直连路由'
+		else
+			failed='策略接口在线但缺少合法 IPv4 地址/前缀'
+		fi
+		if [ -z "$failed" ] && [ -n "$policy_gateway" ]; then
+			rp_is_ipv4 "$policy_gateway" || failed='策略接口网关不是合法 IPv4 地址'
+			[ -n "$failed" ] || ip -4 route replace table "$table" default via "$policy_gateway" dev "$policy_device" metric 10 >/dev/null 2>&1 || failed='无法安装策略接口默认路由'
+		elif [ -z "$failed" ]; then
+			ip -4 route replace table "$table" default dev "$policy_device" metric 10 >/dev/null 2>&1 || failed='无法安装无网关策略默认路由'
+		fi
+	fi
+fi
+
+smartdns_enabled=$(rp_uci_get main smartdns_enabled 1)
+smartdns_changed=0
+if [ -z "$failed" ] && [ "$smartdns_enabled" = 1 ]; then
+	mkdir -p "$(dirname "$RP_SMARTDNS_FILE")"
+	if [ -e "$RP_SMARTDNS_FILE" ] && { [ ! -f "$RP_SMARTDNS_FILE" ] || [ -L "$RP_SMARTDNS_FILE" ]; }; then
+		failed='SmartDNS 目标片段不是安全的普通文件'
+	else
+		cp "$RP_RUN_DIR/90-routepolicy.conf" "$RP_SMARTDNS_FILE.new" && chmod 0644 "$RP_SMARTDNS_FILE.new" && mv -f "$RP_SMARTDNS_FILE.new" "$RP_SMARTDNS_FILE" || failed='无法原子安装 SmartDNS 片段'
+		[ -n "$failed" ] || smartdns_changed=1
+	fi
+else
+	if [ -z "$failed" ] && [ -e "$RP_SMARTDNS_FILE" ]; then
+		rm -f "$RP_SMARTDNS_FILE" && smartdns_changed=1 || failed='无法删除 SmartDNS 适配片段'
+	fi
+fi
+
+if [ -z "$failed" ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
+	if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
+		"$RP_ROOT/etc/init.d/smartdns" reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
+	fi
+fi
+
+if [ -n "$failed" ]; then
+	restore_previous
+	[ -x "$RP_ROOT/etc/init.d/smartdns" ] && "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+	rp_output_error apply "$failed；已尝试恢复应用前状态"
+	exit 1
+fi
+
+if rp_is_uint "$old_table" && rp_is_uint "$old_priority" && rp_is_hex32 "$old_mark" && rp_is_hex32 "$old_mask"; then
+	if [ "$old_priority:$old_mark:$old_mask:$old_table" != "$priority:$mark:$mask:$table" ]; then
+		remove_owned_rule "$old_priority" "$old_mark" "$old_mask" "$old_table"
+	fi
+	if [ "$old_table" != "$table" ]; then ip -4 route flush table "$old_table" >/dev/null 2>&1 || true; fi
+fi
+
+umask 077
+cat >"$RP_STATE_DIR/applied" <<EOF
+schema=$RP_SCHEMA_VERSION
+route_table=$table
+rule_priority=$priority
+mark=$mark
+mark_mask=$mask
+policy_interface=$policy_if
+policy_device=$policy_device
+policy_cidr=$policy_cidr
+EOF
+date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-apply"
+rp_output_ok apply "已应用；nft 使用$([ "$incremental" -eq 1 ] && printf '增量事务并保留动态集合' || printf '完整原子事务')"

@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+rp_ensure_dirs
+[ -d "$RP_MANAGED_PREVIOUS" ] && [ -n "$(find "$RP_MANAGED_PREVIOUS" -type f -name '*.list' -print -quit 2>/dev/null)" ] || { rp_output_error rollback '没有可回滚的 previous 清单'; exit 1; }
+lock="$RP_RUN_DIR/update.lock"
+mkdir "$lock" 2>/dev/null || { rp_output_error rollback '更新或回滚操作正在进行'; exit 1; }
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
+swap="$RP_ETC/managed.d/swap.$$"
+mv "$RP_MANAGED_CURRENT" "$swap" && mv "$RP_MANAGED_PREVIOUS" "$RP_MANAGED_CURRENT" && mv "$swap" "$RP_MANAGED_PREVIOUS" || { rp_output_error rollback '目录原子交换失败'; exit 1; }
+if [ "$(rp_uci_get main enabled 0)" = 1 ] && ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply" >/dev/null 2>&1; then
+	mv "$RP_MANAGED_CURRENT" "$swap" && mv "$RP_MANAGED_PREVIOUS" "$RP_MANAGED_CURRENT" && mv "$swap" "$RP_MANAGED_PREVIOUS" || true
+	ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply" >/dev/null 2>&1 || true
+	rp_output_error rollback 'previous 应用失败，已恢复回滚前清单'
+	exit 1
+fi
+date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-rollback"
+rp_output_ok rollback '已将 previous 与 current 交换并应用'

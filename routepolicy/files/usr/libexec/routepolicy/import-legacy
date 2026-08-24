@@ -1,0 +1,124 @@
+#!/bin/sh
+
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+[ "$#" -eq 1 ] || { rp_output_error import-legacy '必须提供旧目录'; exit 2; }
+legacy=$1
+case "$legacy" in /*) ;; *) rp_output_error import-legacy '旧目录必须是绝对路径'; exit 1 ;; esac
+[ -d "$legacy" ] && [ ! -L "$legacy" ] || { rp_output_error import-legacy '旧路径必须是非符号链接目录'; exit 1; }
+
+rp_ensure_dirs
+marker="$RP_ETC/.legacy-imported"
+report_target="$RP_STATE_DIR/legacy-import-report.json"
+for protected in "$marker" "$report_target"; do
+	if [ -e "$protected" ] && { [ ! -f "$protected" ] || [ -L "$protected" ]; }; then
+		rp_output_error import-legacy "导入目标不是安全的普通文件: $protected"
+		exit 1
+	fi
+done
+lock="$RP_RUN_DIR/import.lock"
+mkdir "$lock" 2>/dev/null || { rp_output_error import-legacy '另一个导入正在进行'; exit 1; }
+work=$(mktemp -d "$RP_RUN_DIR/import.XXXXXX") || { rmdir "$lock"; exit 1; }
+prepared_files=
+cleanup() {
+	for prepared in $prepared_files; do rm -f "$prepared"; done
+	rm -rf "$work"
+	rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+imported_files=0
+imported_entries=0
+staged_users=
+staged_managed=
+
+stage_group() {
+	name=$1 format=$2
+	shift 2
+	raw="$work/$name.raw"
+	: >"$raw"
+	found=0
+	for base in "$@"; do
+		file="$legacy/$base"
+		if [ -e "$file" ]; then
+			[ -f "$file" ] && [ ! -L "$file" ] || { rp_output_error import-legacy "拒绝非普通旧文件: $base"; exit 1; }
+			cat "$file" >>"$raw"
+			printf '\n' >>"$raw"
+			imported_files=$((imported_files + 1))
+			found=1
+		fi
+	done
+	[ "$found" -eq 1 ] || return 0
+	current="$RP_USER_DIR/$name.list"
+	if [ -e "$current" ] && { [ ! -f "$current" ] || [ -L "$current" ]; }; then rp_output_error import-legacy "人工清单目标不安全: $name"; exit 1; fi
+	[ ! -f "$current" ] || cat "$current" >>"$raw"
+	candidate="$work/user-$name.candidate"
+	if ! ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$format" "$raw" >"$candidate" 2>/dev/null; then
+		rp_output_error import-legacy "旧清单 $name 含无法无损转换的条目；所有目标保持不变"
+		exit 1
+	fi
+	chmod 0600 "$candidate"
+	count=$(rp_list_count "$candidate")
+	imported_entries=$((imported_entries + count))
+	staged_users="$staged_users $name"
+}
+
+stage_group domain-policy plain-domain domain-policy.list domain_policy.list proxy-domains.list proxy_domains.txt gfwlist.txt
+stage_group domain-default plain-domain domain-default.list domain_default.list direct-domains.list direct_domains.txt
+stage_group ipv4-policy plain-ipv4 ipv4-policy.list ipv4_policy.list proxy-ipv4.list proxy_ipv4.txt chnroute-exclude.txt
+stage_group ipv4-default plain-ipv4 ipv4-default.list ipv4_default.list direct-ipv4.list direct_ipv4.txt chnroute.txt
+
+# Fixed-name legacy automatic lists become an initial last-known-good snapshot.
+for spec in \
+	'managed-domain-policy.list:plain-domain:legacy.domain-policy.list' \
+	'managed-domain-default.list:plain-domain:legacy.domain-default.list' \
+	'managed-ipv4-policy.list:plain-ipv4:legacy.ipv4-policy.list' \
+	'managed-ipv4-default.list:plain-ipv4:legacy.ipv4-default.list'; do
+	base=${spec%%:*}; rest=${spec#*:}; format=${rest%%:*}; dest=${rest#*:}
+	file="$legacy/$base"
+	[ -e "$file" ] || continue
+	[ -f "$file" ] && [ ! -L "$file" ] || { rp_output_error import-legacy "拒绝非普通旧文件: $base"; exit 1; }
+	if ! ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$format" "$file" >"$work/managed-$dest" 2>/dev/null; then
+		rp_output_error import-legacy "旧自动清单 $base 含无法无损转换的条目；所有目标保持不变"
+		exit 1
+	fi
+	managed_target="$RP_MANAGED_CURRENT/$dest"
+	[ ! -e "$managed_target" ] || { [ -f "$managed_target" ] && [ ! -L "$managed_target" ]; } || { rp_output_error import-legacy "目标自动清单不安全: $dest"; exit 1; }
+	staged_managed="$staged_managed $dest"
+	imported_files=$((imported_files + 1))
+done
+
+# All conversion and target checks finish before the first public target changes.
+# Prepare candidates beside each destination, then rename them atomically.
+for name in $staged_users; do
+	prepared="$RP_USER_DIR/.import-$name.$$"
+	cp "$work/user-$name.candidate" "$prepared" || { rp_output_error import-legacy '无法准备人工清单导入事务'; exit 1; }
+	chmod 0600 "$prepared"
+	prepared_files="$prepared_files $prepared"
+done
+for dest in $staged_managed; do
+	prepared="$RP_MANAGED_CURRENT/.import-$dest.$$"
+	cp "$work/managed-$dest" "$prepared" || { rp_output_error import-legacy '无法准备自动清单导入事务'; exit 1; }
+	chmod 0600 "$prepared"
+	prepared_files="$prepared_files $prepared"
+done
+for name in $staged_users; do mv -f "$RP_USER_DIR/.import-$name.$$" "$RP_USER_DIR/$name.list"; done
+for dest in $staged_managed; do mv -f "$RP_MANAGED_CURRENT/.import-$dest.$$" "$RP_MANAGED_CURRENT/$dest"; done
+
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+report="$work/legacy-import-report.json"
+printf '{"ok":true,"source":"%s","files":%s,"entries":%s,"imported_at":"%s","deleted":false}\n' \
+	"$(rp_json_escape "$legacy")" "$imported_files" "$imported_entries" "$timestamp" >"$report"
+chmod 0600 "$report"
+mv -f "$report" "$report_target"
+printf '%s\n' "$timestamp" >"$work/marker"
+chmod 0600 "$work/marker"
+mv -f "$work/marker" "$marker"
+
+if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+	cat "$report_target"
+else
+	printf '已从 %s 导入 %s 个文件、归一化后共 %s 条；旧目录未删除\n' "$legacy" "$imported_files" "$imported_entries"
+fi

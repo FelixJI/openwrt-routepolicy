@@ -1,0 +1,251 @@
+#!/bin/sh
+
+# Shared, side-effect-free helpers. Do not enable errexit here: callers decide.
+RP_ROOT=${ROUTEPOLICY_ROOT:-}
+RP_ETC="$RP_ROOT/etc/routepolicy"
+RP_UCI_CONFIG="$RP_ROOT/etc/config/routepolicy"
+RP_USER_DIR="$RP_ETC/user.d"
+RP_MANAGED_CURRENT="$RP_ETC/managed.d/current"
+RP_MANAGED_PREVIOUS="$RP_ETC/managed.d/previous"
+RP_STATE_DIR="$RP_ETC/state"
+RP_RUN_DIR="$RP_ROOT/tmp/routepolicy"
+RP_NFT_FILE="$RP_RUN_DIR/rules.nft"
+RP_SMARTDNS_FILE="$RP_ROOT/etc/smartdns/conf.d/90-routepolicy.conf"
+RP_TABLE_FAMILY=inet
+RP_TABLE_NAME=routepolicy
+RP_SCHEMA_VERSION=1
+
+rp_err() { printf '%s\n' "routepolicy: $*" >&2; }
+rp_die() { rp_err "$*"; exit 1; }
+
+rp_have() { command -v "$1" >/dev/null 2>&1; }
+
+rp_uci_get() {
+	section=$1
+	option=$2
+	default=${3-}
+	value=$(uci -q get "routepolicy.$section.$option" 2>/dev/null) || value=$default
+	[ -n "$value" ] || value=$default
+	printf '%s\n' "$value"
+}
+
+rp_is_bool() { case ${1-} in 0|1) return 0 ;; *) return 1 ;; esac; }
+rp_is_uint() { case ${1-} in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+rp_uint_between() {
+	rp_is_uint "$1" || return 1
+	[ "$1" -ge "$2" ] 2>/dev/null && [ "$1" -le "$3" ] 2>/dev/null
+}
+rp_is_name() {
+	value=${1-}
+	[ -n "$value" ] && [ "${#value}" -le "${2:-32}" ] || return 1
+	case "$value" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$value" in -*|.*|*..*) return 1 ;; esac
+	return 0
+}
+rp_is_group() { rp_is_name "$1" 64; }
+rp_is_device() {
+	value=${1-}
+	[ -n "$value" ] && [ "${#value}" -le 32 ] || return 1
+	case "$value" in *[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+	return 0
+}
+rp_is_ipv4() {
+	printf '%s\n' "$1" | awk -F. '
+		NF != 4 { exit 1 }
+		{ for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1 }
+	' >/dev/null 2>&1
+}
+rp_network_cidr() {
+	address=$1 prefix=$2
+	rp_is_ipv4 "$address" && rp_uint_between "$prefix" 0 32 || return 1
+	awk -v ip="$address" -v p="$prefix" '
+		function text(v,a,b,c,d){a=int(v/16777216);v-=a*16777216;b=int(v/65536);v-=b*65536;c=int(v/256);d=v-c*256;return a"."b"."c"."d}
+		BEGIN{split(ip,x,".");v=((x[1]*256+x[2])*256+x[3])*256+x[4];block=2^(32-p);print text(int(v/block)*block) "/" p}'
+}
+rp_is_hex32() {
+	case ${1-} in 0x[0-9A-Fa-f]*) ;; *) return 1 ;; esac
+	[ "${#1}" -le 10 ] || return 1
+	case ${1#0x} in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
+	return 0
+}
+rp_hex_decimal() { printf '%u\n' "$(( $1 ))"; }
+rp_hex8() { printf '0x%08x\n' "$(( $1 ))"; }
+rp_inverse_mask() { printf '0x%08x\n' "$(( 0xffffffff ^ $1 ))"; }
+rp_is_mark_bit() {
+	rp_is_hex32 "$1" || return 1
+	n=$(rp_hex_decimal "$1") || return 1
+	[ "$n" -gt 0 ] && [ "$n" -le 2147483648 ] || return 1
+	[ $(( n & (n - 1) )) -eq 0 ]
+}
+rp_is_https_url() {
+	url=${1-}
+	[ -n "$url" ] && [ "${#url}" -le 2048 ] || return 1
+	case "$url" in https://*) ;; *) return 1 ;; esac
+	case "$url" in *[[:space:]]*) return 1 ;; esac
+	# C locale: reject every byte outside visible ASCII, including all whitespace
+	# and control characters. The bracket expression is POSIX-sh parse-safe.
+	if printf '%s' "$url" | LC_ALL=C grep -q '[^!-~]'; then return 1; fi
+	return 0
+}
+rp_json_escape() {
+	# Values passed here are already length-limited configuration/status fields.
+	printf '%s' "$1" |
+		sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s//\\r/g' |
+		awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'
+}
+
+rp_source_sections() {
+	uci -q show routepolicy 2>/dev/null |
+		sed -n 's/^routepolicy\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=source$/\1/p'
+}
+
+rp_interface_json() {
+	iface=$1
+	rp_is_name "$iface" 32 || return 1
+	ubus call "network.interface.$iface" status 2>/dev/null
+}
+rp_interface_device() {
+	rp_interface_json "$1" | jsonfilter -e '@.l3_device' 2>/dev/null | sed -n '1p'
+}
+rp_interface_gateway() {
+	rp_interface_json "$1" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null | sed -n '1p'
+}
+rp_interface_address() {
+	rp_interface_json "$1" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null | sed -n '1p'
+}
+rp_interface_prefix() {
+	rp_interface_json "$1" | jsonfilter -e '@["ipv4-address"][0].mask' 2>/dev/null | sed -n '1p'
+}
+rp_interface_up() {
+	value=$(rp_interface_json "$1" | jsonfilter -e '@.up' 2>/dev/null | sed -n '1p') || return 1
+	[ "$value" = true ] || [ "$value" = 1 ]
+}
+
+rp_schedule_due() {
+	now_date=$1 now_hour=$2 now_minute=$3 target_hour=$4 target_minute=$5 last_date=${6-}
+	case "$now_date" in ????-??-??) ;; *) return 1 ;; esac
+	rp_uint_between "$now_hour" 0 23 && rp_uint_between "$now_minute" 0 59 || return 1
+	rp_uint_between "$target_hour" 0 23 && rp_uint_between "$target_minute" 0 59 || return 1
+	[ "$now_date" != "$last_date" ] || return 1
+	[ $((now_hour * 60 + now_minute)) -ge $((target_hour * 60 + target_minute)) ]
+}
+
+rp_state_get() {
+	key=$1
+	[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] || return 1
+	sed -n "s/^$key=//p" "$RP_STATE_DIR/applied" | sed -n '1p'
+}
+
+rp_mark_conflicts() {
+	ours_mark=$1 ours_mask=$2 ours_priority=$3 ours_table=$4
+	previous_mark=${5-} previous_mask=${6-} previous_priority=${7-} previous_table=${8-}
+	rp_is_hex32 "$ours_mark" && rp_is_hex32 "$ours_mask" && rp_is_uint "$ours_priority" && rp_is_uint "$ours_table" || return 0
+	ours_mark_n=$((ours_mark)); ours_mask_n=$((ours_mask))
+	ip -4 rule show 2>/dev/null | while IFS= read -r line; do
+		token=$(printf '%s\n' "$line" | awk '{for(i=1;i<=NF;i++)if($i=="fwmark"){print $(i+1);exit}}')
+		[ -n "$token" ] || continue
+		other_mark=${token%%/*}; [ "$other_mark" != "$token" ] && other_mask=${token#*/} || other_mask=0xffffffff
+		case "$other_mark:$other_mask" in 0x[0-9A-Fa-f]*:0x[0-9A-Fa-f]*) ;; *) continue ;; esac
+		other_mark_n=$((other_mark)); other_mask_n=$((other_mask))
+		[ $((other_mask_n & ours_mask_n)) -ne 0 ] || continue
+		priority_token=$(printf '%s\n' "$line" | awk '{print $1}')
+		lookup=$(printf '%s\n' "$line" | awk '{for(i=1;i<NF;i++)if($i=="lookup"||$i=="table"){print $(i+1);exit}}')
+		if [ "$priority_token" = "$ours_priority:" ] && [ "$other_mark_n" -eq "$ours_mark_n" ] && [ "$other_mask_n" -eq "$ours_mask_n" ] && [ "$lookup" = "$ours_table" ]; then continue; fi
+		if [ -n "$previous_mark" ] && [ "$priority_token" = "$previous_priority:" ] && [ "$other_mark_n" -eq $((previous_mark)) ] && [ "$other_mask_n" -eq $((previous_mask)) ] && [ "$lookup" = "$previous_table" ]; then continue; fi
+		printf '%s\n' "$line"
+	done
+}
+
+rp_validate_main() {
+	errors=0
+	for command_name in uci ubus jsonfilter nft ip; do
+		rp_have "$command_name" || { rp_err "缺少命令: $command_name"; errors=$((errors + 1)); }
+	done
+	for field in enabled strict_enforcement dns_redirect warm_restore smartdns_enabled auto_update update_via_policy_interface; do
+		value=$(rp_uci_get main "$field" '')
+		rp_is_bool "$value" || { rp_err "main.$field 必须为 0 或 1"; errors=$((errors + 1)); }
+	done
+	for field in lan_interface default_interface policy_interface; do
+		value=$(rp_uci_get main "$field" '')
+		rp_is_name "$value" 32 || { rp_err "main.$field 不是合法逻辑接口名"; errors=$((errors + 1)); }
+	done
+	table=$(rp_uci_get main route_table '')
+	rp_uint_between "$table" 1 252 || { rp_err 'main.route_table 必须在 1..252'; errors=$((errors + 1)); }
+	priority=$(rp_uci_get main rule_priority '')
+	rp_uint_between "$priority" 1 32765 || { rp_err 'main.rule_priority 必须在 1..32765'; errors=$((errors + 1)); }
+	mark=$(rp_uci_get main mark '')
+	mask=$(rp_uci_get main mark_mask '')
+	rp_is_mark_bit "$mark" || { rp_err 'main.mark 必须是 32 位范围内的单一非零 bit'; errors=$((errors + 1)); }
+	rp_is_mark_bit "$mask" || { rp_err 'main.mark_mask 必须是 32 位范围内的单一非零 bit'; errors=$((errors + 1)); }
+	[ "$mark" = "$mask" ] || { rp_err 'main.mark 与 main.mark_mask 必须表示同一 bit'; errors=$((errors + 1)); }
+	group=$(rp_uci_get main smartdns_policy_group '')
+	rp_is_group "$group" || { rp_err 'main.smartdns_policy_group 非法'; errors=$((errors + 1)); }
+	hour=$(rp_uci_get main update_hour '')
+	minute=$(rp_uci_get main update_minute '')
+	rp_uint_between "$hour" 0 23 || { rp_err 'main.update_hour 必须在 0..23'; errors=$((errors + 1)); }
+	rp_uint_between "$minute" 0 59 || { rp_err 'main.update_minute 必须在 0..59'; errors=$((errors + 1)); }
+	[ "$errors" -eq 0 ]
+}
+
+rp_validate_sources() {
+	errors=0
+	for section in $(rp_source_sections); do
+		rp_is_name "$section" 32 || { rp_err "非法 source 节名: $section"; errors=$((errors + 1)); continue; }
+		enabled=$(rp_uci_get "$section" enabled 0)
+		rp_is_bool "$enabled" || { rp_err "$section.enabled 必须为 0 或 1"; errors=$((errors + 1)); }
+		[ "$enabled" = 1 ] || continue
+		url=$(rp_uci_get "$section" url '')
+		rp_is_https_url "$url" || { rp_err "$section.url 必须是长度受限、无空白的 HTTPS URL"; errors=$((errors + 1)); }
+		format=$(rp_uci_get "$section" format '')
+		case "$format" in plain-domain|plain-ipv4|hosts-domain|adblock-domain|dnsmasq-domain|clash-domain|clash-ipv4) ;; *) rp_err "$section.format 不受支持"; errors=$((errors + 1)) ;; esac
+		target=$(rp_uci_get "$section" target '')
+		case "$target" in domain-policy|domain-default|ipv4-policy|ipv4-default) ;; *) rp_err "$section.target 不受支持"; errors=$((errors + 1)) ;; esac
+		case "$format:$target" in *domain:domain-*|hosts-domain:domain-*|adblock-domain:domain-*|dnsmasq-domain:domain-*|clash-domain:domain-*|*ipv4:ipv4-*|clash-ipv4:ipv4-*) ;; *) rp_err "$section.format 与 target 类型不一致"; errors=$((errors + 1)) ;; esac
+		minimum=$(rp_uci_get "$section" min_entries 1)
+		shrink=$(rp_uci_get "$section" max_shrink_percent 50)
+		rp_uint_between "$minimum" 1 10000000 || { rp_err "$section.min_entries 必须在 1..10000000"; errors=$((errors + 1)); }
+		rp_uint_between "$shrink" 0 100 || { rp_err "$section.max_shrink_percent 必须在 0..100"; errors=$((errors + 1)); }
+		via=$(rp_uci_get "$section" update_via_policy_interface "$(rp_uci_get main update_via_policy_interface 1)")
+		rp_is_bool "$via" || { rp_err "$section.update_via_policy_interface 必须为 0 或 1"; errors=$((errors + 1)); }
+	done
+	[ "$errors" -eq 0 ]
+}
+
+rp_ensure_dirs() {
+	umask 077
+	mkdir -p "$RP_USER_DIR" "$RP_MANAGED_CURRENT" "$RP_MANAGED_PREVIOUS" "$RP_STATE_DIR" "$RP_RUN_DIR/lists"
+}
+
+rp_merge_lists() {
+	target=$1
+	output=$2
+	user="$RP_USER_DIR/$target.list"
+	{
+		[ -f "$user" ] && cat "$user"
+		for file in "$RP_MANAGED_CURRENT"/*."$target".list; do
+			[ -f "$file" ] && cat "$file"
+		done
+	} | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$output"
+}
+
+rp_list_count() { awk 'NF && $0 !~ /^[[:space:]]*[#;]/ { n++ } END { print n+0 }' "$1"; }
+
+rp_output_ok() {
+	operation=$1
+	message=$2
+	if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+		printf '{"ok":true,"operation":"%s","message":"%s"}\n' "$(rp_json_escape "$operation")" "$(rp_json_escape "$message")"
+	else
+		printf '%s\n' "$message"
+	fi
+}
+
+rp_output_error() {
+	operation=$1
+	message=$2
+	if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+		printf '{"ok":false,"operation":"%s","error":"%s"}\n' "$(rp_json_escape "$operation")" "$(rp_json_escape "$message")"
+	else
+		rp_err "$message"
+	fi
+}

@@ -1,0 +1,87 @@
+name: Release OpenWrt packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to publish
+        required: true
+        type: string
+
+concurrency:
+  group: routepolicy-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_VERSION: 25.12.0
+  OPENWRT_SDK_ARCHIVE: openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  OPENWRT_SDK_BASE: https://downloads.openwrt.org/releases/25.12.0/targets/x86/64
+
+jobs:
+  build-and-release:
+    name: Build and publish OpenWrt 25.12 x86_64 APKs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # 官方 checkout action 使用稳定主版本；发布调用 runner 自带 gh，避免额外 action。
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Run static checks before publishing
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck zstd
+          sh tests/ci/static-checks.sh
+          sh tests/ci/package-contract-tests.sh
+          sh tests/converters/run.sh
+          sh tests/core/run.sh
+          pwsh -File tests/luci/check-static.ps1
+          sh tests/ci/validate-workflows.sh
+      - name: Download and verify fixed OpenWrt SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --output sdk.tar.zst "$OPENWRT_SDK_BASE/$OPENWRT_SDK_ARCHIVE"
+          curl --fail --location --retry 3 --output sha256sums "$OPENWRT_SDK_BASE/sha256sums"
+          awk -v file="$OPENWRT_SDK_ARCHIVE" '$2 == file || $2 == "*" file { print; found = 1 } END { exit !found }' sha256sums | sha256sum --check --status
+          tar --use-compress-program=unzstd -xf sdk.tar.zst
+          mv "${OPENWRT_SDK_ARCHIVE%.tar.zst}" sdk
+      - name: Install official release feeds and build packages
+        working-directory: sdk
+        run: |
+          set -eu
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp -a ../routepolicy package/routepolicy
+          cp -a ../luci-app-routepolicy package/luci-app-routepolicy
+          make defconfig
+          printf '%s\n' 'CONFIG_PACKAGE_routepolicy=m' 'CONFIG_PACKAGE_luci-app-routepolicy=m' >> .config
+          make defconfig
+          make package/ucode/host/compile V=s
+          staging_dir/host/bin/ucode -c ../luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
+          make package/routepolicy/compile package/luci-app-routepolicy/compile V=s -j"$(nproc)"
+          make package/index V=s
+      - name: Prepare APK, index and installation instructions
+        run: |
+          set -eu
+          OPENWRT_SDK_VERSION="$OPENWRT_VERSION" GITHUB_SHA="$(git rev-parse HEAD)" sh scripts/ci/prepare-release.sh sdk release-assets
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          case "$RELEASE_TAG" in v*) ;; *) echo 'Only v* tags can be released.' >&2; exit 1 ;; esac
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --title "$RELEASE_TAG — OpenWrt 25.12 x86_64" \
+            --verify-tag \
+            --generate-notes \
+            --notes "仅支持 OpenWrt 25.12 x86_64。APK 默认禁用；升级前备份配置，并按随附 INSTALL.txt 完成预检。发布附件包含 APK、Packages 索引和构建信息。"

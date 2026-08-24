@@ -1,0 +1,145 @@
+#!/bin/sh
+
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+rp_ensure_dirs
+work=$(mktemp -d "$RP_RUN_DIR/render.XXXXXX") || exit 1
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+normalize_list() {
+	name=$1
+	format=$2
+	raw="$work/$name.raw"
+	out="$RP_RUN_DIR/lists/$name.list.new"
+	rp_merge_lists "$name" "$raw"
+	if [ -s "$raw" ]; then
+		"$LIBEXEC/converters/$format" "$raw" >"$out"
+	else
+		: >"$out"
+	fi
+	mv -f "$out" "$RP_RUN_DIR/lists/$name.list"
+}
+
+normalize_list domain-policy plain-domain
+normalize_list domain-default plain-domain
+normalize_list ipv4-policy plain-ipv4
+normalize_list ipv4-default plain-ipv4
+
+lan_if=$(rp_uci_get main lan_interface lan)
+lan_device=$(rp_interface_device "$lan_if") || lan_device=
+rp_is_device "$lan_device" || { rp_output_error render "无法解析 LAN 实际设备: $lan_if"; exit 1; }
+mark=$(rp_uci_get main mark 0x100)
+mask=$(rp_uci_get main mark_mask 0x100)
+inv=$(rp_inverse_mask "$mask")
+dns_redirect=$(rp_uci_get main dns_redirect 1)
+
+elements() {
+	file=$1
+	first=1
+	while IFS= read -r item; do
+		[ -n "$item" ] || continue
+		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+		printf '%s' "$item"
+	done <"$file"
+}
+
+full="$work/rules.nft"
+{
+	cat <<EOF
+table inet routepolicy {
+	set domain_policy4 {
+		type ipv4_addr
+		flags timeout
+		timeout 1h
+		gc-interval 1m
+	}
+	set domain_default4 {
+		type ipv4_addr
+		flags timeout
+		timeout 1h
+		gc-interval 1m
+	}
+	set static_policy4 {
+		type ipv4_addr
+		flags interval
+		auto-merge
+EOF
+	if [ -s "$RP_RUN_DIR/lists/ipv4-policy.list" ]; then printf '\t\telements = { '; elements "$RP_RUN_DIR/lists/ipv4-policy.list"; printf ' }\n'; fi
+	cat <<EOF
+	}
+	set static_default4 {
+		type ipv4_addr
+		flags interval
+		auto-merge
+EOF
+	if [ -s "$RP_RUN_DIR/lists/ipv4-default.list" ]; then printf '\t\telements = { '; elements "$RP_RUN_DIR/lists/ipv4-default.list"; printf ' }\n'; fi
+	cat <<EOF
+	}
+	chain classify {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname != "$lan_device" comment "routepolicy: non-LAN" return
+EOF
+	if [ "$dns_redirect" = 1 ]; then
+		printf '\t\tmeta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"\n'
+	fi
+	cat <<EOF
+		meta mark set (meta mark & $inv) | (ct mark & $mask) comment "routepolicy: restore connection mark"
+		ct mark & $mask != 0 counter comment "routepolicy: established policy connection" return
+		ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter comment "routepolicy: excluded destination" return
+		ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: dynamic default override" return
+		ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: static default override" return
+		ip daddr @domain_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: dynamic policy"
+		ip daddr @static_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: static policy"
+	}
+}
+EOF
+} >"$full"
+
+update="$work/update.nft"
+{
+	cat <<EOF
+flush set inet routepolicy static_policy4
+flush set inet routepolicy static_default4
+EOF
+	if [ -s "$RP_RUN_DIR/lists/ipv4-policy.list" ]; then printf 'add element inet routepolicy static_policy4 { '; elements "$RP_RUN_DIR/lists/ipv4-policy.list"; printf ' }\n'; fi
+	if [ -s "$RP_RUN_DIR/lists/ipv4-default.list" ]; then printf 'add element inet routepolicy static_default4 { '; elements "$RP_RUN_DIR/lists/ipv4-default.list"; printf ' }\n'; fi
+	cat <<EOF
+flush chain inet routepolicy classify
+add rule inet routepolicy classify iifname != "$lan_device" comment "routepolicy: non-LAN" return
+EOF
+	if [ "$dns_redirect" = 1 ]; then printf 'add rule inet routepolicy classify meta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"\n'; fi
+	cat <<EOF
+add rule inet routepolicy classify meta mark set (meta mark & $inv) | (ct mark & $mask) comment "routepolicy: restore connection mark"
+add rule inet routepolicy classify ct mark & $mask != 0 counter comment "routepolicy: established policy connection" return
+add rule inet routepolicy classify ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter comment "routepolicy: excluded destination" return
+add rule inet routepolicy classify ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: dynamic default override" return
+add rule inet routepolicy classify ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: static default override" return
+add rule inet routepolicy classify ip daddr @domain_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: dynamic policy"
+add rule inet routepolicy classify ip daddr @static_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: static policy"
+EOF
+} >"$update"
+
+group=$(rp_uci_get main smartdns_policy_group policy)
+smartdns="$work/90-routepolicy.conf"
+cat >"$smartdns" <<EOF
+# Generated by routepolicy. Do not edit.
+nftset-timeout yes
+domain-set -name routepolicy_policy -type list -file $RP_RUN_DIR/lists/domain-policy.list
+domain-set -name routepolicy_default -type list -file $RP_RUN_DIR/lists/domain-default.list
+nftset /domain-set:routepolicy_policy/#4:inet#routepolicy#domain_policy4
+nftset /domain-set:routepolicy_default/#4:inet#routepolicy#domain_default4
+domain-rules /domain-set:routepolicy_policy/ -nameserver $group -no-serve-expired -speed-check-mode none
+domain-rules /domain-set:routepolicy_default/ -no-serve-expired -speed-check-mode none
+EOF
+
+mv -f "$full" "$RP_NFT_FILE"
+mv -f "$update" "$RP_RUN_DIR/update.nft"
+mv -f "$smartdns" "$RP_RUN_DIR/90-routepolicy.conf"
+
+if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+	printf '{"ok":true,"operation":"render","nft":"%s","smartdns":"%s"}\n' "$(rp_json_escape "$RP_NFT_FILE")" "$(rp_json_escape "$RP_RUN_DIR/90-routepolicy.conf")"
+else
+	printf 'nft: %s\nSmartDNS: %s\n' "$RP_NFT_FILE" "$RP_RUN_DIR/90-routepolicy.conf"
+fi

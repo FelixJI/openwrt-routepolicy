@@ -1,0 +1,26 @@
+#!/bin/sh
+[ "${1:-}" = -q ] && shift
+case "${1:-}" in
+	show)
+		[ "${2:-}" = routepolicy ] && printf 'routepolicy.main=main\n'
+		;;
+	get)
+		case "${2:-}" in
+			routepolicy.main.enabled) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo broken || echo 1 ;;
+			routepolicy.main.lan_interface) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo 'lan"bad' || echo lan ;;
+			routepolicy.main.default_interface) echo wan ;;
+			routepolicy.main.policy_interface) echo usbwan ;;
+			routepolicy.main.strict_enforcement) echo "${TEST_STRICT:-1}" ;;
+			routepolicy.main.smartdns_enabled) echo "${TEST_SMARTDNS_ENABLED:-1}" ;;
+			routepolicy.main.dns_redirect|routepolicy.main.warm_restore|routepolicy.main.auto_update|routepolicy.main.update_via_policy_interface) echo 1 ;;
+			routepolicy.main.route_table) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo not-a-number || echo "${TEST_ROUTE_TABLE:-200}" ;;
+			routepolicy.main.rule_priority) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo -1 || echo "${TEST_RULE_PRIORITY:-12000}" ;;
+			routepolicy.main.mark) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo 0xzz || echo "${TEST_MARK:-0x100}" ;;
+			routepolicy.main.mark_mask) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo 0xzz || echo "${TEST_MARK_MASK:-0x100}" ;;
+			routepolicy.main.smartdns_policy_group) echo policy ;;
+			routepolicy.main.update_hour) echo 4 ;;
+			routepolicy.main.update_minute) echo 17 ;;
+			*) exit 1 ;;
+		esac
+		;;
+esac

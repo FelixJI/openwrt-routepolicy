@@ -1,0 +1,93 @@
+#!/bin/sh
+
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+passed=0 failed=0 warned=0 results=
+add_check() {
+	name=$1 state=$2 detail=$3
+	case "$state" in pass) passed=$((passed + 1)) ;; fail) failed=$((failed + 1)) ;; warn) warned=$((warned + 1)) ;; *) return 1 ;; esac
+	if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+		item="{\"name\":\"$(rp_json_escape "$name")\",\"status\":\"$state\",\"detail\":\"$(rp_json_escape "$detail")\"}"
+		[ -z "$results" ] && results=$item || results="$results,$item"
+	else
+		printf '[%s] %s: %s\n' "$state" "$name" "$detail"
+	fi
+}
+redact_url() { printf '%s\n' "$1" | sed 's/[?#].*$/?[redacted]/'; }
+subnets_overlap() {
+	awk -v a="$1" -v ap="$2" -v b="$3" -v bp="$4" '
+	function ipn(s,x){split(s,x,".");return ((x[1]*256+x[2])*256+x[3])*256+x[4]}
+	BEGIN{if(ap!~/^[0-9]+$/||bp!~/^[0-9]+$/)exit 1;ab=2^(32-ap);bb=2^(32-bp);as=int(ipn(a)/ab)*ab;bs=int(ipn(b)/bb)*bb;exit !((as<=bs+bb-1)&&(bs<=as+ab-1))}'
+}
+
+if ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" >/dev/null 2>&1; then add_check uci pass '配置、来源和人工清单有效'; else add_check uci fail '配置、来源或人工清单校验失败'; fi
+table=$(rp_uci_get main route_table 200); priority=$(rp_uci_get main rule_priority 12000)
+mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
+lan=$(rp_uci_get main lan_interface lan); default_if=$(rp_uci_get main default_interface wan); policy=$(rp_uci_get main policy_interface usbwan)
+for role_spec in "LAN:$lan" "default:$default_if" "policy:$policy"; do
+	role=${role_spec%%:*}; iface=${role_spec#*:}
+	if rp_interface_json "$iface" >/dev/null 2>&1; then add_check "interface-$role" pass "$iface 可通过 ubus 查询"; else add_check "interface-$role" fail "$iface 不可通过 ubus 查询"; fi
+done
+if ip -4 route show table main 2>/dev/null | grep -Eq '^default([[:space:]]|$)'; then add_check main-default pass 'main 表存在默认路由'; else add_check main-default fail 'main 表缺少默认路由'; fi
+conflicts=$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table")
+if [ -z "$conflicts" ]; then add_check mark-conflict pass '未发现 mark mask 位重叠'; else add_check mark-conflict fail '发现与 routepolicy mark mask 位重叠的规则（详情已省略）'; fi
+if nft list table inet routepolicy >/dev/null 2>&1; then add_check nft-table pass 'inet routepolicy 存在'; else add_check nft-table fail 'inet routepolicy 不存在'; fi
+if ip -4 rule show 2>/dev/null | grep -Fq "fwmark $mark/$mask"; then add_check policy-rule pass '掩码策略规则存在'; else add_check policy-rule fail '掩码策略规则不存在'; fi
+if ip -4 route show table "$table" 2>/dev/null | grep -Eq '^default([[:space:]]|$)'; then add_check policy-default pass '策略接口真实默认路由存在'; elif rp_interface_up "$policy"; then add_check policy-default fail '策略接口在线但真实默认路由缺失'; else add_check policy-default warn '策略接口离线，真实默认路由按设计移除'; fi
+if ip -4 route show table "$table" 2>/dev/null | grep -Eq '^blackhole default([[:space:]]|$)'; then add_check blackhole pass '策略表严格阻断存在'; else add_check blackhole fail '策略表严格阻断不存在'; fi
+if [ "$(rp_uci_get main smartdns_enabled 1)" = 0 ]; then add_check smartdns-fragment warn 'SmartDNS 适配已禁用';
+elif [ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] && ! grep -Eq '^[[:space:]]*server[[:space:]]' "$RP_SMARTDNS_FILE"; then add_check smartdns-fragment pass '独立片段存在且未定义上游服务器';
+else add_check smartdns-fragment fail '独立片段缺失、不安全或包含上游服务器'; fi
+if rp_have nslookup; then
+	if nslookup localhost 127.0.0.1 >/dev/null 2>&1; then add_check dns-local pass '本机 DNS 能解析 localhost'; else add_check dns-local warn '本机 DNS localhost 查询失败'; fi
+else add_check dns-local warn '系统无 nslookup，跳过本机 DNS 探测'; fi
+
+ipv6_detail=
+for key in network.lan.ip6assign dhcp.lan.ra dhcp.lan.dhcpv6 dhcp.lan.ndp; do
+	value=$(uci -q get "$key" 2>/dev/null) || value=
+	case "$value" in ''|disabled|0) ;; *) ipv6_detail="$ipv6_detail $key=$value" ;; esac
+done
+if [ -z "$ipv6_detail" ]; then add_check ipv6-lan pass '未发现 LAN IPv6 服务配置'; else add_check ipv6-lan warn "LAN IPv6 仍有配置:$ipv6_detail"; fi
+
+zone_found=0; nat_ok=0; mss_ok=0
+for zone in $(uci -q show firewall 2>/dev/null | sed -n 's/^firewall\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=zone$/\1/p'); do
+	networks=$(uci -q get "firewall.$zone.network" 2>/dev/null) || networks=
+	case " $networks " in *" $policy "*)
+		zone_found=1
+		[ "$(uci -q get "firewall.$zone.masq" 2>/dev/null)" = 1 ] && nat_ok=1
+		[ "$(uci -q get "firewall.$zone.mtu_fix" 2>/dev/null)" = 1 ] && mss_ok=1
+		;;
+	esac
+done
+[ "$zone_found" -eq 1 ] && [ "$nat_ok" -eq 1 ] && add_check firewall-nat pass '策略接口所在区域启用 NAT' || add_check firewall-nat warn '未确认策略接口区域启用 NAT（软件包不会自动修改）'
+[ "$zone_found" -eq 1 ] && [ "$mss_ok" -eq 1 ] && add_check firewall-mss pass '策略接口所在区域启用 MSS 钳制' || add_check firewall-mss warn '未确认策略接口区域启用 MSS 钳制（软件包不会自动修改）'
+
+lan_addr=$(rp_interface_address "$lan" 2>/dev/null) || lan_addr=; lan_prefix=$(rp_interface_prefix "$lan" 2>/dev/null) || lan_prefix=
+policy_addr=$(rp_interface_address "$policy" 2>/dev/null) || policy_addr=; policy_prefix=$(rp_interface_prefix "$policy" 2>/dev/null) || policy_prefix=
+if [ -n "$lan_addr" ] && [ -n "$policy_addr" ]; then
+	if subnets_overlap "$lan_addr" "$lan_prefix" "$policy_addr" "$policy_prefix"; then add_check subnet-overlap fail 'LAN 与策略接口 IPv4 网段重叠'; else add_check subnet-overlap pass 'LAN 与策略接口 IPv4 网段不重叠'; fi
+else add_check subnet-overlap warn '地址信息不足，无法判断网段重叠'; fi
+
+if nft list set inet routepolicy domain_policy4 2>/dev/null | grep -q 'timeout'; then add_check dynamic-set pass '动态集合存在 timeout 能力'; else add_check dynamic-set fail '动态集合缺失或未启用 timeout'; fi
+if [ "$(rp_uci_get main dns_redirect 1)" = 0 ]; then add_check dns-redirect warn 'DNS 重定向已禁用';
+elif nft list chain inet routepolicy classify 2>/dev/null | grep -q 'dport 53.*redirect'; then add_check dns-redirect pass 'LAN DNS 重定向规则存在';
+else add_check dns-redirect fail '配置要求 DNS 重定向但规则缺失'; fi
+sources=0
+for source in $(rp_source_sections); do
+	[ "$(rp_uci_get "$source" enabled 0)" = 1 ] || continue
+	url=$(rp_uci_get "$source" url '')
+	# Never emit query parameters or credentials in diagnostics.
+	redacted=$(redact_url "$url"); : "$redacted"
+	sources=$((sources + 1))
+done
+[ "$sources" -gt 0 ] && add_check update-sources pass "$sources 个启用来源通过静态校验（URL 已脱敏）" || add_check update-sources warn '没有启用的更新来源'
+
+if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+	[ "$failed" -eq 0 ] && ok=true || ok=false
+	printf '{"ok":%s,"operation":"diagnose","passed":%s,"warned":%s,"failed":%s,"checks":[%s]}\n' "$ok" "$passed" "$warned" "$failed" "$results"
+else
+	printf 'summary: %s passed, %s warned, %s failed\n' "$passed" "$warned" "$failed"
+fi
+[ "$failed" -eq 0 ]

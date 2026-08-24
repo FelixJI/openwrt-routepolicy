@@ -1,0 +1,17 @@
+{
+  "luci-app-routepolicy": {
+    "description": "Grant LuCI access to RoutePolicy's restricted configuration and RPC methods",
+    "read": {
+      "uci": [ "routepolicy" ],
+      "ubus": {
+        "routepolicy": [ "status", "validate", "diagnose", "read_user_list" ]
+      }
+    },
+    "write": {
+      "uci": [ "routepolicy" ],
+      "ubus": {
+        "routepolicy": [ "apply", "reload", "update", "rollback", "import_legacy", "write_user_list" ]
+      }
+    }
+  }
+}

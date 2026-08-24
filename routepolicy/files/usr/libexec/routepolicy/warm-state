@@ -1,0 +1,52 @@
+#!/bin/sh
+
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+[ "$#" -eq 1 ] || exit 2
+case "$1" in save|restore) mode=$1 ;; *) exit 2 ;; esac
+rp_ensure_dirs
+
+snapshot_set() {
+	set_name=$1; target="$RP_STATE_DIR/warm-$set_name.list"
+	raw="$RP_RUN_DIR/warm-$set_name.raw.$$"; normalized="$RP_STATE_DIR/.warm-$set_name.$$"
+	trap 'rm -f "$raw" "$normalized"' EXIT HUP INT TERM
+	nft list set inet routepolicy "$set_name" 2>/dev/null |
+		tr ',{}' '\n  ' |
+		awk '{ for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){print $i;break} }' |
+		sed -n '1,4096p' >"$raw"
+	if [ -s "$raw" ] && "$LIBEXEC/converters/plain-ipv4" "$raw" >"$normalized" 2>/dev/null; then
+		chmod 0600 "$normalized"; mv -f "$normalized" "$target"
+	else
+		rm -f "$normalized"
+		: >"$raw"; chmod 0600 "$raw"; mv -f "$raw" "$target"
+	fi
+	rm -f "$raw"
+	trap - EXIT HUP INT TERM
+}
+
+if [ "$mode" = save ]; then
+	snapshot_set domain_policy4
+	snapshot_set domain_default4
+	exit 0
+fi
+
+batch="$RP_RUN_DIR/warm-restore.nft.$$"
+trap 'rm -f "$batch"' EXIT HUP INT TERM
+: >"$batch"
+for set_name in domain_policy4 domain_default4; do
+	file="$RP_STATE_DIR/warm-$set_name.list"
+	[ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || continue
+	normalized="$RP_RUN_DIR/warm-$set_name.normalized.$$"
+	if ! ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/plain-ipv4" "$file" >"$normalized" 2>/dev/null; then rm -f "$normalized"; continue; fi
+	printf 'add element inet routepolicy %s { ' "$set_name" >>"$batch"
+	first=1
+	while IFS= read -r ipaddr; do
+		[ "$first" -eq 1 ] && first=0 || printf ', ' >>"$batch"
+		printf '%s timeout 10m' "$ipaddr" >>"$batch"
+	done <"$normalized"
+	printf ' }\n' >>"$batch"
+	rm -f "$normalized"
+done
+[ -s "$batch" ] || exit 0
+nft -c -f "$batch" >/dev/null 2>&1 && nft -f "$batch" >/dev/null 2>&1

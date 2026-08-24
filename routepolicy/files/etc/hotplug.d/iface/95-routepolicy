@@ -1,0 +1,17 @@
+#!/bin/sh
+
+[ -x /usr/sbin/routepolicyctl ] || exit 0
+[ "$(uci -q get routepolicy.main.enabled 2>/dev/null)" = 1 ] || exit 0
+
+lan=$(uci -q get routepolicy.main.lan_interface 2>/dev/null)
+default_if=$(uci -q get routepolicy.main.default_interface 2>/dev/null)
+policy_if=$(uci -q get routepolicy.main.policy_interface 2>/dev/null)
+
+case "${INTERFACE:-}" in
+	"$lan"|"$default_if"|"$policy_if") ;;
+	*) exit 0 ;;
+esac
+case "${ACTION:-}" in ifup|ifdown|ifupdate) ;; *) exit 0 ;; esac
+
+logger -t routepolicy "interface event: $INTERFACE $ACTION"
+/usr/sbin/routepolicyctl reload >/dev/null 2>&1 || logger -t routepolicy -p daemon.err 'reload after interface event failed'

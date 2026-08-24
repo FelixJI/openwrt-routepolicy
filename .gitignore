@@ -1,0 +1,20 @@
+# 本地交付物：该脚本只在完成设备迁移后由操作者保留和执行，不属于公开仓库。
+cleanup-legacy-splitroute-after-package-install.sh
+
+# Codex 本地规划记录
+task_plan.md
+findings.md
+progress.md
+
+# OpenWrt SDK 与构建产物
+openwrt-sdk-*/
+sdk-work/
+dist/
+*.apk
+*.ipk
+*.tar.zst
+
+# 常见本地文件
+.DS_Store
+Thumbs.db
+node_modules/

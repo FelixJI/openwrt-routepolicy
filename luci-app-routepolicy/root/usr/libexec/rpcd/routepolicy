@@ -1,0 +1,167 @@
+'use strict';
+
+/*
+ * rpcd object deliberately exposes a small, enumerable operation surface.
+ * Every command below is a literal; no request field becomes a command, path,
+ * nft expression, or shell fragment.
+ */
+import { popen } from 'fs';
+
+const LISTS = {
+    'domain-policy': true,
+    'domain-default': true,
+    'ipv4-policy': true,
+    'ipv4-default': true
+};
+
+const COMMANDS = {
+    status: [ '/usr/sbin/routepolicyctl', 'status', '--json' ],
+    validate: [ '/usr/sbin/routepolicyctl', 'validate', '--json' ],
+    apply: [ '/etc/init.d/routepolicy', 'restart' ],
+    reload: [ '/etc/init.d/routepolicy', 'restart' ],
+    update: [ '/usr/sbin/routepolicyctl', 'update', '--json' ],
+    rollback: [ '/usr/sbin/routepolicyctl', 'rollback', '--json' ],
+    diagnose: [ '/usr/sbin/routepolicyctl', 'diagnose', '--json' ],
+    import_legacy: [ '/usr/sbin/routepolicyctl', 'import-legacy', '/etc/splitroute', '--json' ]
+};
+
+function result(ok, message, extra) {
+    let response = { ok: ok, message: message };
+    for (let key in (extra || {}))
+        response[key] = extra[key];
+    return response;
+}
+
+function run(operation) {
+    let proc = popen(COMMANDS[operation], 'r');
+    if (!proc)
+        return result(false, '无法启动 RoutePolicy 控制程序');
+
+    let output = proc.read('all') || '';
+    let exitcode = proc.close();
+
+    if (operation == 'apply' || operation == 'reload')
+        return exitcode == 0
+            ? result(true, '服务生命周期已与保存的 UCI 配置同步')
+            : result(false, 'RoutePolicy 服务启停或应用失败', { output: output });
+
+    let payload = null;
+
+    try {
+        payload = json(output);
+    }
+    catch (e) {
+        payload = { output: output };
+    }
+
+    if (type(payload) != 'object')
+        payload = { output: output };
+
+    /* A missing or malformed reply must never turn a failed child into success. */
+    payload.ok = (exitcode == 0 && payload.ok === true);
+    if (!payload.message)
+        payload.message = payload.ok ? '操作完成' : 'RoutePolicy 控制程序执行失败';
+    return payload;
+}
+
+function list_name(req) {
+    if (!req || type(req.list) != 'string' || !LISTS[req.list])
+        return null;
+    return req.list;
+}
+
+function normalize_lines(content, kind) {
+    if (type(content) != 'string' || length(content) > 262144)
+        return result(false, '规则内容必须是小于 256 KiB 的纯文本');
+
+    let valid = [], invalid = [], duplicate = 0, seen = {};
+    for (let raw in split(content, /\r?\n/)) {
+        let line = trim(raw);
+        if (!line || line[0] == '#')
+            continue;
+
+        let is_domain = (kind == 'domain-policy' || kind == 'domain-default');
+        let accepted = is_domain
+            ? match(line, /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i)
+            : match(line, /^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)(?:\/(?:[0-9]|[12][0-9]|3[0-2]))?$/);
+
+        if (!accepted) {
+            push(invalid, line);
+            continue;
+        }
+        line = lc(line);
+        if (seen[line]) {
+            duplicate++;
+            continue;
+        }
+        seen[line] = true;
+        push(valid, line);
+    }
+
+    return result(invalid.length == 0, invalid.length ? '发现非法规则，未保存' : '规则校验通过', {
+        valid: valid,
+        valid_count: valid.length,
+        duplicate_count: duplicate,
+        invalid_count: invalid.length,
+        invalid: invalid
+    });
+}
+
+return {
+    status: { args: {}, call: function(req) { return run('status'); } },
+    validate: { args: {}, call: function(req) { return run('validate'); } },
+    apply: { args: {}, call: function(req) { return run('apply'); } },
+    reload: { args: {}, call: function(req) { return run('reload'); } },
+    update: { args: {}, call: function(req) { return run('update'); } },
+    rollback: { args: {}, call: function(req) { return run('rollback'); } },
+    diagnose: { args: {}, call: function(req) { return run('diagnose'); } },
+    import_legacy: { args: {}, call: function(req) { return run('import_legacy'); } },
+    read_user_list: {
+        args: { list: 'String' },
+        call: function(req) {
+            let kind = list_name(req);
+            if (!kind)
+                return result(false, '未知的人工规则类型');
+            let proc = popen([ '/usr/sbin/routepolicyctl', 'user-list', 'read', kind, '--json' ], 'r');
+            if (!proc)
+                return result(false, '无法启动 RoutePolicy 控制程序');
+            let output = proc.read('all') || '';
+            let exitcode = proc.close();
+            try {
+                let payload = json(output);
+                if (exitcode == 0 && type(payload) == 'object')
+                    return payload;
+            }
+            catch (e) {}
+            return result(false, '读取人工规则失败');
+        }
+    },
+    write_user_list: {
+        args: { list: 'String', content: 'String' },
+        call: function(req) {
+            let kind = list_name(req);
+            if (!kind)
+                return result(false, '未知的人工规则类型');
+            let checked = normalize_lines(req.content, kind);
+            if (!checked.ok)
+                return checked;
+            /*
+             * argv is an execvp vector, not a shell command. The core command
+             * owns same-directory candidate creation, regular-file checks and
+             * atomic replacement after accepting only this enumerated list kind.
+             */
+            let proc = popen([ '/usr/sbin/routepolicyctl', 'user-list', 'write', kind, '--json' ], 'w');
+            if (!proc)
+                return result(false, '无法启动 RoutePolicy 控制程序');
+            let content = join('\n', checked.valid) + (checked.valid.length ? '\n' : '');
+            let written = proc.write(content);
+            if (written != length(content)) {
+                proc.close();
+                return result(false, '向核心校验器传递人工规则失败');
+            }
+            if (proc.close() != 0)
+                return result(false, '核心校验或原子写入人工规则失败');
+            return checked;
+        }
+    }
+};

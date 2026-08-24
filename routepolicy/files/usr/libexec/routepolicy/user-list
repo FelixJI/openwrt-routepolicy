@@ -1,0 +1,63 @@
+#!/bin/sh
+
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+usage() { rp_output_error user-list '用法: user-list {read|write} {domain-policy|domain-default|ipv4-policy|ipv4-default}'; exit 2; }
+[ "$#" -eq 2 ] || usage
+action=$1
+name=$2
+case "$name" in
+	domain-policy|domain-default) format=plain-domain ;;
+	ipv4-policy|ipv4-default) format=plain-ipv4 ;;
+	*) usage ;;
+esac
+case "$action" in read|write) ;; *) usage ;; esac
+
+rp_ensure_dirs
+target="$RP_USER_DIR/$name.list"
+if [ -e "$target" ] && { [ ! -f "$target" ] || [ -L "$target" ]; }; then
+	rp_output_error user-list '目标不是安全的普通文件'
+	exit 1
+fi
+
+if [ "$action" = read ]; then
+	content=
+	[ ! -f "$target" ] || content=$(cat "$target")
+	if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+		printf '{"ok":true,"operation":"user-list.read","name":"%s","content":"%s"}\n' "$name" "$(rp_json_escape "$content")"
+	else
+		printf '%s' "$content"
+		[ -z "$content" ] || printf '\n'
+	fi
+	exit 0
+fi
+
+umask 077
+raw=$(mktemp "$RP_USER_DIR/.${name}.raw.XXXXXX") || exit 1
+candidate=$(mktemp "$RP_USER_DIR/.${name}.candidate.XXXXXX") || { rm -f "$raw"; exit 1; }
+trap 'rm -f "$raw" "$candidate"' EXIT HUP INT TERM
+dd bs=1024 count=257 of="$raw" 2>/dev/null
+bytes=$(wc -c <"$raw" | tr -d '[:space:]')
+if [ "$bytes" -gt 262144 ]; then
+	rp_output_error user-list '输入超过 256KiB 限制'
+	exit 1
+fi
+
+if [ -s "$raw" ]; then
+	if ! ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$format" "$raw" >"$candidate" 2>/dev/null; then
+		rp_output_error user-list '输入含非法条目；原文件未改变'
+		exit 1
+	fi
+else
+	: >"$candidate"
+fi
+chmod 0600 "$candidate"
+mv -f "$candidate" "$target"
+count=$(rp_list_count "$target")
+if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+	printf '{"ok":true,"operation":"user-list.write","name":"%s","count":%s,"bytes":%s}\n' "$name" "$count" "$bytes"
+else
+	printf '已写入 %s：%s 条\n' "$name" "$count"
+fi

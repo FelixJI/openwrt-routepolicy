@@ -1,0 +1,9 @@
+#!/bin/sh
+expr=${2:-}
+case "$expr" in
+	'@.l3_device') echo br-test ;;
+	'@["ipv4-address"][0].address') echo 192.0.2.1 ;;
+	'@["ipv4-address"][0].mask') echo 24 ;;
+	'@.up') echo true ;;
+	'@.routepolicy.instances.*.running'|'@.smartdns.instances.*.running') echo true ;;
+esac
