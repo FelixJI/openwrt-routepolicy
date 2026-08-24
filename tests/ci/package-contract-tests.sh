@@ -18,6 +18,9 @@ grep -q '^PKG_NAME:=routepolicy$' routepolicy/Makefile || fail '核心包名不�
 grep -q '^PKG_NAME:=luci-app-routepolicy$' luci-app-routepolicy/Makefile || fail 'LuCI 包名不正确'
 grep -q "^config main 'main'$" routepolicy/files/etc/config/routepolicy || fail '缺少 main 配置段'
 grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepolicy || fail '安装默认必须禁用'
+rpcd_plugin=luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
+grep -q '^#!/usr/bin/ucode$' "$rpcd_plugin" || fail 'rpcd ucode 插件缺少固定解释器'
+[ "$(git ls-files -s -- "$rpcd_plugin" | awk '{print $1}')" = 100755 ] || fail 'rpcd ucode 插件必须记录为可执行文件'
 
 # 发布树不得捆绑或引用仅供现场迁移后使用的本地清理脚本。
 if grep -R -n -E 'cleanup-legacy-splitroute-after-package-install\.sh' \
