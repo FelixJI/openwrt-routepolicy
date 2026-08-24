@@ -51,7 +51,7 @@ jobs:
           set -euo pipefail
           curl --fail --location --retry 3 --output sdk.tar.zst "$OPENWRT_SDK_BASE/$OPENWRT_SDK_ARCHIVE"
           curl --fail --location --retry 3 --output sha256sums "$OPENWRT_SDK_BASE/sha256sums"
-          awk -v file="$OPENWRT_SDK_ARCHIVE" '$2 == file || $2 == "*" file { print; found = 1 } END { exit !found }' sha256sums | sha256sum --check --status
+          awk -v file="$OPENWRT_SDK_ARCHIVE" '$2 == file || $2 == "*" file { print $1 "  sdk.tar.zst"; found = 1 } END { exit !found }' sha256sums | sha256sum --check --status
           tar --use-compress-program=unzstd -xf sdk.tar.zst
           mv "${OPENWRT_SDK_ARCHIVE%.tar.zst}" sdk
       - name: Install official release feeds and build packages
