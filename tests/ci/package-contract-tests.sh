@@ -21,6 +21,8 @@ grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepol
 rpcd_plugin=luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
 grep -q '^#!/usr/bin/ucode$' "$rpcd_plugin" || fail 'rpcd ucode 插件缺少固定解释器'
 [ "$(git ls-files -s -- "$rpcd_plugin" | awk '{print $1}')" = 100755 ] || fail 'rpcd ucode 插件必须记录为可执行文件'
+grep -Fq 'routepolicy-*.apk' scripts/ci/prepare-release.sh || fail 'Release 收集必须使用 OpenWrt APK 连字符命名'
+if grep -Fq 'routepolicy_*.apk' scripts/ci/prepare-release.sh; then fail 'Release 收集仍使用旧 IPK 风格下划线命名'; fi
 
 # 发布树不得捆绑或引用仅供现场迁移后使用的本地清理脚本。
 if grep -R -n -E 'cleanup-legacy-splitroute-after-package-install\.sh' \

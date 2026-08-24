@@ -6,7 +6,7 @@ SDK_DIR=${1:?需要 SDK 目录}
 OUT_DIR=${2:?需要输出目录}
 mkdir -p "$OUT_DIR"
 
-find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'routepolicy_*.apk' -o -name 'luci-app-routepolicy_*.apk' \) -exec cp {} "$OUT_DIR" \;
+find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'routepolicy-*.apk' -o -name 'luci-app-routepolicy-*.apk' \) -exec cp {} "$OUT_DIR" \;
 
 # SDK 会为 base、luci 等多个 feed 分别生成同名 Packages 文件；保留 feed
 # 前缀，避免在 Release 目录中相互覆盖。
@@ -15,8 +15,8 @@ find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'Packages' -o -name 'Packag
     cp "$index" "$OUT_DIR/$feed-$(basename "$index")"
 done
 
-routepolicy_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'routepolicy_*.apk' | wc -l | tr -d '[:space:]')
-luci_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'luci-app-routepolicy_*.apk' | wc -l | tr -d '[:space:]')
+routepolicy_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'routepolicy-*.apk' | wc -l | tr -d '[:space:]')
+luci_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'luci-app-routepolicy-*.apk' | wc -l | tr -d '[:space:]')
 [ "$routepolicy_count" -eq 1 ] || {
     printf '应恰好收集一个 routepolicy APK，实际为 %s。\n' "$routepolicy_count" >&2
     exit 1
@@ -29,9 +29,9 @@ luci_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'luci-app-routepolicy_*.a
 cat > "$OUT_DIR/INSTALL.txt" <<'EOF'
 RoutePolicy 安装说明（仅 OpenWrt 25.12 x86_64）
 
-从本 Release 下载 routepolicy_*.apk 和 luci-app-routepolicy_*.apk，上传到目标设备后：
-  apk add --allow-untrusted ./routepolicy_*.apk
-  apk add --allow-untrusted ./luci-app-routepolicy_*.apk
+从本 Release 下载 routepolicy-*.apk 和 luci-app-routepolicy-*.apk，上传到目标设备后：
+  apk add --allow-untrusted ./routepolicy-*.apk
+  apk add --allow-untrusted ./luci-app-routepolicy-*.apk
   routepolicyctl validate
 
 安装后保持默认禁用状态，先在 LuCI/UCI 核对接口与 SmartDNS 配置。不要在未验证的版本或架构上安装。
