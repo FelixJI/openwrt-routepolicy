@@ -1,7 +1,7 @@
 #!/bin/sh
 
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 CTL="$ROOT/routepolicy/files/usr/sbin/routepolicyctl"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-cli-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM

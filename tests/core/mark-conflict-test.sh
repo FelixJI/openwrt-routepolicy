@@ -1,7 +1,7 @@
 #!/bin/sh
 
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 . "$ROOT/routepolicy/files/usr/libexec/routepolicy/common"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-mark-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM

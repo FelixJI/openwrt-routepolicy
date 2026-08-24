@@ -1,7 +1,7 @@
 #!/bin/sh
 
 set -eu
-HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/common-test.sh"
 "$HERE/user-list-test.sh"
 "$HERE/cli-contract-test.sh"

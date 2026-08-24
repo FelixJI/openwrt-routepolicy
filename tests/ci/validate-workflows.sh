@@ -2,7 +2,7 @@
 # GitHub runner 自带 Ruby/Psych；用其解析 YAML，避免另行下载 YAML 工具。
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT"
 
 command -v ruby >/dev/null 2>&1 || {

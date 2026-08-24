@@ -1,7 +1,7 @@
 #!/bin/sh
 
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-smartdns-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM

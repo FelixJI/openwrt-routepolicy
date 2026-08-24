@@ -2,7 +2,7 @@
 # 不依赖 SDK 的快速契约测试，守住包的安装安全边界。
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT"
 
 fail() {

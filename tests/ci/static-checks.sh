@@ -2,7 +2,7 @@
 # 离线静态检查：只检查仓库内可执行脚本和 Web 资源，不下载依赖。
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT"
 
 shell_files=$(find routepolicy luci-app-routepolicy scripts tests -type f 2>/dev/null | while IFS= read -r file; do

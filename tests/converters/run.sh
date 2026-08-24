@@ -1,7 +1,7 @@
 #!/bin/sh
 
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 CONVERTERS="$ROOT/routepolicy/files/usr/libexec/routepolicy/converters"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-converter-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
