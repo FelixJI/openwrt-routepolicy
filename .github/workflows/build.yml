@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       # 官方 actions 使用稳定主版本；其余步骤均为 runner 内置命令，减少供应链面。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install offline check tools
         run: sudo apt-get update && sudo apt-get install --yes shellcheck
       - name: Check shell, ucode and JavaScript
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: static
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install SDK extractor
         run: sudo apt-get update && sudo apt-get install --yes zstd
       - name: Download and verify fixed OpenWrt SDK
@@ -76,7 +76,7 @@ jobs:
           printf '%s\n' 'CONFIG_PACKAGE_routepolicy=m' 'CONFIG_PACKAGE_luci-app-routepolicy=m' >> .config
           make defconfig
           make package/ucode/host/compile V=s
-          staging_dir/host/bin/ucode -c ../luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
+          staging_dir/hostpkg/bin/ucode -c ../luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
           make package/routepolicy/compile package/luci-app-routepolicy/compile V=s -j"$(nproc)"
           make package/index V=s
       - name: Collect release files
