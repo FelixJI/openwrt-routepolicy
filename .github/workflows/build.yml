@@ -84,7 +84,7 @@ jobs:
           set -eu
           OPENWRT_SDK_VERSION="$OPENWRT_VERSION" GITHUB_SHA="$(git rev-parse HEAD)" sh scripts/ci/prepare-release.sh sdk release-assets
       - name: Upload APK and package index artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openwrt-25.12-x86_64-apks
           path: release-assets/
