@@ -1,5 +1,5 @@
 #!/bin/sh
-# 将 SDK 生成的 APK 与 Packages 索引收集为 GitHub Release 附件。
+# 将 SDK 生成的 APK 与 apk 仓库索引收集为 GitHub Release 附件。
 set -eu
 
 SDK_DIR=${1:?需要 SDK 目录}
@@ -8,21 +8,27 @@ mkdir -p "$OUT_DIR"
 
 find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'routepolicy-*.apk' -o -name 'luci-app-routepolicy-*.apk' \) -exec cp {} "$OUT_DIR" \;
 
-# SDK 会为 base、luci 等多个 feed 分别生成同名 Packages 文件；保留 feed
-# 前缀，避免在 Release 目录中相互覆盖。
-find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'Packages' -o -name 'Packages.gz' -o -name 'Packages.manifest' -o -name 'Packages.sig' \) -print | while IFS= read -r index; do
+# OpenWrt 25.12 的 apk 索引名为 packages.adb；各 feed 会生成同名文件，
+# 因此保留 feed 前缀，避免在 Release 目录中相互覆盖。index.json 仅作为
+# 人类可读的审计辅助，不是 apk 客户端使用的仓库数据库。
+find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'packages.adb' -o -name 'index.json' \) -print | while IFS= read -r index; do
     feed=$(basename "$(dirname "$index")")
     cp "$index" "$OUT_DIR/$feed-$(basename "$index")"
 done
 
 routepolicy_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'routepolicy-*.apk' | wc -l | tr -d '[:space:]')
 luci_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name 'luci-app-routepolicy-*.apk' | wc -l | tr -d '[:space:]')
+index_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*-packages.adb' | wc -l | tr -d '[:space:]')
 [ "$routepolicy_count" -eq 1 ] || {
     printf '应恰好收集一个 routepolicy APK，实际为 %s。\n' "$routepolicy_count" >&2
     exit 1
 }
 [ "$luci_count" -eq 1 ] || {
     printf '应恰好收集一个 luci-app-routepolicy APK，实际为 %s。\n' "$luci_count" >&2
+    exit 1
+}
+[ "$index_count" -ge 1 ] || {
+    printf '未收集到 OpenWrt apk packages.adb 索引。\n' >&2
     exit 1
 }
 
@@ -35,7 +41,7 @@ RoutePolicy 安装说明（仅 OpenWrt 25.12 x86_64）
   routepolicyctl validate
 
 安装后保持默认禁用状态，先在 LuCI/UCI 核对接口与 SmartDNS 配置。不要在未验证的版本或架构上安装。
-Packages* 文件是本次构建产生的 APK 索引，供离线仓库或审计使用；发布 APK 未签名，直接安装时仅应使用本仓库 Release 中的文件。
+*-packages.adb 是本次构建产生的 apk 仓库索引，*-index.json 供人工审计；发布 APK 未签名，直接安装时仅应使用本仓库 Release 中的文件。
 下载全部 Release 附件后，先运行：
   sha256sum -c SHA256SUMS
 若任一文件校验失败，请停止安装并重新下载。

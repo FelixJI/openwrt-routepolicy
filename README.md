@@ -10,7 +10,7 @@
 
 ## 安装
 
-1. 在 [Releases](../../releases) 下载与目标版本对应的 `routepolicy-*.apk`、`luci-app-routepolicy-*.apk`、`Packages*` 索引文件、`INSTALL.txt` 和 `SHA256SUMS`。
+1. 在 [Releases](../../releases) 下载与目标版本对应的 `routepolicy-*.apk`、`luci-app-routepolicy-*.apk`、`*-packages.adb` 索引文件、`INSTALL.txt` 和 `SHA256SUMS`。
 2. 通过 OpenWrt 控制台上传 APK；保留可用的本地/VMM 回退入口。
 3. 在设备上先安装、但不要立即启用：
 

@@ -84,4 +84,4 @@ jobs:
             --title "$RELEASE_TAG — OpenWrt 25.12 x86_64" \
             --verify-tag \
             --generate-notes \
-            --notes "仅支持 OpenWrt 25.12 x86_64。APK 默认禁用；升级前备份配置，并按随附 INSTALL.txt 完成预检。发布附件包含 APK、Packages 索引和构建信息。"
+            --notes "仅支持 OpenWrt 25.12 x86_64。APK 默认禁用；升级前备份配置，并按随附 INSTALL.txt 完成预检。发布附件包含 APK、packages.adb 索引和构建信息。"
