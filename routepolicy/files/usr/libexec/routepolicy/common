@@ -1,4 +1,6 @@
 #!/bin/sh
+# Shared constants are consumed by scripts that source this file.
+# shellcheck disable=SC2034
 
 # Shared, side-effect-free helpers. Do not enable errexit here: callers decide.
 RP_ROOT=${ROUTEPOLICY_ROOT:-}
@@ -200,7 +202,7 @@ rp_validate_sources() {
 		case "$format" in plain-domain|plain-ipv4|hosts-domain|adblock-domain|dnsmasq-domain|clash-domain|clash-ipv4) ;; *) rp_err "$section.format 不受支持"; errors=$((errors + 1)) ;; esac
 		target=$(rp_uci_get "$section" target '')
 		case "$target" in domain-policy|domain-default|ipv4-policy|ipv4-default) ;; *) rp_err "$section.target 不受支持"; errors=$((errors + 1)) ;; esac
-		case "$format:$target" in *domain:domain-*|hosts-domain:domain-*|adblock-domain:domain-*|dnsmasq-domain:domain-*|clash-domain:domain-*|*ipv4:ipv4-*|clash-ipv4:ipv4-*) ;; *) rp_err "$section.format 与 target 类型不一致"; errors=$((errors + 1)) ;; esac
+		case "$format:$target" in *domain:domain-*|*ipv4:ipv4-*) ;; *) rp_err "$section.format 与 target 类型不一致"; errors=$((errors + 1)) ;; esac
 		minimum=$(rp_uci_get "$section" min_entries 1)
 		shrink=$(rp_uci_get "$section" max_shrink_percent 50)
 		rp_uint_between "$minimum" 1 10000000 || { rp_err "$section.min_entries 必须在 1..10000000"; errors=$((errors + 1)); }
