@@ -15,6 +15,9 @@ foreach ($view in $views) {
     if ($LASTEXITCODE -ne 0) { throw "JavaScript syntax check failed: $($view.FullName)" }
 }
 
+& node (Join-Path $PSScriptRoot 'module-contract-test.js')
+if ($LASTEXITCODE -ne 0) { throw 'LuCI module constructor contract failed' }
+
 $rpcText = Get-Content -Raw -Encoding UTF8 $rpc
 $methods = @(
     'status', 'validate', 'apply', 'reload', 'update', 'rollback', 'diagnose', 'import_legacy',
