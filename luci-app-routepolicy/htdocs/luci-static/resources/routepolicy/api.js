@@ -1,5 +1,6 @@
 'use strict';
 'require rpc';
+'require baseclass';
 
 const METHODS = [
 	'status', 'validate', 'apply', 'reload', 'update', 'rollback',
@@ -32,4 +33,4 @@ api.notice = function(ui, payload, fallback) {
 	return payload;
 };
 
-return api;
+return baseclass.extend(api);
