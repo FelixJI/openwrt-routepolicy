@@ -1,9 +1,20 @@
 #!/bin/sh
 [ "${1:-}" = -q ] && shift
+[ -z "${TEST_UCI_LOG:-}" ] || printf '%s\n' "$*" >>"$TEST_UCI_LOG"
 case "${1:-}" in
 	show)
-		[ "${2:-}" = routepolicy ] && printf 'routepolicy.main=main\n'
+		case "${2:-}" in
+			routepolicy) printf 'routepolicy.main=main\n' ;;
+			smartdns) printf 'smartdns.main=smartdns\n' ;;
+			*) exit 1 ;;
+		esac
 		;;
+	export)
+		[ "${2:-}" = smartdns ] || exit 1
+		printf "package smartdns\n\nconfig smartdns 'main'\n"
+		;;
+	import|batch) cat >/dev/null ;;
+	commit|add_list|del_list|delete|set) exit 0 ;;
 	get)
 		case "${2:-}" in
 			routepolicy.main.enabled) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo broken || echo 1 ;;

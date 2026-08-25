@@ -16,7 +16,11 @@ foreach ($view in $views) {
 }
 
 $rpcText = Get-Content -Raw -Encoding UTF8 $rpc
-$methods = @('status', 'validate', 'apply', 'reload', 'update', 'rollback', 'diagnose', 'import_legacy', 'read_user_list', 'write_user_list')
+$methods = @(
+    'status', 'validate', 'apply', 'reload', 'update', 'rollback', 'diagnose', 'import_legacy',
+    'read_user_list', 'write_user_list', 'smartdns_status', 'smartdns_save', 'smartdns_validate',
+    'smartdns_apply', 'smartdns_discard_candidate', 'read_local_hosts', 'write_local_hosts'
+)
 foreach ($method in $methods) {
     if ($rpcText -notmatch "(?m)^\s*${method}:") { throw "Missing fixed RPC method: $method" }
 }
@@ -38,6 +42,18 @@ if ($settingsText -notmatch 'handleSaveApply[\s\S]*api\.reload\(\)') {
 $aclText = Get-Content -Raw -Encoding UTF8 $acl
 foreach ($forbidden in @('file', 'exec', '*', '/bin/sh')) {
     if ($aclText -match [regex]::Escape($forbidden)) { throw "Overbroad ACL token found: $forbidden" }
+}
+if ($aclText -match '"uci"\s*:\s*\[[^\]]*"smartdns"') {
+    throw 'Browser ACL must not receive direct SmartDNS UCI write access'
+}
+$apiText = Get-Content -Raw -Encoding UTF8 (Join-Path $package 'htdocs/luci-static/resources/routepolicy/api.js')
+foreach ($method in $methods) {
+    if ($apiText -notmatch [regex]::Escape("'$method'")) { throw "Missing LuCI API declaration: $method" }
+    if ($aclText -notmatch [regex]::Escape('"' + $method + '"')) { throw "Missing ACL declaration: $method" }
+}
+$smartdnsView = Get-Content -Raw -Encoding UTF8 (Join-Path $package 'htdocs/luci-static/resources/view/routepolicy/smartdns.js')
+foreach ($required in @('api.smartdnsSave', 'api.smartdnsValidate', 'api.smartdnsApply', 'window.confirm', 'data-server')) {
+    if ($smartdnsView -notmatch [regex]::Escape($required)) { throw "SmartDNS page missing contract token: $required" }
 }
 
 Write-Output 'LuCI static contract checks passed.'

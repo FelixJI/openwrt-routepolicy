@@ -13,3 +13,4 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/apply-route-test.sh"
 "$HERE/import-legacy-test.sh"
 "$HERE/smartdns-lifecycle-test.sh"
+"$HERE/smartdns-management-test.sh"

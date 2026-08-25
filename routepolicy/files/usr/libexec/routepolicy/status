@@ -23,7 +23,7 @@ rule_present=0; ip -4 rule show 2>/dev/null | awk -v p="$priority:" -v m="$mark/
 blackhole=0; ip -4 route show table "$table" 2>/dev/null | grep -Eq '^blackhole default([[:space:]]|$)' && blackhole=1
 policy_default=0; ip -4 route show table "$table" 2>/dev/null | grep -Eq '^default([[:space:]]|$)' && policy_default=1
 main_default=0; ip -4 route show table main 2>/dev/null | grep -Eq '^default([[:space:]]|$)' && main_default=1
-smartdns_fragment=0; [ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] && smartdns_fragment=1
+smartdns_fragment=0; rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" && smartdns_fragment=1
 applied=0; [ -f "$RP_STATE_DIR/applied" ] && applied=1
 service_running=0
 ubus call service list '{"name":"routepolicy"}' 2>/dev/null | jsonfilter -e '@.routepolicy.instances.*.running' 2>/dev/null | grep -Eq '^(true|1)$' && service_running=1

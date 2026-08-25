@@ -9,6 +9,7 @@ usage() {
 Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollback} [--json]
        routepolicyctl import-legacy DIRECTORY [--json]
        routepolicyctl user-list {read|write} {domain-policy|domain-default|ipv4-policy|ipv4-default} [--json]
+       routepolicyctl smartdns-{status|save|validate|apply|discard|read-local-hosts|write-local-hosts} [--json]
 EOF
 	exit 2
 }
@@ -42,6 +43,14 @@ case "$command_name" in
 			usage
 		fi
 		exec "$LIBEXEC/user-list" "$1" "$2"
+		;;
+	smartdns-status|smartdns-save|smartdns-validate|smartdns-apply|smartdns-discard|smartdns-read-local-hosts|smartdns-write-local-hosts)
+		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then
+			export ROUTEPOLICY_OUTPUT=json
+		elif [ "$#" -ne 0 ]; then
+			usage
+		fi
+		exec "$LIBEXEC/smartdns-control" "${command_name#smartdns-}"
 		;;
 	*) usage ;;
 esac

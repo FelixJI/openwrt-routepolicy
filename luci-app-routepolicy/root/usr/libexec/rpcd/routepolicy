@@ -23,6 +23,11 @@ const COMMANDS = {
     update: [ '/usr/sbin/routepolicyctl', 'update', '--json' ],
     rollback: [ '/usr/sbin/routepolicyctl', 'rollback', '--json' ],
     diagnose: [ '/usr/sbin/routepolicyctl', 'diagnose', '--json' ],
+    smartdns_status: [ '/usr/sbin/routepolicyctl', 'smartdns-status', '--json' ],
+    smartdns_validate: [ '/usr/sbin/routepolicyctl', 'smartdns-validate', '--json' ],
+    smartdns_apply: [ '/usr/sbin/routepolicyctl', 'smartdns-apply', '--json' ],
+    smartdns_discard_candidate: [ '/usr/sbin/routepolicyctl', 'smartdns-discard', '--json' ],
+    read_local_hosts: [ '/usr/sbin/routepolicyctl', 'smartdns-read-local-hosts', '--json' ],
     import_legacy: [ '/usr/sbin/routepolicyctl', 'import-legacy', '/etc/splitroute', '--json' ]
 };
 
@@ -63,6 +68,21 @@ function run(operation) {
     if (!payload.message)
         payload.message = payload.ok ? '操作完成' : 'RoutePolicy 控制程序执行失败';
     return payload;
+}
+
+function write_core(command, content, success_message) {
+    if (type(content) != 'string' || length(content) > 262144)
+        return result(false, '候选内容必须是小于 256 KiB 的文本');
+    let proc = popen(command, 'w');
+    if (!proc)
+        return result(false, '无法启动 RoutePolicy 控制程序');
+    let written = proc.write(content);
+    if (written != length(content)) {
+        proc.close();
+        return result(false, '向核心事务层传递候选失败');
+    }
+    let exitcode = proc.close();
+    return exitcode == 0 ? result(true, success_message) : result(false, '核心事务层拒绝候选');
 }
 
 function list_name(req) {
@@ -116,6 +136,23 @@ return {
     update: { args: {}, call: function(req) { return run('update'); } },
     rollback: { args: {}, call: function(req) { return run('rollback'); } },
     diagnose: { args: {}, call: function(req) { return run('diagnose'); } },
+    smartdns_status: { args: {}, call: function(req) { return run('smartdns_status'); } },
+    smartdns_save: {
+        args: { content: 'String' },
+        call: function(req) {
+            return write_core([ '/usr/sbin/routepolicyctl', 'smartdns-save', '--json' ], req.content, 'SmartDNS 候选已保存');
+        }
+    },
+    smartdns_validate: { args: {}, call: function(req) { return run('smartdns_validate'); } },
+    smartdns_apply: { args: {}, call: function(req) { return run('smartdns_apply'); } },
+    smartdns_discard_candidate: { args: {}, call: function(req) { return run('smartdns_discard_candidate'); } },
+    read_local_hosts: { args: {}, call: function(req) { return run('read_local_hosts'); } },
+    write_local_hosts: {
+        args: { content: 'String' },
+        call: function(req) {
+            return write_core([ '/usr/sbin/routepolicyctl', 'smartdns-write-local-hosts', '--json' ], req.content, '本地主机候选已保存');
+        }
+    },
     import_legacy: { args: {}, call: function(req) { return run('import_legacy'); } },
     read_user_list: {
         args: { list: 'String' },
