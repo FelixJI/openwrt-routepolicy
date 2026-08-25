@@ -142,7 +142,7 @@ smartdns_status() {
 	[ "$root_count" -gt 0 ] && initialized=1
 	[ "$root_count" -gt 1 ] && ambiguous=1
 	[ "$root_count" -eq 1 ] && root=$(printf '%s\n' "$roots" | sed -n '1p')
-	enabled= port=53
+	enabled='' port=53
 	if [ -n "$root" ]; then
 		enabled=$(rp_uci_config_get smartdns "$root" enabled '')
 		port=$(rp_uci_config_get smartdns "$root" port 53)
