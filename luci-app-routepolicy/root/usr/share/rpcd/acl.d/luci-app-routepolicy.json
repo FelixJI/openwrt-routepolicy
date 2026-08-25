@@ -4,13 +4,13 @@
     "read": {
       "uci": [ "routepolicy" ],
       "ubus": {
-        "routepolicy": [ "status", "validate", "diagnose", "read_user_list" ]
+        "routepolicy": [ "status", "validate", "diagnose", "read_user_list", "smartdns_status", "smartdns_validate", "read_local_hosts" ]
       }
     },
     "write": {
       "uci": [ "routepolicy" ],
       "ubus": {
-        "routepolicy": [ "apply", "reload", "update", "rollback", "import_legacy", "write_user_list" ]
+        "routepolicy": [ "apply", "reload", "update", "rollback", "import_legacy", "write_user_list", "smartdns_save", "smartdns_apply", "smartdns_discard_candidate", "write_local_hosts" ]
       }
     }
   }

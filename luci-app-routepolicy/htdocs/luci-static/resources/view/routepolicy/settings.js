@@ -68,12 +68,13 @@ return view.extend({
 		a = s.taboption('advanced', form.Flag, 'smartdns_enabled', _('生成 SmartDNS 适配片段'));
 		a.tab = 'advanced';
 		a.default = '1';
+		a.description = _('该开关只控制 RoutePolicy 的 90 规则片段；SmartDNS 服务和上游请在“服务 → 路由策略 → SmartDNS”独立管理。');
 
 		a = s.taboption('advanced', form.Value, 'smartdns_policy_group', _('已存在的 SmartDNS 解析组'));
 		a.tab = 'advanced';
 		a.datatype = 'uciname';
 		a.default = 'policy';
-		a.description = _('只引用已有解析组；本应用不会创建或删除上游 DNS 服务器。');
+		a.description = _('RoutePolicy 域名规则引用的解析组；新的 SmartDNS 页面可在用户明确操作后管理上游，外部修改冲突时会拒绝覆盖。');
 
 		a = s.taboption('advanced', form.Flag, 'auto_update', _('定时更新'));
 		a.tab = 'advanced';

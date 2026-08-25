@@ -1,0 +1,461 @@
+#!/bin/sh
+
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+bool_json() { [ "$1" = 1 ] && printf true || printf false; }
+
+current_export() { uci -q export smartdns 2>/dev/null || true; }
+
+refresh_baseline() {
+	rp_ensure_dirs
+	[ -f "$RP_SMARTDNS_CANDIDATE" ] && return 0
+	version=0
+	[ ! -f "$RP_SMARTDNS_BASELINE_VERSION" ] || version=$(sed -n '1p' "$RP_SMARTDNS_BASELINE_VERSION")
+	rp_is_uint "$version" || version=0
+	version=$((version + 1))
+	current_export >"$RP_SMARTDNS_BASELINE.new"
+	printf '%s\n' "$version" >"$RP_SMARTDNS_BASELINE_VERSION.new"
+	chmod 0600 "$RP_SMARTDNS_BASELINE.new" "$RP_SMARTDNS_BASELINE_VERSION.new"
+	mv -f "$RP_SMARTDNS_BASELINE.new" "$RP_SMARTDNS_BASELINE"
+	mv -f "$RP_SMARTDNS_BASELINE_VERSION.new" "$RP_SMARTDNS_BASELINE_VERSION"
+}
+
+baseline_unchanged() {
+	[ -f "$RP_SMARTDNS_BASELINE" ] && [ ! -L "$RP_SMARTDNS_BASELINE" ] || return 1
+	current_export >"$RP_RUN_DIR/smartdns-current.uci"
+	cmp -s "$RP_SMARTDNS_BASELINE" "$RP_RUN_DIR/smartdns-current.uci"
+}
+
+candidate_value() { sed -n "s/^$1$(printf '\t')//p" "$2" | sed -n '1p'; }
+
+safe_scalar() {
+	value=$1 max=${2:-255}
+	[ "${#value}" -le "$max" ] || return 1
+	printf '%s' "$value" | LC_ALL=C grep -Eq '^[!-~]*$' || return 1
+	case "$value" in *"'"*|*\\*) return 1 ;; esac
+}
+
+safe_cache_path() {
+	path=$1
+	case "$path" in /etc/smartdns/*|/tmp/*|/var/cache/*) ;; *) return 1 ;; esac
+	case "/$path/" in */../*|*/./*) return 1 ;; esac
+	target="$RP_ROOT$path"
+	[ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || return 1
+	parent=$(dirname "$target")
+	[ ! -d "$parent" ] || {
+		resolved=$(readlink -f "$parent" 2>/dev/null) || return 1
+		case "$path:$resolved" in
+			/etc/smartdns/*:"$RP_ROOT/etc/smartdns"*|/tmp/*:"$RP_ROOT/tmp"*|/var/cache/*:"$RP_ROOT/var/cache"*) ;;
+			*) return 1 ;;
+		esac
+	}
+}
+
+validate_candidate() {
+	file=$1
+	[ -f "$file" ] && [ ! -L "$file" ] || { rp_err 'SmartDNS 候选不存在或不安全'; return 1; }
+	[ "$(wc -c <"$file")" -le 262144 ] || { rp_err 'SmartDNS 候选超过 256 KiB'; return 1; }
+	awk '{ line=$0; count=gsub(/\t/,"",line); if (count != 1) bad=1 } END { exit bad }' "$file" || { rp_err 'SmartDNS 候选每行必须恰好包含一个字段分隔符'; return 1; }
+	errors=0 seen_version=0 seen_initialize=0
+	while IFS="$(printf '\t')" read -r key value extra; do
+		[ -n "$key" ] || continue
+		[ -z "${extra:-}" ] || { rp_err "$key 包含额外字段"; errors=$((errors + 1)); continue; }
+		case "$key" in
+			version) rp_is_uint "$value" && seen_version=1 || { rp_err 'version 非法'; errors=$((errors + 1)); } ;;
+			initialize) rp_is_bool "$value" && seen_initialize=1 || { rp_err 'initialize 必须为 0 或 1'; errors=$((errors + 1)); } ;;
+			enabled|tcp_server|ipv6_server|cache_persist|prefetch_domain|serve_expired|dualstack_ip_selection|force_aaaa_soa|force_https_soa|dashboard_enabled|confirm_danger)
+				case "$value" in ''|0|1) ;; *) rp_err "$key 必须为继承、0 或 1"; errors=$((errors + 1)) ;; esac ;;
+			auto_set_dnsmasq) case "$value" in ''|0|1) ;; *) rp_err 'auto_set_dnsmasq 必须为继承、0 或 1'; errors=$((errors + 1)) ;; esac ;;
+			port|dashboard_port) rp_uint_between "$value" 1 65535 || { rp_err "$key 必须在 1..65535"; errors=$((errors + 1)); } ;;
+			cache_size) case "$value" in -1) ;; *) rp_uint_between "$value" 0 10000000 || { rp_err 'cache_size 必须为 -1、0 或正整数'; errors=$((errors + 1)); } ;; esac ;;
+			cache_checkpoint_time) rp_is_uint "$value" && { [ "$value" -eq 0 ] || [ "$value" -ge 120 ]; } || { rp_err 'cache_checkpoint_time 必须为 0 或至少 120'; errors=$((errors + 1)); } ;;
+			rr_ttl_min|rr_ttl_max|rr_ttl_reply_max|serve_expired_reply_ttl)
+				[ -z "$value" ] || { rp_is_uint "$value" && [ "$value" -gt 0 ]; } || { rp_err "$key 必须为空或正整数"; errors=$((errors + 1)); } ;;
+			cache_file) [ -z "$value" ] || safe_cache_path "$value" || { rp_err 'cache_file 不在允许目录或不是安全普通文件'; errors=$((errors + 1)); } ;;
+			local_domain) [ -z "$value" ] || rp_is_name "$value" 253 || { rp_err 'local_domain 非法'; errors=$((errors + 1)); } ;;
+			dashboard_data_dir) [ -z "$value" ] || { case "$value" in /etc/smartdns/*|/tmp/*|/var/lib/smartdns/*) safe_scalar "$value" 255 ;; *) false ;; esac; } || { rp_err 'dashboard_data_dir 非法'; errors=$((errors + 1)); } ;;
+			dashboard_log_retention) [ -z "$value" ] || rp_uint_between "$value" 0 3650 || { rp_err 'dashboard_log_retention 非法'; errors=$((errors + 1)); } ;;
+			server.*.*)
+				rest=${key#server.}; id=${rest%%.*}; field=${rest#*.}
+				field_value=$value
+				rp_is_name "$id" 64 || { rp_err '上游段标识非法'; errors=$((errors + 1)); continue; }
+				value=$field_value
+				case "$field" in
+					delete) rp_is_bool "$value" || { rp_err "$key 必须为 0 或 1"; errors=$((errors + 1)); } ;;
+					enabled|exclude_default_group|fallback) case "$value" in ''|0|1) ;; *) rp_err "$key 必须为继承、0 或 1"; errors=$((errors + 1)) ;; esac ;;
+					type) case "$value" in udp|tcp|tls|https|quic|h3) ;; *) rp_err "$key 协议非法"; errors=$((errors + 1)) ;; esac ;;
+					port) [ -z "$value" ] || rp_uint_between "$value" 1 65535 || { rp_err "$key 端口非法"; errors=$((errors + 1)); } ;;
+					name|ip|server_group|host_name|http_host|proxy|interface|set_mark) [ -z "$value" ] || safe_scalar "$value" 255 || { rp_err "$key 含非法字符"; errors=$((errors + 1)); } ;;
+					*) rp_err "不支持的上游字段: $field"; errors=$((errors + 1)) ;;
+				esac ;;
+			*) rp_err "不支持的 SmartDNS 字段: $key"; errors=$((errors + 1)) ;;
+		esac
+	done <"$file"
+	[ "$seen_version" -eq 1 ] || { rp_err '候选缺少 version'; errors=$((errors + 1)); }
+	[ "$seen_initialize" -eq 1 ] || { rp_err '候选缺少 initialize'; errors=$((errors + 1)); }
+	minimum=$(candidate_value rr_ttl_min "$file"); maximum=$(candidate_value rr_ttl_max "$file")
+	if [ -n "$minimum" ] && [ -n "$maximum" ] && [ "$minimum" -gt "$maximum" ] 2>/dev/null; then
+		rp_err 'rr_ttl_min 不能大于 rr_ttl_max'; errors=$((errors + 1))
+	fi
+	roots=$(rp_smartdns_root_sections); root_count=$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')
+	initialize=$(candidate_value initialize "$file")
+	[ "$root_count" -le 1 ] || { rp_err '存在多个 SmartDNS 根段，拒绝写入'; errors=$((errors + 1)); }
+	[ "$root_count" -ne 0 ] || [ "$initialize" = 1 ] || { rp_err 'SmartDNS 未初始化'; errors=$((errors + 1)); }
+	danger=0
+	for field in enabled auto_set_dnsmasq force_aaaa_soa force_https_soa dashboard_enabled cache_persist; do
+		value=$(candidate_value "$field" "$file")
+		case "$field:$value" in enabled:0|auto_set_dnsmasq:1|force_aaaa_soa:1|force_https_soa:1|dashboard_enabled:1|cache_persist:0) danger=1 ;; esac
+	done
+	awk -F '\t' '$1 ~ /^server\.[A-Za-z0-9_.-]+\.delete$/ && $2 == "1" { found=1 } END { exit !found }' "$file" && danger=1
+	if [ "$danger" -eq 1 ] && [ "$(candidate_value confirm_danger "$file")" != 1 ]; then
+		rp_err '危险操作缺少明确确认'; errors=$((errors + 1))
+	fi
+	if [ "$(candidate_value dashboard_enabled "$file")" = 1 ] && [ ! -x "$RP_ROOT/etc/init.d/smartdns-ui" ]; then
+		rp_err 'smartdns-ui 未安装，不能启用仪表盘'; errors=$((errors + 1))
+	fi
+	auto_dnsmasq=$(candidate_value auto_set_dnsmasq "$file")
+	if [ -z "$auto_dnsmasq" ] && [ "$root_count" -eq 1 ]; then root=$(printf '%s\n' "$roots" | sed -n '1p'); auto_dnsmasq=$(rp_uci_config_get smartdns "$root" auto_set_dnsmasq 0); fi
+	if [ "$auto_dnsmasq" = 1 ] && rp_have ubus; then
+		if ! ubus call service list '{"name":"dnsmasq"}' 2>/dev/null | jsonfilter -e '@.dnsmasq.instances.*.running' 2>/dev/null | grep -Eq '^(true|1)$'; then
+			rp_err 'dnsmasq 未运行，不能启用自动配置'; errors=$((errors + 1))
+		fi
+	fi
+	policy_group=$(rp_uci_get main smartdns_policy_group policy)
+	server_check=$(awk -F '\t' -v wanted="$policy_group" '
+		$1 ~ /^server\.[A-Za-z0-9_.-]+\./ { rest=$1; sub(/^server\./,"",rest); id=rest; sub(/\..*$/,"",id); field=rest; sub(/^[^.]+\./,"",field); touched=1; value[id,field]=$2; ids[id]=1 }
+		END { for(id in ids) if(value[id,"delete"] != "1" && value[id,"enabled"] != "0" && value[id,"server_group"] == wanted) found=1; print touched+0, found+0 }
+	' "$file")
+	set -- $server_check
+	if [ "${1:-0}" = 1 ] && [ "${2:-0}" != 1 ] && [ "$(rp_uci_get main smartdns_enabled 1)" = 1 ]; then
+		rp_err "上游变更会使 RoutePolicy 引用组 $policy_group 没有可用服务器"; errors=$((errors + 1))
+	fi
+	[ "$errors" -eq 0 ]
+}
+
+smartdns_status() {
+	refresh_baseline
+	roots=$(rp_smartdns_root_sections)
+	root_count=$(printf '%s\n' "$roots" | awk 'NF { n++ } END { print n+0 }')
+	initialized=0 ambiguous=0 root=
+	[ "$root_count" -gt 0 ] && initialized=1
+	[ "$root_count" -gt 1 ] && ambiguous=1
+	[ "$root_count" -eq 1 ] && root=$(printf '%s\n' "$roots" | sed -n '1p')
+	enabled= port=53
+	if [ -n "$root" ]; then
+		enabled=$(rp_uci_config_get smartdns "$root" enabled '')
+		port=$(rp_uci_config_get smartdns "$root" port 53)
+	fi
+	running=0
+	if rp_have ubus; then
+		ubus call service list '{"name":"smartdns"}' 2>/dev/null |
+			jsonfilter -e '@.smartdns.instances.*.running' 2>/dev/null |
+			grep -Eq '^(true|1)$' && running=1
+	fi
+	fragment90_exists=0; [ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] && fragment90_exists=1
+	fragment91_exists=0; [ -f "$RP_SMARTDNS_EXTRA_FILE" ] && [ ! -L "$RP_SMARTDNS_EXTRA_FILE" ] && fragment91_exists=1
+	fragment90_loaded=0; rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" && fragment90_loaded=1
+	fragment91_loaded=0; rp_smartdns_fragment_loaded "$RP_SMARTDNS_EXTRA_FILE" && fragment91_loaded=1
+	candidate=0
+	{ [ -f "$RP_SMARTDNS_CANDIDATE" ] && [ ! -L "$RP_SMARTDNS_CANDIDATE" ]; } || { [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ] && [ ! -L "$RP_LOCAL_HOSTS_CANDIDATE" ]; } && candidate=1
+	dashboard=0; [ -x "$RP_ROOT/etc/init.d/smartdns-ui" ] && dashboard=1
+	printf '{"ok":true,"operation":"smartdns-status","initialized":%s,"ambiguous":%s,"root_count":%s,' \
+		"$(bool_json "$initialized")" "$(bool_json "$ambiguous")" "$root_count"
+	version=$(sed -n '1p' "$RP_SMARTDNS_BASELINE_VERSION" 2>/dev/null)
+	printf '"root":"%s","enabled":"%s","port":"%s","running":%s,"candidate_pending":%s,"version":"%s",' \
+		"$(rp_json_escape "$root")" "$(rp_json_escape "$enabled")" "$(rp_json_escape "$port")" "$(bool_json "$running")" "$(bool_json "$candidate")" "$(rp_json_escape "$version")"
+	printf '"fragments":{"90":{"exists":%s,"loaded":%s},"91":{"exists":%s,"loaded":%s}},"dashboard":{"installed":%s},' \
+		"$(bool_json "$fragment90_exists")" "$(bool_json "$fragment90_loaded")" \
+		"$(bool_json "$fragment91_exists")" "$(bool_json "$fragment91_loaded")" "$(bool_json "$dashboard")"
+	printf '"settings":{'
+	first=1
+	for option in enabled port tcp_server ipv6_server auto_set_dnsmasq cache_size cache_persist cache_file prefetch_domain serve_expired rr_ttl_min rr_ttl_max rr_ttl_reply_max dualstack_ip_selection force_aaaa_soa force_https_soa local_domain; do
+		value=; [ -z "$root" ] || value=$(rp_uci_config_get smartdns "$root" "$option" '')
+		[ "$first" -eq 1 ] && first=0 || printf ','
+		printf '"%s":{"explicit":"%s","source":"%s"}' "$option" "$(rp_json_escape "$value")" "$([ -n "$value" ] && printf explicit || printf inherited)"
+	done
+	for extra_spec in 'cache_checkpoint_time:cache-checkpoint-time' 'serve_expired_reply_ttl:serve-expired-reply-ttl' 'dashboard_port:smartdns-ui.port' 'dashboard_data_dir:smartdns-ui.data-dir'; do
+		option=${extra_spec%%:*}; directive=${extra_spec#*:}; value=
+		[ ! -f "$RP_SMARTDNS_EXTRA_FILE" ] || value=$(awk -v key="$directive" '$1==key{print $2;exit}' "$RP_SMARTDNS_EXTRA_FILE")
+		[ "$first" -eq 1 ] && first=0 || printf ','
+		printf '"%s":{"explicit":"%s","source":"%s"}' "$option" "$(rp_json_escape "$value")" "$([ -n "$value" ] && printf explicit || printf inherited)"
+	done
+	dashboard_enabled=; dashboard_retention=
+	if [ -f "$RP_SMARTDNS_EXTRA_FILE" ]; then
+		dashboard_enabled=$(awk '$1=="smartdns-ui.enable"{if($2=="yes")print 1;else if($2=="no")print 0;exit}' "$RP_SMARTDNS_EXTRA_FILE")
+		dashboard_seconds=$(awk '$1=="smartdns-ui.max-query-log-age"{print $2;exit}' "$RP_SMARTDNS_EXTRA_FILE")
+		rp_is_uint "${dashboard_seconds:-}" && dashboard_retention=$((dashboard_seconds / 86400)) || dashboard_retention=
+	fi
+	printf ',"dashboard_enabled":{"explicit":"%s","source":"%s"}' "$dashboard_enabled" "$([ -n "$dashboard_enabled" ] && printf explicit || printf inherited)"
+	printf ',"dashboard_log_retention":{"explicit":"%s","source":"%s"}' "$dashboard_retention" "$([ -n "$dashboard_retention" ] && printf explicit || printf inherited)"
+	printf '},"servers":['
+	first=1
+	for server in $(rp_smartdns_server_sections); do
+		[ "$first" -eq 1 ] && first=0 || printf ','
+		printf '{"id":"%s"' "$(rp_json_escape "$server")"
+		for field in name enabled type ip port server_group exclude_default_group host_name http_host fallback proxy interface set_mark; do
+			value=$(rp_uci_config_get smartdns "$server" "$field" '')
+			printf ',"%s":"%s"' "$field" "$(rp_json_escape "$value")"
+		done
+		printf '}'
+	done
+	printf ']}\n'
+}
+
+smartdns_save() {
+	rp_ensure_dirs
+	tmp="$RP_RUN_DIR/smartdns-candidate.$$.new"
+	umask 077
+	if ! dd of="$tmp" bs=262145 count=1 2>/dev/null; then rm -f "$tmp"; rp_output_error smartdns-save '读取候选失败'; return 1; fi
+	if ! validate_candidate "$tmp"; then rm -f "$tmp"; rp_output_error smartdns-save 'SmartDNS 候选校验失败'; return 1; fi
+	requested=$(candidate_value version "$tmp")
+	current_version=$(sed -n '1p' "$RP_SMARTDNS_BASELINE_VERSION" 2>/dev/null)
+	if [ "$requested" != "$current_version" ] || ! baseline_unchanged; then
+		rm -f "$tmp"; rp_output_error smartdns-save 'SmartDNS 配置已被外部修改或版本令牌过期，请刷新'; return 1
+	fi
+	chmod 0600 "$tmp" && mv -f "$tmp" "$RP_SMARTDNS_CANDIDATE"
+	rp_output_ok smartdns-save 'SmartDNS 候选已保存，尚未应用'
+}
+
+smartdns_validate() {
+	if validate_candidate "$RP_SMARTDNS_CANDIDATE"; then
+		changes=$(awk -F '\t' '$1!="version" && $1!="confirm_danger" {n++} END{print n+0}' "$RP_SMARTDNS_CANDIDATE")
+		enabled=$(candidate_value enabled "$RP_SMARTDNS_CANDIDATE")
+		case "$enabled" in 0) service_action=stop ;; 1) service_action=start-or-reload ;; *) service_action=reload-effective-state ;; esac
+		dnsmasq=$(candidate_value auto_set_dnsmasq "$RP_SMARTDNS_CANDIDATE")
+		cache_delete=
+		if [ "$(candidate_value cache_persist "$RP_SMARTDNS_CANDIDATE")" = 0 ]; then cache_delete=$(candidate_value cache_file "$RP_SMARTDNS_CANDIDATE"); fi
+		dangerous=0; [ "$(candidate_value confirm_danger "$RP_SMARTDNS_CANDIDATE")" = 1 ] && dangerous=1
+		printf '{"ok":true,"operation":"smartdns-validate","message":"SmartDNS 候选校验通过","preview":{"changes":%s,"service_action":"%s","dnsmasq_auto":"%s","cache_delete":"%s","dangerous":%s}}\n' \
+			"$changes" "$service_action" "$(rp_json_escape "$dnsmasq")" "$(rp_json_escape "$cache_delete")" "$(bool_json "$dangerous")"
+	else
+		rp_output_error smartdns-validate 'SmartDNS 候选校验失败'; return 1
+	fi
+}
+
+smartdns_discard() {
+	rm -f "$RP_SMARTDNS_CANDIDATE" "$RP_LOCAL_HOSTS_CANDIDATE"
+	refresh_baseline
+	rp_output_ok smartdns-discard 'SmartDNS 候选已丢弃'
+}
+
+snapshot_file() {
+	source=$1 destination=$2
+	if [ -e "$source" ]; then
+		[ -f "$source" ] && [ ! -L "$source" ] || return 1
+		cp "$source" "$destination"
+	else
+		: >"$destination.absent"
+	fi
+}
+
+restore_file() {
+	target=$1 saved=$2
+	if [ -f "$saved" ]; then
+		mkdir -p "$(dirname "$target")" && cp "$saved" "$target"
+	else
+		rm -f "$target"
+	fi
+}
+
+render_extra_fragment() {
+	file=$1 output=$2
+	: >"$output"
+	checkpoint=$(candidate_value cache_checkpoint_time "$file")
+	expired_ttl=$(candidate_value serve_expired_reply_ttl "$file")
+	[ -z "$checkpoint" ] || printf 'cache-checkpoint-time %s\n' "$checkpoint" >>"$output"
+	[ -z "$expired_ttl" ] || printf 'serve-expired-reply-ttl %s\n' "$expired_ttl" >>"$output"
+	dashboard_enabled=$(candidate_value dashboard_enabled "$file")
+	dashboard_port=$(candidate_value dashboard_port "$file")
+	dashboard_data_dir=$(candidate_value dashboard_data_dir "$file")
+	dashboard_retention=$(candidate_value dashboard_log_retention "$file")
+	case "$dashboard_enabled" in 1) printf '%s\n' 'smartdns-ui.enable yes' >>"$output" ;; 0) printf '%s\n' 'smartdns-ui.enable no' >>"$output" ;; esac
+	[ -z "$dashboard_port" ] || printf 'smartdns-ui.port %s\n' "$dashboard_port" >>"$output"
+	[ -z "$dashboard_data_dir" ] || printf 'smartdns-ui.data-dir %s\n' "$dashboard_data_dir" >>"$output"
+	[ -z "$dashboard_retention" ] || printf 'smartdns-ui.max-query-log-age %s\n' "$((dashboard_retention * 86400))" >>"$output"
+}
+
+emit_uci_batch() {
+	file=$1 root=$2 output=$3
+	: >"$output"
+	while IFS="$(printf '\t')" read -r key value extra; do
+		[ -z "${extra:-}" ] || continue
+		case "$key" in
+			version|initialize|confirm_danger|serve_expired_reply_ttl|cache_checkpoint_time|dashboard_*) continue ;;
+			server.*.*)
+				rest=${key#server.}; id=${rest%%.*}; field=${rest#*.}
+				if [ "$field" = delete ] && [ "$value" = 1 ]; then
+					printf "delete smartdns.%s\n" "$id" >>"$output"
+					continue
+				fi
+				printf "set smartdns.%s=server\n" "$id" >>"$output"
+				[ -n "$value" ] && printf "set smartdns.%s.%s='%s'\n" "$id" "$field" "$value" >>"$output" || printf "delete smartdns.%s.%s\n" "$id" "$field" >>"$output"
+				;;
+			*)
+				[ -n "$value" ] && printf "set smartdns.%s.%s='%s'\n" "$root" "$key" "$value" >>"$output" || printf "delete smartdns.%s.%s\n" "$root" "$key" >>"$output"
+				;;
+		esac
+	done <"$file"
+}
+
+smartdns_apply() {
+	validate_candidate "$RP_SMARTDNS_CANDIDATE" || { rp_output_error smartdns-apply 'SmartDNS 候选校验失败'; return 1; }
+	baseline_unchanged || { rp_output_error smartdns-apply 'SmartDNS 配置已被外部修改，请刷新'; return 1; }
+	rp_ensure_dirs
+	lock="$RP_RUN_DIR/smartdns-apply.lock"
+	mkdir "$lock" 2>/dev/null || { rp_output_error smartdns-apply '另一个 SmartDNS 应用正在进行'; return 1; }
+	work=$(mktemp -d "$RP_RUN_DIR/smartdns-apply.XXXXXX") || { rmdir "$lock"; return 1; }
+	cleanup_apply() { rm -rf "$work"; rmdir "$lock" 2>/dev/null || true; }
+	trap cleanup_apply EXIT HUP INT TERM
+	current_export >"$work/smartdns.previous"
+	snapshot_file "$RP_SMARTDNS_FILE" "$work/90.previous" || { rp_output_error smartdns-apply '90 片段不是安全普通文件'; return 1; }
+	snapshot_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous" || { rp_output_error smartdns-apply '91 片段不是安全普通文件'; return 1; }
+	snapshot_file "$RP_LOCAL_HOSTS" "$work/hosts.previous" || { rp_output_error smartdns-apply '本地主机文件不是安全普通文件'; return 1; }
+	service_was_running=0
+	if rp_have ubus; then
+		ubus call service list '{"name":"smartdns"}' 2>/dev/null | jsonfilter -e '@.smartdns.instances.*.running' 2>/dev/null | grep -Eq '^(true|1)$' && service_was_running=1
+	fi
+	roots=$(rp_smartdns_root_sections); root=$(printf '%s\n' "$roots" | sed -n '1p')
+	if [ -z "$root" ]; then root=main; printf 'set smartdns.%s=smartdns\n' "$root" >"$work/uci.batch"; else : >"$work/uci.batch"; fi
+	emit_uci_batch "$RP_SMARTDNS_CANDIDATE" "$root" "$work/options.batch"
+	cat "$work/options.batch" >>"$work/uci.batch"
+	render_extra_fragment "$RP_SMARTDNS_CANDIDATE" "$work/91.candidate"
+	hosts_source=$RP_LOCAL_HOSTS
+	[ ! -f "$RP_LOCAL_HOSTS_CANDIDATE" ] || hosts_source=$RP_LOCAL_HOSTS_CANDIDATE
+	adapter_enabled=$(rp_uci_get main smartdns_enabled 1)
+	if [ "$adapter_enabled" = 1 ]; then rp_render_smartdns90 "$work/90.candidate" "$hosts_source" || { rp_output_error smartdns-apply '生成 90 片段失败'; return 1; }; fi
+	printf "del_list smartdns.%s.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'\n" "$root" >>"$work/uci.batch"
+	printf "del_list smartdns.%s.conf_files='/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n" "$root" >>"$work/uci.batch"
+	if [ "$adapter_enabled" = 1 ]; then
+		printf "add_list smartdns.%s.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'\n" "$root" >>"$work/uci.batch"
+	fi
+	if [ -s "$work/91.candidate" ]; then
+		printf "add_list smartdns.%s.conf_files='/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n" "$root" >>"$work/uci.batch"
+	fi
+	failed=
+	uci -q batch <"$work/uci.batch" || failed='写入 SmartDNS UCI 失败'
+	[ -n "$failed" ] || uci commit smartdns || failed='提交 SmartDNS UCI 失败'
+	if [ -z "$failed" ]; then
+		if [ "$adapter_enabled" = 1 ]; then
+			mkdir -p "$(dirname "$RP_SMARTDNS_FILE")"
+			cp "$work/90.candidate" "$RP_SMARTDNS_FILE.new" && chmod 0644 "$RP_SMARTDNS_FILE.new" && mv -f "$RP_SMARTDNS_FILE.new" "$RP_SMARTDNS_FILE" || failed='安装 90 片段失败'
+		else
+			rm -f "$RP_SMARTDNS_FILE" || failed='删除已关闭的 90 片段失败'
+		fi
+	fi
+	if [ -z "$failed" ]; then
+		if [ -s "$work/91.candidate" ]; then
+			mkdir -p "$(dirname "$RP_SMARTDNS_EXTRA_FILE")"
+			cp "$work/91.candidate" "$RP_SMARTDNS_EXTRA_FILE.new" && chmod 0644 "$RP_SMARTDNS_EXTRA_FILE.new" && mv -f "$RP_SMARTDNS_EXTRA_FILE.new" "$RP_SMARTDNS_EXTRA_FILE" || failed='安装 91 片段失败'
+		else
+			rm -f "$RP_SMARTDNS_EXTRA_FILE" || failed='删除空 91 片段失败'
+		fi
+	fi
+	if [ -z "$failed" ] && [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]; then
+		[ ! -L "$RP_LOCAL_HOSTS_CANDIDATE" ] || failed='本地主机候选不是安全普通文件'
+		if [ -z "$failed" ]; then
+			mkdir -p "$(dirname "$RP_LOCAL_HOSTS")"
+			cp "$RP_LOCAL_HOSTS_CANDIDATE" "$RP_LOCAL_HOSTS.new" && chmod 0600 "$RP_LOCAL_HOSTS.new" && mv -f "$RP_LOCAL_HOSTS.new" "$RP_LOCAL_HOSTS" || failed='安装本地主机文件失败'
+		fi
+	fi
+	enabled=$(candidate_value enabled "$RP_SMARTDNS_CANDIDATE")
+	[ -n "$enabled" ] || enabled=$(rp_uci_config_get smartdns "$root" enabled 1)
+	if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
+		if [ "$enabled" = 0 ]; then "$RP_ROOT/etc/init.d/smartdns" stop >"$work/service.log" 2>&1 || failed='停止 SmartDNS 失败';
+		elif [ "$service_was_running" = 1 ]; then "$RP_ROOT/etc/init.d/smartdns" reload >"$work/service.log" 2>&1 || failed='重载 SmartDNS 失败';
+		else "$RP_ROOT/etc/init.d/smartdns" start >"$work/service.log" 2>&1 || failed='启动 SmartDNS 失败'; fi
+	fi
+	if [ -z "$failed" ] && [ "$enabled" != 0 ]; then
+		if [ "$adapter_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then failed='90 片段未出现在 SmartDNS 实际生成配置中'; fi
+		if [ -s "$work/91.candidate" ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_EXTRA_FILE"; then failed='91 片段未出现在 SmartDNS 实际生成配置中'; fi
+	fi
+	if [ -z "$failed" ] && [ "$(candidate_value cache_persist "$RP_SMARTDNS_CANDIDATE")" = 0 ]; then
+		cache_file=$(candidate_value cache_file "$RP_SMARTDNS_CANDIDATE")
+		[ -n "$cache_file" ] || cache_file=$(rp_uci_config_get smartdns "$root" cache_file '')
+		if [ -n "$cache_file" ]; then
+			safe_cache_path "$cache_file" || failed='缓存文件路径在应用时不再安全'
+			[ -n "$failed" ] || rm -f "$RP_ROOT$cache_file" || failed='删除已确认关闭的持久缓存文件失败'
+		fi
+	fi
+	if [ -n "$failed" ]; then
+		if [ -s "$work/smartdns.previous" ]; then uci -q import smartdns <"$work/smartdns.previous" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; fi
+		restore_file "$RP_SMARTDNS_FILE" "$work/90.previous"
+		restore_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous"
+		restore_file "$RP_LOCAL_HOSTS" "$work/hosts.previous"
+		if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
+			if [ "$service_was_running" = 1 ]; then "$RP_ROOT/etc/init.d/smartdns" start >/dev/null 2>&1 || true
+			else "$RP_ROOT/etc/init.d/smartdns" stop >/dev/null 2>&1 || true; fi
+		fi
+		rp_output_error smartdns-apply "$failed；已恢复应用前配置与自有文件"
+		return 1
+	fi
+	current_export >"$RP_SMARTDNS_APPLIED"
+	cp "$RP_SMARTDNS_APPLIED" "$RP_SMARTDNS_BASELINE"
+	rm -f "$RP_SMARTDNS_CANDIDATE" "$RP_LOCAL_HOSTS_CANDIDATE"
+	rp_output_ok smartdns-apply 'SmartDNS 候选已独立应用并验证加载状态'
+}
+
+normalize_local_hosts() {
+	awk '
+	function ipv4(s, a,i) { if (split(s,a,".") != 4) return 0; for(i=1;i<=4;i++) if(a[i] !~ /^[0-9]+$/ || a[i] < 0 || a[i] > 255) return 0; return 1 }
+	function ipv6(s) { return index(s,":") && s ~ /^[0-9A-Fa-f:]+$/ && s !~ /:::/ }
+	function hostname(s, n,a,i) {
+		if (length(s) < 1 || length(s) > 253 || s !~ /^[A-Za-z0-9.-]+$/ || s ~ /^[-.]/ || s ~ /[-.]$/ || s ~ /\.\./) return 0
+		n=split(s,a,"."); for(i=1;i<=n;i++) if(length(a[i]) > 63 || a[i] ~ /^-/ || a[i] ~ /-$/) return 0; return 1
+	}
+	BEGIN { errors=0 }
+	/^[[:space:]]*(#|;|$)/ { next }
+	{
+		if (NF < 2 || (!ipv4($1) && !ipv6($1))) { errors=1; next }
+		ip=tolower($1); line=ip
+		for(i=2;i<=NF;i++) {
+			name=tolower($i)
+			if (!hostname(name) || (name_ip[name] && name_ip[name] != ip)) { errors=1; next }
+			name_ip[name]=ip; line=line " " name
+		}
+		print line
+	}
+	END { exit errors }
+	'
+}
+
+smartdns_write_local_hosts() {
+	rp_ensure_dirs
+	input="$RP_RUN_DIR/local-hosts.$$.input"; normalized="$RP_RUN_DIR/local-hosts.$$.new"
+	umask 077
+	dd of="$input" bs=262145 count=1 2>/dev/null || { rm -f "$input"; rp_output_error smartdns-write-local-hosts '读取本地主机失败'; return 1; }
+	if [ "$(wc -c <"$input")" -gt 262144 ] || ! normalize_local_hosts <"$input" >"$normalized"; then
+		rm -f "$input" "$normalized"; rp_output_error smartdns-write-local-hosts '本地主机格式、IP、名称或唯一性校验失败'; return 1
+	fi
+	if [ -e "$RP_LOCAL_HOSTS_CANDIDATE" ] && { [ ! -f "$RP_LOCAL_HOSTS_CANDIDATE" ] || [ -L "$RP_LOCAL_HOSTS_CANDIDATE" ]; }; then
+		rm -f "$input" "$normalized"; rp_output_error smartdns-write-local-hosts '本地主机目标不是安全普通文件'; return 1
+	fi
+	chmod 0600 "$normalized" && mv -f "$normalized" "$RP_LOCAL_HOSTS_CANDIDATE"
+	rm -f "$input"
+	rp_output_ok smartdns-write-local-hosts '本地主机候选已原子保存；下次 SmartDNS 应用生效'
+}
+
+smartdns_read_local_hosts() {
+	content=
+	if [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ] && [ ! -L "$RP_LOCAL_HOSTS_CANDIDATE" ]; then content=$(cat "$RP_LOCAL_HOSTS_CANDIDATE")
+	elif [ -f "$RP_LOCAL_HOSTS" ] && [ ! -L "$RP_LOCAL_HOSTS" ]; then content=$(cat "$RP_LOCAL_HOSTS"); fi
+	dynamic=
+	lease_file="$RP_ROOT/tmp/dhcp.leases"
+	if [ -f "$lease_file" ] && [ ! -L "$lease_file" ]; then
+		dynamic=$(awk 'NF>=4 && $4!="*" { print $3 " " tolower($4) }' "$lease_file")
+	fi
+	printf '{"ok":true,"operation":"smartdns-read-local-hosts","content":"%s","dynamic":"%s"}\n' \
+		"$(rp_json_escape "$content")" "$(rp_json_escape "$dynamic")"
+}
+
+case "${1:-}" in
+	status) smartdns_status ;;
+	save) smartdns_save ;;
+	validate) smartdns_validate ;;
+	apply) smartdns_apply ;;
+	discard) smartdns_discard ;;
+	read-local-hosts) smartdns_read_local_hosts ;;
+	write-local-hosts) smartdns_write_local_hosts ;;
+	*) rp_output_error smartdns '未知 SmartDNS 操作'; exit 2 ;;
+esac

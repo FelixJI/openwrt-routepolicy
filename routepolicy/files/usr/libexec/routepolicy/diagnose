@@ -38,8 +38,11 @@ if ip -4 rule show 2>/dev/null | grep -Fq "fwmark $mark/$mask"; then add_check p
 if ip -4 route show table "$table" 2>/dev/null | grep -Eq '^default([[:space:]]|$)'; then add_check policy-default pass '策略接口真实默认路由存在'; elif rp_interface_up "$policy"; then add_check policy-default fail '策略接口在线但真实默认路由缺失'; else add_check policy-default warn '策略接口离线，真实默认路由按设计移除'; fi
 if ip -4 route show table "$table" 2>/dev/null | grep -Eq '^blackhole default([[:space:]]|$)'; then add_check blackhole pass '策略表严格阻断存在'; else add_check blackhole fail '策略表严格阻断不存在'; fi
 if [ "$(rp_uci_get main smartdns_enabled 1)" = 0 ]; then add_check smartdns-fragment warn 'SmartDNS 适配已禁用';
-elif [ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] && ! grep -Eq '^[[:space:]]*server[[:space:]]' "$RP_SMARTDNS_FILE"; then add_check smartdns-fragment pass '独立片段存在且未定义上游服务器';
-else add_check smartdns-fragment fail '独立片段缺失、不安全或包含上游服务器'; fi
+elif [ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] && ! grep -Eq '^[[:space:]]*server[[:space:]]' "$RP_SMARTDNS_FILE" && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then add_check smartdns-fragment pass '90 片段安全且已进入实际生成配置';
+else add_check smartdns-fragment fail '90 片段缺失、不安全、包含上游或未实际加载'; fi
+if [ ! -e "$RP_SMARTDNS_EXTRA_FILE" ]; then add_check smartdns-extra warn '91 额外片段当前不需要';
+elif [ -f "$RP_SMARTDNS_EXTRA_FILE" ] && [ ! -L "$RP_SMARTDNS_EXTRA_FILE" ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_EXTRA_FILE"; then add_check smartdns-extra pass '91 额外片段已进入实际生成配置';
+else add_check smartdns-extra fail '91 额外片段不安全或未实际加载'; fi
 if rp_have nslookup; then
 	if nslookup localhost 127.0.0.1 >/dev/null 2>&1; then add_check dns-local pass '本机 DNS 能解析 localhost'; else add_check dns-local warn '本机 DNS localhost 查询失败'; fi
 else add_check dns-local warn '系统无 nslookup，跳过本机 DNS 探测'; fi

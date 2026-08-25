@@ -32,14 +32,30 @@ if [ "$mode" = teardown ]; then
 		have_applied=0
 	fi
 	smartdns_backup="$RP_SMARTDNS_FILE.teardown.$$"
+	smartdns_uci_backup="$RP_RUN_DIR/smartdns.teardown.$$.uci"
+	uci -q export smartdns >"$smartdns_uci_backup" 2>/dev/null || : >"$smartdns_uci_backup"
 	if [ -e "$RP_SMARTDNS_FILE" ]; then
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
 		mv "$RP_SMARTDNS_FILE" "$smartdns_backup" || { rp_output_error apply '无法暂存 SmartDNS 片段'; exit 1; }
+		if ! rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 0; then
+			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
+			rm -f "$smartdns_uci_backup"
+			rp_output_error apply '无法移除 SmartDNS 片段登记；已恢复原片段'
+			exit 1
+		fi
 		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
+			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
 			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
 			rp_output_error apply 'SmartDNS 重载失败；已恢复原片段且未拆除策略规则'
+			exit 1
+		fi
+		if rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
+			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
+			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+			rp_output_error apply 'SmartDNS 实际生成配置仍加载 90 片段；已回滚'
 			exit 1
 		fi
 	fi
@@ -69,6 +85,7 @@ if [ "$mode" = teardown ]; then
 		fi
 	fi
 	rm -f "$smartdns_backup"
+	rm -f "$smartdns_uci_backup"
 	if [ -n "$cleanup_failed" ]; then
 		rp_output_error apply "$cleanup_failed；已保留 applied 状态供下次精确清理"
 		exit 1
@@ -160,6 +177,7 @@ if [ -e "$RP_SMARTDNS_FILE" ]; then
 else
 	: >"$work/smartdns.previous.absent"
 fi
+uci -q export smartdns >"$work/smartdns.uci.previous" 2>/dev/null || : >"$work/smartdns.uci.previous"
 
 restore_previous() {
 	if [ -s "$work/nft.previous" ]; then
@@ -184,6 +202,9 @@ restore_previous() {
 		cp "$work/smartdns.previous" "$RP_SMARTDNS_FILE"
 	else
 		rm -f "$RP_SMARTDNS_FILE"
+	fi
+	if [ -s "$work/smartdns.uci.previous" ]; then
+		uci -q import smartdns <"$work/smartdns.uci.previous" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true
 	fi
 }
 
@@ -247,10 +268,25 @@ else
 	fi
 fi
 
+if [ -z "$failed" ]; then
+	if [ "$smartdns_enabled" = 1 ]; then
+		rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1 || failed='无法登记 SmartDNS 适配片段'
+	else
+		rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 0 || failed='无法移除 SmartDNS 适配片段登记'
+	fi
+fi
+
 if [ -z "$failed" ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
 	if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
 		"$RP_ROOT/etc/init.d/smartdns" reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
 	fi
+fi
+
+if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+	failed='SmartDNS 实际生成配置未加载 90 片段'
+fi
+if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 0 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+	failed='SmartDNS 实际生成配置仍加载已关闭的 90 片段'
 fi
 
 if [ -n "$failed" ]; then
