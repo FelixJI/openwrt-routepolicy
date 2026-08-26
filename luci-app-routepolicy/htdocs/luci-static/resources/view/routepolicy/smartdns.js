@@ -23,9 +23,9 @@ const SERVER_FIELDS = [ 'name', 'enabled', 'type', 'ip', 'port', 'server_group',
 
 function triSelect(key, value) {
 	return E('select', { 'data-key': key }, [
-		E('option', { value: '', selected: value === '' }, _('继承')),
-		E('option', { value: '1', selected: value === '1' }, _('开启')),
-		E('option', { value: '0', selected: value === '0' }, _('关闭'))
+		E('option', { value: '', selected: value === '' ? '' : null }, _('继承')),
+		E('option', { value: '1', selected: value === '1' ? '' : null }, _('开启')),
+		E('option', { value: '0', selected: value === '0' ? '' : null }, _('关闭'))
 	]);
 }
 
@@ -43,7 +43,7 @@ function serverInput(server, field) {
 	if (field === 'type')
 		return E('select', { 'data-key': 'server.' + server.id + '.type' },
 			[ 'udp', 'tcp', 'tls', 'https', 'quic', 'h3' ].map(function(protocol) {
-				return E('option', { value: protocol, selected: value === protocol }, protocol.toUpperCase());
+				return E('option', { value: protocol, selected: value === protocol ? '' : null }, protocol.toUpperCase());
 			}));
 	return E('input', { 'data-key': 'server.' + server.id + '.' + field, value: value, type: field === 'port' ? 'number' : 'text' });
 }
@@ -71,7 +71,8 @@ return view.extend({
 		this.serverBox = serverBox;
 		this.hosts = E('textarea', { id: 'smartdns-local-hosts', rows: 10, style: 'width:100%' }, hosts.content || '');
 		let statusText = this.status.ambiguous ? _('存在多个 SmartDNS 根段，写入已禁用。') :
-			(this.status.initialized ? _('已初始化') : _('未初始化；首次验证并应用时会在明确确认后创建最小根段。'));
+			(this.status.initialized ? _('已识别唯一 SmartDNS 根配置段；空白或“继承”表示该选项未显式配置。') :
+				_('未找到 SmartDNS 根配置段；首次验证并应用时会在明确确认后创建最小根段。'));
 		return E('div', { class: 'cbi-map' }, [
 			E('h2', {}, _('SmartDNS 管理')),
 			E('p', {}, _('SmartDNS 候选与 RoutePolicy 路由应用完全独立。继承表示删除对应 option；页面不会在打开时物化默认值。')),

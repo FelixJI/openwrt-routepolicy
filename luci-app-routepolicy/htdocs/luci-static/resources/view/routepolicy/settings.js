@@ -6,6 +6,23 @@
 'require ui';
 'require routepolicy/api as api';
 
+function validateMarkBit(sectionId, value) {
+	if (typeof value !== 'string' || !/^0x[0-9A-Fa-f]{1,8}$/.test(value))
+		return _('请输入以 0x 开头、不超过 8 位十六进制数字的单一 mark bit，例如 0x100。');
+
+	let number = parseInt(value, 16);
+	if (number < 1 || number > 0x80000000 || (number & (number - 1)) !== 0)
+		return _('mark 必须只包含一个非零 bit，例如 0x100。');
+
+	let peerName = this.option === 'mark' ? 'mark_mask' : 'mark';
+	let peer = this.map.lookupOption(peerName, sectionId);
+	let peerValue = peer ? peer[0].formvalue(peer[1]) : null;
+	if (peerValue && peerValue !== value)
+		return _('策略 mark bit 与 mark 掩码必须填写完全相同的值。');
+
+	return true;
+}
+
 return view.extend({
 	load: function() { return uci.load('routepolicy'); },
 
@@ -58,13 +75,16 @@ return view.extend({
 		a = s.taboption('advanced', form.Value, 'mark', _('策略 mark bit'));
 		a.tab = 'advanced';
 		a.default = '0x100';
-		a.datatype = 'or(hexstring,range(1,2147483647))';
-		a.description = _('仅使用指定 bit；RoutePolicy 不覆盖完整 fwmark。');
+		a.rmempty = false;
+		a.validate = validateMarkBit;
+		a.description = _('使用 0x 前缀的单一 32 位 mark bit；RoutePolicy 不覆盖完整 fwmark。');
 
 		a = s.taboption('advanced', form.Value, 'mark_mask', _('mark 掩码'));
 		a.tab = 'advanced';
 		a.default = '0x100';
-		a.datatype = 'or(hexstring,range(1,2147483647))';
+		a.rmempty = false;
+		a.validate = validateMarkBit;
+		a.description = _('必须与策略 mark bit 完全相同。');
 
 		a = s.taboption('advanced', form.Flag, 'smartdns_enabled', _('生成 SmartDNS 适配片段'));
 		a.tab = 'advanced';
