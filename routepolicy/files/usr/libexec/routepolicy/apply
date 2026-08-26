@@ -14,8 +14,12 @@ remove_owned_rule() {
 
 if [ "$mode" = teardown ]; then
 	rp_ensure_dirs
-	if [ "$(rp_uci_get main warm_restore 1)" = 1 ] && nft list table inet routepolicy >/dev/null 2>&1; then
-		"$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
+	nft_present=0
+	if nft list table inet routepolicy >/dev/null 2>&1; then
+		nft_present=1
+		if [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
+			"$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
+		fi
 	fi
 	# Stop must remove what was actually applied, even when UCI identifiers were
 	# edited at the same time as enabled=0. Without a complete valid ownership
@@ -26,6 +30,8 @@ if [ "$mode" = teardown ]; then
 	mask=$(rp_state_get mark_mask 2>/dev/null) || mask=
 	state_present=0
 	if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ]; then state_present=1; fi
+	owned_state_found=$nft_present
+	[ "$state_present" -eq 0 ] || owned_state_found=1
 	have_applied=1
 	if ! rp_uint_between "$table" 1 252 || ! rp_uint_between "$priority" 1 32765 || \
 		! rp_is_mark_bit "$mark" || ! rp_is_mark_bit "$mask" || [ "$mark" != "$mask" ]; then
@@ -35,6 +41,7 @@ if [ "$mode" = teardown ]; then
 	smartdns_uci_backup="$RP_RUN_DIR/smartdns.teardown.$$.uci"
 	uci -q export smartdns >"$smartdns_uci_backup" 2>/dev/null || : >"$smartdns_uci_backup"
 	if [ -e "$RP_SMARTDNS_FILE" ]; then
+		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
 		mv "$RP_SMARTDNS_FILE" "$smartdns_backup" || { rp_output_error apply '无法暂存 SmartDNS 片段'; exit 1; }
@@ -95,7 +102,11 @@ if [ "$mode" = teardown ]; then
 		exit 1
 	fi
 	[ "$have_applied" -eq 0 ] || rm -f "$RP_STATE_DIR/applied"
-	rp_output_ok apply '已删除 routepolicy 自有表、规则、路由和 SmartDNS 片段'
+	if [ "$owned_state_found" -eq 1 ]; then
+		rp_output_ok apply '停用清理完成：已删除 RoutePolicy 自有表、规则、路由和 SmartDNS 片段'
+	else
+		rp_output_ok apply '未发现已应用的 RoutePolicy 状态；保持停用'
+	fi
 	exit 0
 fi
 

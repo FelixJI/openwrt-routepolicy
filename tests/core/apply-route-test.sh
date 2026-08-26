@@ -39,10 +39,14 @@ fi
 }
 
 : >"$tmp/ip.log"; : >"$tmp/nft.log"
-TEST_ROUTE_TABLE=201 TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" \
+no_state_output=$(TEST_NFT_ABSENT=1 TEST_ROUTE_TABLE=201 TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" \
 	PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
 	ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
-	"$ROOT/routepolicy/files/usr/libexec/routepolicy/apply" teardown >/dev/null
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/apply" teardown)
+[ "$no_state_output" = '未发现已应用的 RoutePolicy 状态；保持停用' ] || {
+	printf 'empty teardown output was misleading: %s\n' "$no_state_output" >&2
+	exit 1
+}
 if grep -Fq -- '-4 route flush table ' "$tmp/ip.log"; then
 	printf 'teardown guessed and flushed a table without an applied ownership record\n' >&2; cat "$tmp/ip.log" >&2; exit 1
 fi

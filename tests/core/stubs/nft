@@ -2,6 +2,7 @@
 [ -z "${TEST_NFT_LOG:-}" ] || printf '%s\n' "$*" >>"$TEST_NFT_LOG"
 case "$*" in
 	'list table inet routepolicy')
+		[ "${TEST_NFT_ABSENT:-0}" != 1 ] || exit 1
 		if [ "${TEST_NFT_DELETE_FAIL:-0}" = 1 ] || [ -z "${TEST_NFT_LOG:-}" ] || ! grep -Fxq 'delete table inet routepolicy' "$TEST_NFT_LOG"; then
 			echo 'table inet routepolicy { }'
 		else

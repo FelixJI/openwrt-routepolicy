@@ -1,4 +1,3 @@
-#!/usr/bin/ucode
 'use strict';
 
 /*
@@ -46,10 +45,12 @@ function run(operation) {
     let output = proc.read('all') || '';
     let exitcode = proc.close();
 
-    if (operation == 'apply' || operation == 'reload')
+    if (operation == 'apply' || operation == 'reload') {
+        let lifecycle = trim(output);
         return exitcode == 0
-            ? result(true, '服务生命周期已与保存的 UCI 配置同步')
-            : result(false, 'RoutePolicy 服务启停或应用失败', { output: output });
+            ? result(true, lifecycle || '服务生命周期已与保存的 UCI 配置同步')
+            : result(false, lifecycle || 'RoutePolicy 服务启停或应用失败', { output: output });
+    }
 
     let payload = null;
 
@@ -91,6 +92,10 @@ function list_name(req) {
     return req.list;
 }
 
+function request_args(request) {
+    return request && type(request.args) == 'object' ? request.args : {};
+}
+
 function normalize_lines(content, kind) {
     if (type(content) != 'string' || length(content) > 262144)
         return result(false, '规则内容必须是小于 256 KiB 的纯文本');
@@ -129,6 +134,7 @@ function normalize_lines(content, kind) {
 }
 
 return {
+    routepolicy: {
     status: { args: {}, call: function(req) { return run('status'); } },
     validate: { args: {}, call: function(req) { return run('validate'); } },
     apply: { args: {}, call: function(req) { return run('apply'); } },
@@ -139,7 +145,8 @@ return {
     smartdns_status: { args: {}, call: function(req) { return run('smartdns_status'); } },
     smartdns_save: {
         args: { content: 'String' },
-        call: function(req) {
+        call: function(request) {
+            let req = request_args(request);
             return write_core([ '/usr/sbin/routepolicyctl', 'smartdns-save', '--json' ], req.content, 'SmartDNS 候选已保存');
         }
     },
@@ -149,14 +156,16 @@ return {
     read_local_hosts: { args: {}, call: function(req) { return run('read_local_hosts'); } },
     write_local_hosts: {
         args: { content: 'String' },
-        call: function(req) {
+        call: function(request) {
+            let req = request_args(request);
             return write_core([ '/usr/sbin/routepolicyctl', 'smartdns-write-local-hosts', '--json' ], req.content, '本地主机候选已保存');
         }
     },
     import_legacy: { args: {}, call: function(req) { return run('import_legacy'); } },
     read_user_list: {
         args: { list: 'String' },
-        call: function(req) {
+        call: function(request) {
+            let req = request_args(request);
             let kind = list_name(req);
             if (!kind)
                 return result(false, '未知的人工规则类型');
@@ -176,7 +185,8 @@ return {
     },
     write_user_list: {
         args: { list: 'String', content: 'String' },
-        call: function(req) {
+        call: function(request) {
+            let req = request_args(request);
             let kind = list_name(req);
             if (!kind)
                 return result(false, '未知的人工规则类型');
@@ -201,5 +211,6 @@ return {
                 return result(false, '核心校验或原子写入人工规则失败');
             return checked;
         }
+    }
     }
 };

@@ -76,7 +76,7 @@ jobs:
           printf '%s\n' 'CONFIG_PACKAGE_routepolicy=m' 'CONFIG_PACKAGE_luci-app-routepolicy=m' >> .config
           make defconfig
           make package/ucode/host/compile V=s
-          staging_dir/hostpkg/bin/ucode -c ../luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
+          staging_dir/hostpkg/bin/ucode -c ../luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
           make package/routepolicy/compile package/luci-app-routepolicy/compile V=s -j"$(nproc)"
           make package/index V=s
       - name: Collect release files
