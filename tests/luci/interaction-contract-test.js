@@ -25,11 +25,14 @@ class Element {
 	addEventListener(name, listener) { this.listeners[name] = listener; }
 	appendChild(child) {
 		if (Array.isArray(child)) {
-			child.forEach(this.appendChild.bind(this));
+			this.children.push(String(child));
 			return child;
 		}
 		this.children.push(child);
 		return child;
+	}
+	toString() {
+		return '[object HTML' + this.tagName.charAt(0).toUpperCase() + this.tagName.slice(1) + 'Element]';
 	}
 	replaceChildren(...children) {
 		this.children = [];
@@ -207,13 +210,24 @@ async function statusContract(filename) {
 		}
 	} });
 	const page = loadSource(filename, harness.dependencies, harness.globals);
-	const root = page.render({ service: { enabled: false } });
+	const root = page.render({
+		service: { enabled: false },
+		interfaces: {
+			lan: { device: 'br-lan', address: '192.0.2.1/24', online: true, message: 'LAN 正常' },
+			wan: { device: 'eth0', address: '198.51.100.2/24', online: true, message: '默认出口正常' },
+			policy: { device: 'eth1', address: '203.0.113.2/24', online: false, message: '策略出口离线' }
+		}
+	});
 	assert.ok((root.getAttribute('class') || '').split(/\s+/).includes('cbi-map'),
 		'the status page must use LuCI cbi-map structure');
 	const buttons = findAll(root, function(node) { return node.tagName === 'button'; });
 	const labels = buttons.map(nodeText);
 	assert.ok(labels.includes('启用并应用'), 'the status page must expose an explicit enable action');
 	assert.ok(labels.includes('停用并清理'), 'the status page must expose an explicit disable action');
+	assert.ok(!nodeText(root).includes('[object HTMLDivElement]'),
+		'interface rows must render as DOM rows instead of a stringified nested element array');
+	for (const expected of [ 'br-lan', 'eth0', 'eth1', '192.0.2.1/24', '198.51.100.2/24', '203.0.113.2/24' ])
+		assert.ok(nodeText(root).includes(expected), 'interface table must display ' + expected);
 	const validate = buttons.find(function(button) { return nodeText(button) === '验证候选配置'; });
 	assert.ok(validate && validate.listeners.click, 'validate action must be rendered');
 	await validate.listeners.click();
@@ -229,6 +243,10 @@ async function manualRuleFeedbackContract(filename) {
 	} });
 	const page = loadSource(filename, harness.dependencies, harness.globals);
 	const root = page.render({ ok: true, content: '' });
+	const pageText = nodeText(root);
+	assert.ok(pageText.includes('保存后如何生效'), 'manual rule page must label the post-save activation guidance');
+	for (const expected of [ '不会立即改变运行态', '运行状态', '验证候选配置', '重新应用当前配置' ])
+		assert.ok(pageText.includes(expected), 'manual rule activation guidance must explain: ' + expected);
 	const textarea = findAll(root, function(node) { return node.tagName === 'textarea'; })[0];
 	textarea.value = 'example.com\n';
 	const save = findAll(root, function(node) { return node.tagName === 'button' && nodeText(node) === '校验并保存'; })[0];
