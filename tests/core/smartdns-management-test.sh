@@ -17,12 +17,43 @@ case "${1:-}:${2:-}" in
 			0) exit 1 ;;
 			1) printf "smartdns.main=smartdns\nsmartdns.main.enabled='1'\nsmartdns.main.port='6053'\n" ;;
 			2) printf "smartdns.main=smartdns\nsmartdns.other=smartdns\n" ;;
+			anonymous) printf '%s\n' \
+				'smartdns.@smartdns[0]=smartdns' \
+				"smartdns.@smartdns[0].enabled='1'" \
+				"smartdns.@smartdns[0].port='6053'" \
+				'smartdns.@server[0]=server' \
+				"smartdns.@server[0].enabled='1'" \
+				"smartdns.@server[0].type='udp'" \
+				"smartdns.@server[0].ip='1.1.1.1'" \
+				"smartdns.@server[0].server_group='default'" \
+				'smartdns.@server[1]=server' \
+				"smartdns.@server[1].enabled='1'" \
+				"smartdns.@server[1].type='udp'" \
+				"smartdns.@server[1].ip='9.9.9.9'" \
+				"smartdns.@server[1].server_group='policy'" \
+				'smartdns.@server[2]=server' \
+				"smartdns.@server[2].enabled='1'" \
+				"smartdns.@server[2].type='udp'" \
+				"smartdns.@server[2].ip='8.8.8.8'" \
+				"smartdns.@server[2].server_group='default'" ;;
 		esac
 		;;
 	export:smartdns)
-		[ "${TEST_SMARTDNS_ROOTS:-0}" -gt 0 ] || exit 1
-		printf "package smartdns\n\nconfig smartdns 'main'\n\toption enabled '1'\n"
+		case "${TEST_SMARTDNS_ROOTS:-0}" in
+			0) exit 1 ;;
+			anonymous) printf "package smartdns\n\nconfig smartdns\n\toption enabled '1'\n\nconfig server\n\toption ip '1.1.1.1'\n\nconfig server\n\toption ip '9.9.9.9'\n\nconfig server\n\toption ip '8.8.8.8'\n" ;;
+			*) printf "package smartdns\n\nconfig smartdns 'main'\n\toption enabled '1'\n" ;;
+		esac
 		;;
+	"get:smartdns.@smartdns[0].enabled") printf '%s\n' 1 ;;
+	"get:smartdns.@smartdns[0].port") printf '%s\n' 6053 ;;
+	"get:smartdns.@server[0].enabled"|"get:smartdns.@server[1].enabled"|"get:smartdns.@server[2].enabled") printf '%s\n' 1 ;;
+	"get:smartdns.@server[0].type"|"get:smartdns.@server[1].type"|"get:smartdns.@server[2].type") printf '%s\n' udp ;;
+	"get:smartdns.@server[0].ip") printf '%s\n' 1.1.1.1 ;;
+	"get:smartdns.@server[1].ip") printf '%s\n' 9.9.9.9 ;;
+	"get:smartdns.@server[2].ip") printf '%s\n' 8.8.8.8 ;;
+	"get:smartdns.@server[0].server_group"|"get:smartdns.@server[2].server_group") printf '%s\n' default ;;
+	"get:smartdns.@server[1].server_group") printf '%s\n' policy ;;
 	batch:) cat >>"$TEST_UCI_LOG" ;;
 	import:smartdns) cat >/dev/null; printf '%s\n' import >>"$TEST_UCI_LOG" ;;
 	commit:smartdns) printf '%s\n' commit >>"$TEST_UCI_LOG" ;;
@@ -54,6 +85,44 @@ out=$(TEST_SMARTDNS_ROOTS=2 PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" R
 	"$CTL" smartdns-status --json)
 printf '%s\n' "$out" | grep -Fq '"ambiguous":true'
 printf '%s\n' "$out" | grep -Fq '"root_count":2'
+
+out=$(TEST_SMARTDNS_ROOTS=anonymous PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \
+	"$CTL" smartdns-status --json)
+printf '%s\n' "$out" | grep -Fq '"initialized":true' || {
+	printf '%s\n' 'anonymous SmartDNS root was not recognized as initialized' >&2
+	exit 1
+}
+printf '%s\n' "$out" | grep -Fq '"root_count":1'
+printf '%s\n' "$out" | grep -Fq '"root":"@smartdns[0]"'
+printf '%s\n' "$out" | grep -Fq '"enabled":{"explicit":"1","source":"explicit"}'
+printf '%s\n' "$out" | grep -Fq '"id":"@server[1]"'
+printf '%s\n' "$out" | grep -Fq '"server_group":"policy"'
+version=$(printf '%s\n' "$out" | sed -n 's/.*"version":"\([0-9][0-9]*\)".*/\1/p')
+{
+	printf 'version\t%s\n' "$version"
+	printf '%s\t%s\n' initialize 0 enabled 1 port 5353 \
+		'server.@server[1].enabled' 1 'server.@server[1].type' udp \
+		'server.@server[1].ip' 9.9.9.10 'server.@server[1].server_group' policy \
+		'server.@server[0].delete' 1 'server.@server[2].delete' 1 confirm_danger 1
+} | TEST_SMARTDNS_ROOTS=anonymous TEST_UCI_LOG="$tmp/uci.log" PATH="$tmp/bin:$PATH" \
+	ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/anonymous-save.json"
+grep -Fq '"ok":true' "$tmp/anonymous-save.json"
+: >"$tmp/uci.log"; : >"$tmp/smartdns.log"
+mkdir -p "$tmp/root/etc/smartdns/conf.d"
+TEST_SMARTDNS_ROOTS=anonymous TEST_UCI_LOG="$tmp/uci.log" TEST_SMARTDNS_LOG="$tmp/smartdns.log" \
+	PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \
+	"$CTL" smartdns-apply --json >"$tmp/anonymous-apply.json"
+grep -Fq '"ok":true' "$tmp/anonymous-apply.json"
+grep -Fq "set smartdns.@smartdns[0].port='5353'" "$tmp/uci.log"
+grep -Fq "set smartdns.@server[1].ip='9.9.9.10'" "$tmp/uci.log"
+if grep -Fq 'set smartdns.main=smartdns' "$tmp/uci.log" || grep -Fq 'set smartdns.@server[1]=server' "$tmp/uci.log"; then
+	printf '%s\n' 'anonymous SmartDNS apply created or retyped a section' >&2
+	exit 1
+fi
+awk '/delete smartdns\.@server\[2\]/{two=NR} /delete smartdns\.@server\[0\]/{zero=NR} END{exit !(two && zero && two < zero)}' "$tmp/uci.log" || {
+	printf '%s\n' 'anonymous SmartDNS servers were not deleted in descending index order' >&2
+	exit 1
+}
 
 out=$(TEST_SMARTDNS_ROOTS=1 PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \
 	"$CTL" smartdns-status --json)

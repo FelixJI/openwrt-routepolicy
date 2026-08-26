@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require form';
+'require tools.widgets as widgets';
 'require uci';
 'require ui';
 'require routepolicy/api as api';
@@ -17,16 +18,16 @@ return view.extend({
 		o.default = '0';
 		o.description = _('首次启用前，请确保已有 VMM 控制台或等效的带外回退路径。应用动作会再次要求确认。');
 
-		o = s.option(form.NetworkSelect, 'lan_interface', _('LAN 逻辑接口'));
+		o = s.option(widgets.NetworkSelect, 'lan_interface', _('LAN 逻辑接口'));
 		o.nocreate = true;
 		o.rmempty = false;
 		o.description = _('使用逻辑接口选择器；不会接受设备名或 shell 文本。');
 
-		o = s.option(form.NetworkSelect, 'default_interface', _('默认出口逻辑接口'));
+		o = s.option(widgets.NetworkSelect, 'default_interface', _('默认出口逻辑接口'));
 		o.nocreate = true;
 		o.rmempty = false;
 
-		o = s.option(form.NetworkSelect, 'policy_interface', _('策略出口逻辑接口'));
+		o = s.option(widgets.NetworkSelect, 'policy_interface', _('策略出口逻辑接口'));
 		o.nocreate = true;
 		o.rmempty = false;
 
