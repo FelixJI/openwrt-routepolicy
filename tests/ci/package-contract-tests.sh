@@ -16,13 +16,17 @@ fail() {
 
 grep -q '^PKG_NAME:=routepolicy$' routepolicy/Makefile || fail '核心包名不正确'
 grep -q '^PKG_NAME:=luci-app-routepolicy$' luci-app-routepolicy/Makefile || fail 'LuCI 包名不正确'
-grep -q '^PKG_VERSION:=0.2.1$' routepolicy/Makefile || fail '核心包版本未升级到 0.2.1 热修复'
-grep -q '^PKG_VERSION:=0.2.1$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.2.1 热修复'
+grep -q '^PKG_VERSION:=0.2.2$' routepolicy/Makefile || fail '核心包版本未升级到 0.2.2 热修复'
+grep -q '^PKG_VERSION:=0.2.2$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.2.2 热修复'
 grep -q "^config main 'main'$" routepolicy/files/etc/config/routepolicy || fail '缺少 main 配置段'
 grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepolicy || fail '安装默认必须禁用'
-rpcd_plugin=luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy
-grep -q '^#!/usr/bin/ucode$' "$rpcd_plugin" || fail 'rpcd ucode 插件缺少固定解释器'
-[ "$(git ls-files -s -- "$rpcd_plugin" | awk '{print $1}')" = 100755 ] || fail 'rpcd ucode 插件必须记录为可执行文件'
+rpcd_plugin=luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
+[ -f "$rpcd_plugin" ] || fail 'rpcd ucode 插件未安装到正式扫描目录'
+[ ! -e luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy ] || fail '包中仍保留错误的 exec 插件路径'
+grep -Fq '+rpcd-mod-ucode' luci-app-routepolicy/Makefile || fail 'LuCI 包缺少 rpcd ucode loader 依赖'
+grep -Fq 'luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy' .github/workflows/build.yml || fail '构建工作流未编译正式 rpcd ucode 路径'
+grep -Fq 'luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy' .github/workflows/release.yml || fail '发布工作流未编译正式 rpcd ucode 路径'
+if grep -R -Fq 'luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy' .github tests/luci/README.md; then fail 'CI 或测试说明仍引用错误的 rpcd exec 路径'; fi
 grep -Fq 'smartdns-control' routepolicy/Makefile || fail '核心包未安装 SmartDNS 深模块'
 grep -Fq '/etc/routepolicy/user.d/local-hosts.list' routepolicy/Makefile || fail '本地主机文件未声明为 conffile'
 grep -Fq '91-routepolicy-smartdns-extra.conf' routepolicy/Makefile || fail '卸载脚本未清理 91 片段登记'

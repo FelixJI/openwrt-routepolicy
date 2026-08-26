@@ -4,7 +4,7 @@ $repo = Resolve-Path (Join-Path $PSScriptRoot '../..')
 $package = Join-Path $repo 'luci-app-routepolicy'
 $acl = Join-Path $package 'root/usr/share/rpcd/acl.d/luci-app-routepolicy.json'
 $menu = Join-Path $package 'root/usr/share/luci/menu.d/luci-app-routepolicy.json'
-$rpc = Join-Path $package 'root/usr/libexec/rpcd/routepolicy'
+$rpc = Join-Path $package 'root/usr/share/rpcd/ucode/routepolicy'
 
 Get-Content -Raw -Encoding UTF8 $acl | ConvertFrom-Json | Out-Null
 Get-Content -Raw -Encoding UTF8 $menu | ConvertFrom-Json | Out-Null
@@ -17,6 +17,9 @@ foreach ($view in $views) {
 
 & node (Join-Path $PSScriptRoot 'module-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'LuCI module constructor contract failed' }
+
+& node (Join-Path $PSScriptRoot 'rpcd-contract-test.js')
+if ($LASTEXITCODE -ne 0) { throw 'rpcd ucode registration contract failed' }
 
 $rpcText = Get-Content -Raw -Encoding UTF8 $rpc
 $methods = @(
