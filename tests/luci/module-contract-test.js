@@ -1,5 +1,6 @@
 'use strict';
 
+const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
@@ -28,7 +29,26 @@ function loadModule(name, filename) {
 		baseclass: baseclass,
 		rpc: {
 			declare: function(spec) {
-				return function() { return spec.method; };
+				return function(...args) {
+					if (args.length === 0)
+						return spec.method;
+
+					const params = {};
+					if (Array.isArray(spec.params)) {
+						for (let i = 0; i < spec.params.length; i++)
+							params[spec.params[i]] = args[i];
+					}
+					else if (spec.params && typeof spec.params === 'object') {
+						const values = args[0];
+						if (values && typeof values === 'object') {
+							for (const key of Object.keys(spec.params))
+								if (Object.prototype.hasOwnProperty.call(values, key))
+									params[key] = values[key];
+						}
+					}
+
+					return { method: spec.method, params: params };
+				};
 			}
 		}
 	};
@@ -75,5 +95,17 @@ if (typeof api.smartdnsApply !== 'function' || api.smartdnsApply() !== 'smartdns
 	throw new Error('Loaded API instance must expose the SmartDNS apply RPC method');
 if (api.safeText(null) !== '—')
 	throw new Error('Loaded API instance must retain safeText behavior');
+assert.deepStrictEqual(api.readUserList({ list: 'domain-policy' }), {
+	method: 'read_user_list',
+	params: { list: 'domain-policy' }
+});
+assert.deepStrictEqual(api.writeUserList({ list: 'domain-default', content: 'example.com\n' }), {
+	method: 'write_user_list',
+	params: { list: 'domain-default', content: 'example.com\n' }
+});
+assert.deepStrictEqual(api.smartdnsSave('enabled\t1\n'), {
+	method: 'smartdns_save',
+	params: { content: 'enabled\t1\n' }
+});
 
 console.log('LuCI module constructor contract passed.');

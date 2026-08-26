@@ -2,32 +2,48 @@
 
 /*
  * rpcd object deliberately exposes a small, enumerable operation surface.
- * Every command below is a literal; no request field becomes a command, path,
- * nft expression, or shell fragment.
+ * OpenWrt 25.12 fs.popen() accepts command strings only. Every shell command
+ * below is therefore a complete literal; no request field becomes a command,
+ * path, nft expression, or shell fragment. Dynamic content is written to the
+ * child process through stdin.
  */
 import { popen } from 'fs';
 
 const LISTS = {
-    'domain-policy': true,
-    'domain-default': true,
-    'ipv4-policy': true,
-    'ipv4-default': true
+    'domain-policy': {
+        read: '/usr/sbin/routepolicyctl user-list read domain-policy --json',
+        write: '/usr/sbin/routepolicyctl user-list write domain-policy --json'
+    },
+    'domain-default': {
+        read: '/usr/sbin/routepolicyctl user-list read domain-default --json',
+        write: '/usr/sbin/routepolicyctl user-list write domain-default --json'
+    },
+    'ipv4-policy': {
+        read: '/usr/sbin/routepolicyctl user-list read ipv4-policy --json',
+        write: '/usr/sbin/routepolicyctl user-list write ipv4-policy --json'
+    },
+    'ipv4-default': {
+        read: '/usr/sbin/routepolicyctl user-list read ipv4-default --json',
+        write: '/usr/sbin/routepolicyctl user-list write ipv4-default --json'
+    }
 };
 
 const COMMANDS = {
-    status: [ '/usr/sbin/routepolicyctl', 'status', '--json' ],
-    validate: [ '/usr/sbin/routepolicyctl', 'validate', '--json' ],
-    apply: [ '/etc/init.d/routepolicy', 'restart' ],
-    reload: [ '/etc/init.d/routepolicy', 'restart' ],
-    update: [ '/usr/sbin/routepolicyctl', 'update', '--json' ],
-    rollback: [ '/usr/sbin/routepolicyctl', 'rollback', '--json' ],
-    diagnose: [ '/usr/sbin/routepolicyctl', 'diagnose', '--json' ],
-    smartdns_status: [ '/usr/sbin/routepolicyctl', 'smartdns-status', '--json' ],
-    smartdns_validate: [ '/usr/sbin/routepolicyctl', 'smartdns-validate', '--json' ],
-    smartdns_apply: [ '/usr/sbin/routepolicyctl', 'smartdns-apply', '--json' ],
-    smartdns_discard_candidate: [ '/usr/sbin/routepolicyctl', 'smartdns-discard', '--json' ],
-    read_local_hosts: [ '/usr/sbin/routepolicyctl', 'smartdns-read-local-hosts', '--json' ],
-    import_legacy: [ '/usr/sbin/routepolicyctl', 'import-legacy', '/etc/splitroute', '--json' ]
+    status: '/usr/sbin/routepolicyctl status --json',
+    validate: '/usr/sbin/routepolicyctl validate --json',
+    apply: '/etc/init.d/routepolicy restart',
+    reload: '/etc/init.d/routepolicy restart',
+    update: '/usr/sbin/routepolicyctl update --json',
+    rollback: '/usr/sbin/routepolicyctl rollback --json',
+    diagnose: '/usr/sbin/routepolicyctl diagnose --json',
+    smartdns_status: '/usr/sbin/routepolicyctl smartdns-status --json',
+    smartdns_save: '/usr/sbin/routepolicyctl smartdns-save --json',
+    smartdns_validate: '/usr/sbin/routepolicyctl smartdns-validate --json',
+    smartdns_apply: '/usr/sbin/routepolicyctl smartdns-apply --json',
+    smartdns_discard_candidate: '/usr/sbin/routepolicyctl smartdns-discard --json',
+    read_local_hosts: '/usr/sbin/routepolicyctl smartdns-read-local-hosts --json',
+    write_local_hosts: '/usr/sbin/routepolicyctl smartdns-write-local-hosts --json',
+    import_legacy: '/usr/sbin/routepolicyctl import-legacy /etc/splitroute --json'
 };
 
 function result(ok, message, extra) {
@@ -147,7 +163,7 @@ return {
         args: { content: 'String' },
         call: function(request) {
             let req = request_args(request);
-            return write_core([ '/usr/sbin/routepolicyctl', 'smartdns-save', '--json' ], req.content, 'SmartDNS 候选已保存');
+            return write_core(COMMANDS.smartdns_save, req.content, 'SmartDNS 候选已保存');
         }
     },
     smartdns_validate: { args: {}, call: function(req) { return run('smartdns_validate'); } },
@@ -158,7 +174,7 @@ return {
         args: { content: 'String' },
         call: function(request) {
             let req = request_args(request);
-            return write_core([ '/usr/sbin/routepolicyctl', 'smartdns-write-local-hosts', '--json' ], req.content, '本地主机候选已保存');
+            return write_core(COMMANDS.write_local_hosts, req.content, '本地主机候选已保存');
         }
     },
     import_legacy: { args: {}, call: function(req) { return run('import_legacy'); } },
@@ -169,7 +185,7 @@ return {
             let kind = list_name(req);
             if (!kind)
                 return result(false, '未知的人工规则类型');
-            let proc = popen([ '/usr/sbin/routepolicyctl', 'user-list', 'read', kind, '--json' ], 'r');
+            let proc = popen(LISTS[kind].read, 'r');
             if (!proc)
                 return result(false, '无法启动 RoutePolicy 控制程序');
             let output = proc.read('all') || '';
@@ -194,11 +210,11 @@ return {
             if (!checked.ok)
                 return checked;
             /*
-             * argv is an execvp vector, not a shell command. The core command
-             * owns same-directory candidate creation, regular-file checks and
-             * atomic replacement after accepting only this enumerated list kind.
+             * The selected command is a complete literal from LISTS. The core
+             * command owns same-directory candidate creation, regular-file
+             * checks and atomic replacement after accepting the enumerated kind.
              */
-            let proc = popen([ '/usr/sbin/routepolicyctl', 'user-list', 'write', kind, '--json' ], 'w');
+            let proc = popen(LISTS[kind].write, 'w');
             if (!proc)
                 return result(false, '无法启动 RoutePolicy 控制程序');
             let content = join('\n', checked.valid) + (checked.valid.length ? '\n' : '');

@@ -77,6 +77,7 @@ jobs:
           make defconfig
           make package/ucode/host/compile V=s
           staging_dir/hostpkg/bin/ucode -c ../luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
+          staging_dir/hostpkg/bin/ucode ../tests/luci/ucode-popen-contract.uc
           make package/routepolicy/compile package/luci-app-routepolicy/compile V=s -j"$(nproc)"
           make package/index V=s
       - name: Collect release files
