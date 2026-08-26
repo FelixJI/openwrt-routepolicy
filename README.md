@@ -32,16 +32,43 @@ RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 n
 
 ## 升级
 
-升级前先备份配置，并保留上一个 Release 的 APK：
+升级前先备份配置，并保留上一个 Release 的 APK。下面的命令会从 GitHub `latest` Release 自动识别两个最新版 APK，分别保存为固定文件名并一次性更新，无需手工填写版本号：
 
 ```sh
+set -eu
+
 sysupgrade -b /tmp/before-routepolicy.tar.gz
-apk add --allow-untrusted ./routepolicy-*.apk ./luci-app-routepolicy-*.apk
+
+REPO=FelixJI/openwrt-routepolicy
+ASSET_URLS="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" \
+  | jsonfilter -e '@.assets[*].browser_download_url')"
+CORE_URL="$(printf '%s\n' "$ASSET_URLS" \
+  | grep '/routepolicy-[0-9][^/]*\.apk$' | head -n 1)"
+LUCI_URL="$(printf '%s\n' "$ASSET_URLS" \
+  | grep '/luci-app-routepolicy-[0-9][^/]*\.apk$' | head -n 1)"
+
+[ -n "$CORE_URL" ] && [ -n "$LUCI_URL" ] || {
+  echo '未在 latest Release 中找到完整的 RoutePolicy APK'
+  exit 1
+}
+
+LATEST_DOWNLOAD="https://github.com/${REPO}/releases/latest/download"
+CORE_ASSET="${CORE_URL##*/}"
+LUCI_ASSET="${LUCI_URL##*/}"
+
+cd /tmp
+wget -O routepolicy-latest.apk "${LATEST_DOWNLOAD}/${CORE_ASSET}"
+wget -O luci-app-routepolicy-latest.apk "${LATEST_DOWNLOAD}/${LUCI_ASSET}"
+apk add --allow-untrusted \
+  ./routepolicy-latest.apk \
+  ./luci-app-routepolicy-latest.apk
 routepolicyctl validate
 routepolicyctl diagnose
 ubus list | grep -qx routepolicy
 ubus call routepolicy status '{}'
 ```
+
+该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，并在任一 APK 未找到或下载失败时停止。这里使用 `apk add` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器；若 LuCI 仍显示旧页面，请强制刷新浏览器缓存。
 
 每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
 
