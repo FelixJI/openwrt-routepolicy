@@ -18,6 +18,9 @@ foreach ($view in $views) {
 & node (Join-Path $PSScriptRoot 'module-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'LuCI module constructor contract failed' }
 
+& node (Join-Path $PSScriptRoot 'view-render-contract-test.js')
+if ($LASTEXITCODE -ne 0) { throw 'LuCI view render contract failed' }
+
 & node (Join-Path $PSScriptRoot 'rpcd-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'rpcd ucode registration contract failed' }
 

@@ -49,12 +49,25 @@ rp_uci_config_get() {
 
 rp_smartdns_root_sections() {
 	uci -q show smartdns 2>/dev/null |
-		sed -n 's/^smartdns\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=smartdns$/\1/p'
+		sed -n \
+			-e 's/^smartdns\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=smartdns$/\1/p' \
+			-e 's/^smartdns\.\(@smartdns\[[0-9][0-9]*\]\)=smartdns$/\1/p'
 }
 
 rp_smartdns_server_sections() {
 	uci -q show smartdns 2>/dev/null |
-		sed -n 's/^smartdns\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=server$/\1/p'
+		sed -n \
+			-e 's/^smartdns\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=server$/\1/p' \
+			-e 's/^smartdns\.\(@server\[[0-9][0-9]*\]\)=server$/\1/p'
+}
+
+rp_is_smartdns_server_ref() {
+	value=${1-}
+	[ -n "$value" ] && [ "${#value}" -le 64 ] || return 1
+	if printf '%s\n' "$value" | LC_ALL=C grep -Eq '^[A-Za-z0-9_]+$'; then
+		return 0
+	fi
+	printf '%s\n' "$value" | LC_ALL=C grep -Eq '^@server\[[0-9]+\]$'
 }
 
 rp_smartdns_fragment_loaded() {

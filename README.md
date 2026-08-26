@@ -49,6 +49,8 @@ ubus call routepolicy status '{}'
 
 LuCI 入口为“服务 → 路由策略 → SmartDNS”。它不依赖官方 `luci-app-smartdns`，但可以与其共存；若 SSH、官方页面或其他工具在本页面打开后修改了 SmartDNS UCI，版本/基线比较会拒绝覆盖并要求刷新。SmartDNS 的“保存候选/验证并应用”与 RoutePolicy 的 nftables、策略路由应用完全分离，RoutePolicy 停用时仍可管理 DNS。
 
+页面中的“已初始化”只表示识别到一个 `config smartdns` 根段，不表示服务已安装、正在运行或候选已经应用。命名根段和常见的匿名 `config smartdns` 都会被识别；不存在根段时，“保存 SmartDNS”只保存候选，首次“验证并应用”才会创建最小命名根段。已有匿名 `config server` 会按 `@server[N]` 精确显示和编辑，页面打开后的外部重排仍会触发基线冲突并拒绝覆盖。新建上游使用仅含字母、数字和下划线的稳定 UCI 段标识。
+
 配置所有权按层分开：
 
 - `/etc/config/smartdns` 保存 SmartDNS 服务、监听、上游、缓存、TTL、DNS 行为及两个附加片段的 `conf_files` 登记。RoutePolicy 只精确修改页面涉及的字段，保留未知 option、未知段和其他 `conf_files`。

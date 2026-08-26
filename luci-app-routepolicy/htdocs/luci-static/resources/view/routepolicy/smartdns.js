@@ -71,7 +71,7 @@ return view.extend({
 		this.serverBox = serverBox;
 		this.hosts = E('textarea', { id: 'smartdns-local-hosts', rows: 10, style: 'width:100%' }, hosts.content || '');
 		let statusText = this.status.ambiguous ? _('存在多个 SmartDNS 根段，写入已禁用。') :
-			(this.status.initialized ? _('已初始化') : _('未初始化；首次保存会在明确确认后创建最小根段。'));
+			(this.status.initialized ? _('已初始化') : _('未初始化；首次验证并应用时会在明确确认后创建最小根段。'));
 		return E('div', { class: 'cbi-map' }, [
 			E('h2', {}, _('SmartDNS 管理')),
 			E('p', {}, _('SmartDNS 候选与 RoutePolicy 路由应用完全独立。继承表示删除对应 option；页面不会在打开时物化默认值。')),
@@ -100,9 +100,9 @@ return view.extend({
 	},
 
 	addServer: function() {
-		let id = window.prompt(_('请输入稳定的 UCI 段标识（字母、数字、点、下划线或连字符）'));
+		let id = window.prompt(_('请输入稳定的 UCI 段标识（仅限字母、数字和下划线）'));
 		if (!id) return;
-		if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(id)) {
+		if (!/^[A-Za-z0-9_]{1,64}$/.test(id)) {
 			ui.addNotification(null, E('p', {}, _('上游段标识非法')), 'error'); return;
 		}
 		this.serverBox.appendChild(serverCard({ id: id, enabled: '1', type: 'udp' }));

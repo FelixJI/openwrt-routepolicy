@@ -28,7 +28,7 @@ baseline_unchanged() {
 	cmp -s "$RP_SMARTDNS_BASELINE" "$RP_RUN_DIR/smartdns-current.uci"
 }
 
-candidate_value() { sed -n "s/^$1$(printf '\t')//p" "$2" | sed -n '1p'; }
+candidate_value() { awk -F '\t' -v wanted="$1" '$1 == wanted { print $2; exit }' "$2"; }
 
 safe_scalar() {
 	value=$1 max=${2:-255}
@@ -80,7 +80,7 @@ validate_candidate() {
 			server.*.*)
 				rest=${key#server.}; id=${rest%%.*}; field=${rest#*.}
 				field_value=$value
-				rp_is_name "$id" 64 || { rp_err '上游段标识非法'; errors=$((errors + 1)); continue; }
+				rp_is_smartdns_server_ref "$id" || { rp_err '上游段标识非法'; errors=$((errors + 1)); continue; }
 				value=$field_value
 				case "$field" in
 					delete) rp_is_bool "$value" || { rp_err "$key 必须为 0 或 1"; errors=$((errors + 1)); } ;;
@@ -278,7 +278,9 @@ render_extra_fragment() {
 
 emit_uci_batch() {
 	file=$1 root=$2 output=$3
-	: >"$output"
+	named_deletes="$output.named-deletes"
+	anonymous_deletes="$output.anonymous-deletes"
+	: >"$output"; : >"$named_deletes"; : >"$anonymous_deletes"
 	while IFS="$(printf '\t')" read -r key value extra; do
 		[ -z "${extra:-}" ] || continue
 		case "$key" in
@@ -286,10 +288,17 @@ emit_uci_batch() {
 			server.*.*)
 				rest=${key#server.}; id=${rest%%.*}; field=${rest#*.}
 				if [ "$field" = delete ] && [ "$value" = 1 ]; then
-					printf "delete smartdns.%s\n" "$id" >>"$output"
+					case "$id" in
+						@server\[*\])
+							index=$(printf '%s\n' "$id" | sed -n 's/^@server\[\([0-9][0-9]*\)\]$/\1/p')
+							printf '%s\tdelete smartdns.%s\n' "$index" "$id" >>"$anonymous_deletes"
+							;;
+						*) printf "delete smartdns.%s\n" "$id" >>"$named_deletes" ;;
+					esac
 					continue
 				fi
-				printf "set smartdns.%s=server\n" "$id" >>"$output"
+				[ "$(candidate_value "server.$id.delete" "$file")" = 1 ] && continue
+				case "$id" in @server\[*\]) ;; *) printf "set smartdns.%s=server\n" "$id" >>"$output" ;; esac
 				[ -n "$value" ] && printf "set smartdns.%s.%s='%s'\n" "$id" "$field" "$value" >>"$output" || printf "delete smartdns.%s.%s\n" "$id" "$field" >>"$output"
 				;;
 			*)
@@ -297,6 +306,9 @@ emit_uci_batch() {
 				;;
 		esac
 	done <"$file"
+	cat "$named_deletes" >>"$output"
+	LC_ALL=C sort -rn "$anonymous_deletes" | sed 's/^[0-9][0-9]*[[:space:]]//' >>"$output"
+	rm -f "$named_deletes" "$anonymous_deletes"
 }
 
 smartdns_apply() {
