@@ -27,9 +27,16 @@ function clientCheck(kind, content) {
 }
 
 function resultNode(check) {
-	let wording = _('有效 %d 条，重复 %d 条，非法 %d 条').format(check.valid || check.valid_count || 0, check.duplicate || check.duplicate_count || 0, (check.invalid || []).length || check.invalid_count || 0);
+	let valid = Array.isArray(check.valid) ? check.valid.length : (check.valid_count === undefined ? (check.valid || 0) : check.valid_count);
+	let duplicate = check.duplicate_count === undefined ? (check.duplicate || 0) : check.duplicate_count;
 	let list = check.invalid || [];
-	return E('div', { 'class': check.ok ? 'alert-message notice' : 'alert-message error' }, [ E('strong', {}, wording), list.length ? E('pre', {}, list.join('\n')) : '' ]);
+	let invalid = Array.isArray(list) ? list.length : (check.invalid_count || 0);
+	let wording = _('有效 %d 条，重复 %d 条，非法 %d 条').format(valid, duplicate, invalid);
+	return E('div', { 'class': check.ok ? 'alert-message notice' : 'alert-message error' }, [
+		check.message || check.error ? E('p', {}, api.safeText(check.error || check.message)) : '',
+		E('strong', {}, wording),
+		list.length ? E('pre', {}, list.join('\n')) : ''
+	]);
 }
 
 return view.extend({
@@ -56,17 +63,29 @@ return view.extend({
 		};
 		select.addEventListener('change', function() { loadList(select.value); });
 		let check = E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': function() { feedback.replaceChildren(resultNode(clientCheck(selected, text.value))); } }, _('校验此列表'));
-		let save = E('button', { 'class': 'cbi-button cbi-button-apply', 'click': function() {
+		let save = E('button', { 'class': 'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, function() {
 			let local = clientCheck(selected, text.value);
 			feedback.replaceChildren(resultNode(local));
-			if (!local.ok) return;
-			api.writeUserList({ list: selected, content: text.value }).then(function(reply) { feedback.replaceChildren(resultNode(reply)); api.notice(ui, reply, _('人工规则已保存')); });
-		} }, _('校验并保存'));
+			if (!local.ok) return Promise.resolve(local);
+			return api.writeUserList({ list: selected, content: text.value }).then(function(reply) {
+				feedback.replaceChildren(resultNode(reply));
+				api.notice(ui, reply, _('人工规则保存失败'));
+				return reply;
+			}, function(error) {
+				let reply = { ok: false, error: error && error.message || String(error), invalid: [] };
+				feedback.replaceChildren(resultNode(reply));
+				return reply;
+			});
+		}) }, _('校验并保存'));
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('人工规则')),
-			E('p', { 'class': 'cbi-section-descr' }, _('专用 RPC 只允许读取和写入四类固定清单。任何内容都会以纯文本显示，不会解释为 HTML 或命令。')),
+			E('p', { 'class': 'cbi-section-descr' }, _('专用 RPC 只允许读取和写入四类固定清单。保存会原子写入人工规则文件；RoutePolicy 已启用时，需要回到“运行状态”重新应用后进入运行态。')),
 			E('div', { 'class': 'cbi-section' }, [ E('label', {}, [_('规则类型 '), select]), title, hint, text, E('div', { 'style': 'margin-top: .75rem; display: flex; gap: .5rem' }, [check, save]), feedback ])
 		]);
-	}
+	},
+
+	handleSave: null,
+	handleSaveApply: null,
+	handleReset: null
 });

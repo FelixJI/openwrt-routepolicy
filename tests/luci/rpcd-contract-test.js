@@ -151,7 +151,7 @@ assert.deepStrictEqual(routepolicy.write_user_list.call({ args: {
 	content: 'Example.COM\nexample.com\n'
 } }), {
 	ok: true,
-	message: '规则校验通过',
+	message: '人工规则已保存；RoutePolicy 启用时需重新应用配置后进入运行态',
 	valid: [ 'example.com' ],
 	valid_count: 1,
 	duplicate_count: 1,

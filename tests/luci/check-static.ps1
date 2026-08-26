@@ -21,6 +21,9 @@ if ($LASTEXITCODE -ne 0) { throw 'LuCI module constructor contract failed' }
 & node (Join-Path $PSScriptRoot 'view-render-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'LuCI view render contract failed' }
 
+& node (Join-Path $PSScriptRoot 'interaction-contract-test.js')
+if ($LASTEXITCODE -ne 0) { throw 'LuCI interaction contract failed' }
+
 & node (Join-Path $PSScriptRoot 'rpcd-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'rpcd ucode registration contract failed' }
 
@@ -44,8 +47,12 @@ if ($rpcText -notmatch "reload:\s*'/etc/init\.d/routepolicy restart'") {
     throw 'Reload RPC must reconcile the procd lifecycle through the fixed init script'
 }
 $settingsText = Get-Content -Raw -Encoding UTF8 (Join-Path $package 'htdocs/luci-static/resources/view/routepolicy/settings.js')
-if ($settingsText -notmatch 'handleSaveApply[\s\S]*api\.reload\(\)') {
-    throw 'Save & Apply must synchronize the service lifecycle after saving UCI'
+if ($settingsText -notmatch 'handleSaveApply[\s\S]*ui\.changes\.apply') {
+    throw 'Save & Apply must commit staged UCI through the LuCI apply workflow'
+}
+$sourcesText = Get-Content -Raw -Encoding UTF8 (Join-Path $package 'htdocs/luci-static/resources/view/routepolicy/sources.js')
+if ($sourcesText -notmatch 'handleSaveApply[\s\S]*ui\.changes\.apply') {
+    throw 'Source Save & Apply must commit staged UCI through the LuCI apply workflow'
 }
 
 $aclText = Get-Content -Raw -Encoding UTF8 $acl

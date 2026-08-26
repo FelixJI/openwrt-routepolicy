@@ -225,6 +225,7 @@ return {
             }
             if (proc.close() != 0)
                 return result(false, '核心校验或原子写入人工规则失败');
+            checked.message = '人工规则已保存；RoutePolicy 启用时需重新应用配置后进入运行态';
             return checked;
         }
     }

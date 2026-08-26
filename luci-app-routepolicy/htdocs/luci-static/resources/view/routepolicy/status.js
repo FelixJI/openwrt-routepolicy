@@ -1,46 +1,96 @@
 'use strict';
 'require view';
 'require ui';
+'require uci';
 'require routepolicy/api as api';
 
-function style() {
-	return E('style', {}, `
- .rp-console{--rp-ink:#17212b;--rp-line:#ccd6df;--rp-ok:#0f766e;--rp-warn:#b45309;--rp-bad:#b42318;--rp-panel:#f7fafb;color:var(--rp-ink)}
- .rp-console .rp-hero{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;border-left:5px solid #0b6477;padding:.85rem 1.1rem;background:linear-gradient(105deg,#e5f3f5,#f8fbfc)}
- .rp-console .rp-hero h2{margin:0;font:600 1.55rem/1.2 Georgia,serif;letter-spacing:.02em}.rp-console .rp-eyebrow{margin:0 0 .3rem;text-transform:uppercase;font-size:.72rem;letter-spacing:.12em;color:#47616d}
- .rp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.75rem;margin:1rem 0}.rp-card{border:1px solid var(--rp-line);border-top:3px solid #78909c;background:var(--rp-panel);padding:.8rem 1rem}.rp-card.ok{border-top-color:var(--rp-ok)}.rp-card.warn{border-top-color:var(--rp-warn)}.rp-card.bad{border-top-color:var(--rp-bad)}
- .rp-card dt{font-size:.76rem;text-transform:uppercase;letter-spacing:.08em;color:#536471}.rp-card dd{margin:.4rem 0 0;font-weight:600;overflow-wrap:anywhere}.rp-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin:.9rem 0}.rp-actions button{border-radius:0;border:1px solid #38616a;background:#fff;color:#193d45;padding:.45rem .72rem}.rp-actions button.cbi-button-apply{background:#0b6477;color:#fff}.rp-table{width:100%;border-collapse:collapse}.rp-table th,.rp-table td{padding:.55rem;border-bottom:1px solid var(--rp-line);text-align:left;vertical-align:top}.rp-table th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:#536471}
- @media (prefers-color-scheme:dark){.rp-console{--rp-ink:#e6edf2;--rp-line:#47545d;--rp-panel:#202a30}.rp-console .rp-hero{background:#19343a}.rp-actions button{background:#253139;color:#e6edf2}}
- `);
+function stateText(value, yes, no) {
+	if (value === true) return yes || _('正常');
+	if (value === false) return no || _('否');
+	return api.safeText(value);
 }
 
-function state(value) {
-	if (value === true || value === 'running' || value === 'online' || value === 'loaded') return 'ok';
-	if (value === false || value === 'stopped' || value === 'offline' || value === 'error') return 'bad';
-	return 'warn';
+function statusRow(label, value, description) {
+	return E('div', { 'class': 'cbi-value' }, [
+		E('label', { 'class': 'cbi-value-title' }, label),
+		E('div', { 'class': 'cbi-value-field' }, [
+			E('strong', {}, api.safeText(value)),
+			description ? E('div', { 'class': 'cbi-value-description' }, api.safeText(description)) : ''
+		])
+	]);
 }
 
-function card(label, value, detail) {
-	return E('dl', { 'class': 'rp-card ' + state(value) }, [ E('dt', {}, label), E('dd', {}, api.safeText(value)), detail ? E('small', {}, api.safeText(detail)) : '' ]);
+function resultNode(reply, fallback) {
+	let ok = reply && reply.ok;
+	let detail = reply && (reply.error || reply.message);
+	return E('div', { 'class': 'alert-message ' + (ok ? 'notice' : 'error') }, [
+		E('strong', {}, ok ? _('操作成功') : _('操作失败')),
+		E('p', {}, api.safeText(detail, fallback))
+	]);
 }
 
 return view.extend({
-	load: function() { return api.status(); },
+	load: function() {
+		return Promise.all([ api.status(), uci.load('routepolicy') ]);
+	},
 
-	render: function(status) {
-		status = status || {};
+	render: function(data) {
+		let status = Array.isArray(data) ? (data[0] || {}) : (data || {});
 		let service = status.service || {};
 		let routing = status.routing || {};
 		let dns = status.smartdns || {};
 		let sets = status.sets || {};
 		let interfaces = status.interfaces || {};
+		let feedback = E('div', { 'id': 'routepolicy-operation-result' });
 		let self = this;
-		let action = function(method, label, confirmation) {
+
+		let showPending = function(label) {
+			feedback.replaceChildren(E('div', { 'class': 'alert-message notice' }, [
+				E('strong', {}, label), E('p', {}, _('请稍候，操作完成前不要关闭页面。'))
+			]));
+		};
+
+		let run = function(method, label, confirmation, buttonClass) {
 			return E('button', {
-				'class': method == 'apply' ? 'cbi-button cbi-button-apply' : 'cbi-button cbi-button-neutral',
+				'class': 'cbi-button ' + (buttonClass || 'cbi-button-neutral'),
 				'click': ui.createHandlerFn(self, function() {
-					if (confirmation && !window.confirm(confirmation)) return;
-					return api[method]().then(function(reply) { api.notice(ui, reply, label); window.location.reload(); });
+					if (confirmation && !window.confirm(confirmation)) return Promise.resolve();
+					showPending(label);
+					return api[method]().then(function(reply) {
+						feedback.replaceChildren(resultNode(reply, label));
+						api.notice(ui, reply, label);
+						return reply;
+					}, function(error) {
+						let reply = { ok: false, error: error && error.message || String(error) };
+						feedback.replaceChildren(resultNode(reply, label));
+						throw error;
+					});
+				})
+			}, label);
+		};
+
+		let setEnabled = function(enabled) {
+			let label = enabled ? _('启用并应用') : _('停用并清理');
+			let confirmation = enabled
+				? _('启用会应用 nftables、策略路由和 SmartDNS 片段。首次启用前，请确认可通过 VMM 控制台回退。继续吗？')
+				: _('停用会删除 RoutePolicy 自有的 nftables 表、策略路由和 SmartDNS 片段。继续吗？');
+			return E('button', {
+				'class': 'cbi-button ' + (enabled ? 'cbi-button-positive important' : 'cbi-button-negative'),
+				'disabled': service.enabled === enabled ? '' : null,
+				'click': ui.createHandlerFn(self, function() {
+					if (!window.confirm(confirmation)) return Promise.resolve();
+					showPending(label);
+					uci.set('routepolicy', 'main', 'enabled', enabled ? '1' : '0');
+					return uci.save().then(function() {
+						feedback.replaceChildren(E('div', { 'class': 'alert-message notice' }, [
+							E('strong', {}, _('配置已保存')),
+							E('p', {}, _('LuCI 正在应用变更；完成后页面会自动刷新并显示新的运行状态。'))
+						]));
+						return ui.changes.apply(true);
+					}, function(error) {
+						feedback.replaceChildren(resultNode({ ok: false, error: error && error.message || String(error) }, label));
+						throw error;
+					});
 				})
 			}, label);
 		};
@@ -48,29 +98,58 @@ return view.extend({
 		let interfaceRows = [];
 		for (let name in interfaces) {
 			let iface = interfaces[name] || {};
-			interfaceRows.push(E('tr', {}, [ E('td', {}, name), E('td', {}, api.safeText(iface.device)), E('td', {}, api.safeText(iface.address)), E('td', {}, api.safeText(iface.online)), E('td', {}, api.safeText(iface.message)) ]));
+			interfaceRows.push(E('div', { 'class': 'tr' }, [
+				E('div', { 'class': 'td' }, name),
+				E('div', { 'class': 'td' }, api.safeText(iface.device)),
+				E('div', { 'class': 'td' }, api.safeText(iface.address)),
+				E('div', { 'class': 'td' }, stateText(iface.online, _('在线'), _('离线'))),
+				E('div', { 'class': 'td' }, api.safeText(iface.message))
+			]));
 		}
 
-		return E('div', { 'class': 'rp-console' }, [
-			style(),
-			E('div', { 'class': 'rp-hero' }, [ E('div', {}, [ E('p', { 'class': 'rp-eyebrow' }, _('RoutePolicy / operation desk')), E('h2', {}, _('运行状态与受控操作')) ]), E('small', {}, _('数据来自固定 RPC 状态接口')) ]),
-			E('div', { 'class': 'rp-grid' }, [
-				card(_('服务'), service.running === undefined ? service.state : service.running, service.message),
-				card(_('配置已应用'), service.applied, service.enabled ? _('已启用') : _('未启用')),
-				card(_('策略路由'), routing.real_default === undefined ? routing.state : routing.real_default, routing.blackhole ? _('Blackhole 后备存在') : _('未确认 Blackhole')),
-				card(_('SmartDNS'), dns.running === undefined ? dns.state : dns.running, dns.fragment_loaded ? _('适配片段已加载') : _('适配片段未加载')),
-				card(_('动态策略集合'), sets.domain_policy4 === undefined ? '—' : sets.domain_policy4, _('元素数量')),
-				card(_('最近更新'), status.last_update, status.last_error || _('无最近错误'))
+		return E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('运行状态')),
+			E('div', { 'class': 'cbi-map-descr' }, _('查看保存配置与实际运行态，并通过 LuCI 标准应用流程执行启停。验证只检查候选，不会修改网络。')),
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('服务与配置')),
+				statusRow(_('管理开关'), stateText(service.enabled, _('已启用'), _('已停用')), _('决定应用时启动策略，还是停用并清理自有状态。')),
+				statusRow(_('守护进程'), stateText(service.running === undefined ? service.state : service.running, _('运行中'), _('未运行')), service.message),
+				statusRow(_('配置应用状态'), stateText(service.applied, _('已应用'), _('未应用')), status.last_apply),
+				statusRow(_('策略路由'), stateText(routing.real_default === undefined ? routing.state : routing.real_default, _('默认路由已就绪'), _('默认路由未就绪')), routing.blackhole ? _('Blackhole 后备已就绪') : _('未确认 Blackhole 后备')),
+				statusRow(_('SmartDNS'), stateText(dns.running === undefined ? dns.state : dns.running, _('运行中'), _('未运行')), dns.fragment_loaded ? _('RoutePolicy 片段已加载') : _('RoutePolicy 片段未加载')),
+				statusRow(_('动态策略集合'), sets.domain_policy4 === undefined ? '—' : sets.domain_policy4, _('当前 IPv4 元素数量')),
+				statusRow(_('最近更新'), status.last_update, status.last_error || _('无最近错误'))
 			]),
-			E('div', { 'class': 'rp-actions' }, [
-				action('validate', _('验证候选配置')),
-				action('apply', _('应用已保存配置'), _('这会修改 RoutePolicy 自己的 nftables 表、策略路由和 SmartDNS 片段。首次启用前，请确认可通过 VMM 控制台回退。继续吗？')),
-				action('reload', _('受控重载')),
-				action('update', _('更新全部来源')),
-				action('rollback', _('回滚上一份清单'), _('将恢复上一份已知可用清单。继续吗？'))
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('配置与运行操作')),
+				E('p', { 'class': 'cbi-section-descr' }, _('“保存”只暂存 UCI；“启用并应用/停用并清理”会保存开关并通过 LuCI 的受控应用流程提交。重新应用不会改变启停开关。')),
+				E('div', { 'class': 'cbi-page-actions' }, [
+					setEnabled(true), ' ', setEnabled(false), ' ',
+					run('validate', _('验证候选配置')), ' ',
+					run('apply', _('重新应用当前配置'), _('这会按当前已提交的启停开关重新同步运行态。继续吗？'), 'cbi-button-action'), ' ',
+					run('update', _('更新全部来源')), ' ',
+					run('rollback', _('回滚上一份清单'), _('将恢复上一份已知可用清单。继续吗？'), 'cbi-button-negative'), ' ',
+					E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': function() { window.location.reload(); } }, _('刷新状态'))
+				]),
+				feedback
 			]),
-			E('h3', {}, _('接口观测')), E('table', { 'class': 'rp-table' }, [ E('thead', {}, E('tr', {}, [ E('th', {}, _('逻辑接口')), E('th', {}, _('实际设备')), E('th', {}, _('IPv4 地址')), E('th', {}, _('在线')), E('th', {}, _('说明')) ])), E('tbody', {}, interfaceRows.length ? interfaceRows : E('tr', {}, E('td', { colspan: 5 }, _('状态接口未返回接口数据')))) ]),
-			E('p', { 'class': 'alert-message notice' }, _('保存 UCI、验证候选配置和应用运行配置是三项独立操作。'))
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('接口观测')),
+				E('div', { 'class': 'table cbi-section-table' }, [
+					E('div', { 'class': 'tr table-titles' }, [
+						E('div', { 'class': 'th' }, _('逻辑接口')),
+						E('div', { 'class': 'th' }, _('实际设备')),
+						E('div', { 'class': 'th' }, _('IPv4 地址')),
+						E('div', { 'class': 'th' }, _('状态')),
+						E('div', { 'class': 'th' }, _('说明'))
+					]),
+					interfaceRows.length ? interfaceRows : E('div', { 'class': 'tr' }, E('div', { 'class': 'td' }, _('状态接口未返回接口数据')))
+				])
+			])
 		]);
-	}
+	},
+
+	handleSave: null,
+	handleSaveApply: null,
+	handleReset: null
 });

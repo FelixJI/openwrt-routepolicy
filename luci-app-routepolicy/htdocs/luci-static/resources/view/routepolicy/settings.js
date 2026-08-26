@@ -4,7 +4,6 @@
 'require tools.widgets as widgets';
 'require uci';
 'require ui';
-'require routepolicy/api as api';
 
 function validateMarkBit(sectionId, value) {
 	if (typeof value !== 'string' || !/^0x[0-9A-Fa-f]{1,8}$/.test(value))
@@ -27,7 +26,7 @@ return view.extend({
 	load: function() { return uci.load('routepolicy'); },
 
 	render: function() {
-		let m = new form.Map('routepolicy', _('基础设置'), _('这里的“保存”只写入 UCI，不会改变当前网络。请先到运行状态页验证候选配置，再明确应用。'));
+		let m = new form.Map('routepolicy', _('基础设置'), _('“保存”只把修改加入 LuCI 变更队列，不会改变当前网络；“保存并应用”会提交 UCI，并由服务触发器同步运行态。'));
 		let s = m.section(form.NamedSection, 'main', 'main', _('策略控制面'));
 		s.addremove = false;
 
@@ -117,14 +116,9 @@ return view.extend({
 	},
 
 	handleSave: function(ev) { return this.map.save(); },
-	handleSaveApply: function(ev) {
-		return this.map.save().then(function() {
-			return api.reload();
-		}).then(function(reply) {
-			api.notice(ui, reply, _('服务配置已同步'));
-			if (!reply || !reply.ok)
-				throw new Error(reply && (reply.error || reply.message) || _('服务配置同步失败'));
-			return reply;
+	handleSaveApply: function(ev, mode) {
+		return this.handleSave(ev).then(function() {
+			return ui.changes.apply(mode == '0');
 		});
 	},
 	handleReset: function(ev) { return this.map.reset(); }
