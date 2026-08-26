@@ -20,10 +20,14 @@ run_start() (
 	ROUTEPOLICY_CTL="$tmp/routepolicyctl"
 	ROUTEPOLICY_WATCH="$tmp/watch"
 	export ROUTEPOLICY_CTL ROUTEPOLICY_WATCH
+	# The test resolves this repository-owned fixture before sourcing it.
+	# shellcheck disable=SC1090
 	. "$INIT"
 	config_load() { :; }
 	config_get_bool() {
 		[ "$1" = enabled ] || return 1
+		# Consumed by start_service() from the sourced init script.
+		# shellcheck disable=SC2034
 		enabled=$TEST_ENABLED
 	}
 	procd_open_instance() { printf '%s\n' open >>"$TEST_LIFECYCLE_LOG"; }
