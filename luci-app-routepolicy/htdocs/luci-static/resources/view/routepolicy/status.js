@@ -106,6 +106,17 @@ return view.extend({
 				E('div', { 'class': 'td' }, api.safeText(iface.message))
 			]));
 		}
+		let interfaceTableRows = [
+			E('div', { 'class': 'tr table-titles' }, [
+				E('div', { 'class': 'th' }, _('逻辑接口')),
+				E('div', { 'class': 'th' }, _('实际设备')),
+				E('div', { 'class': 'th' }, _('IPv4 地址')),
+				E('div', { 'class': 'th' }, _('状态')),
+				E('div', { 'class': 'th' }, _('说明'))
+			])
+		].concat(interfaceRows.length ? interfaceRows : [
+			E('div', { 'class': 'tr' }, E('div', { 'class': 'td' }, _('状态接口未返回接口数据')))
+		]);
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('运行状态')),
@@ -135,16 +146,7 @@ return view.extend({
 			]),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('接口观测')),
-				E('div', { 'class': 'table cbi-section-table' }, [
-					E('div', { 'class': 'tr table-titles' }, [
-						E('div', { 'class': 'th' }, _('逻辑接口')),
-						E('div', { 'class': 'th' }, _('实际设备')),
-						E('div', { 'class': 'th' }, _('IPv4 地址')),
-						E('div', { 'class': 'th' }, _('状态')),
-						E('div', { 'class': 'th' }, _('说明'))
-					]),
-					interfaceRows.length ? interfaceRows : E('div', { 'class': 'tr' }, E('div', { 'class': 'td' }, _('状态接口未返回接口数据')))
-				])
+				E('div', { 'class': 'table cbi-section-table' }, interfaceTableRows)
 			])
 		]);
 	},

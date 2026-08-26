@@ -80,7 +80,16 @@ return view.extend({
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('人工规则')),
-			E('p', { 'class': 'cbi-section-descr' }, _('专用 RPC 只允许读取和写入四类固定清单。保存会原子写入人工规则文件；RoutePolicy 已启用时，需要回到“运行状态”重新应用后进入运行态。')),
+			E('p', { 'class': 'cbi-section-descr' }, _('专用 RPC 只允许读取和写入四类固定清单，并在写入前逐行校验。')),
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('保存后如何生效')),
+				E('p', { 'class': 'cbi-section-descr' }, _('“校验并保存”会原子写入人工规则文件，但不会立即改变运行态。')),
+				E('ol', {}, [
+					E('li', {}, _('保存成功后打开“运行状态”页面。')),
+					E('li', {}, _('先点击“验证候选配置”，确认当前配置和人工规则均通过校验。')),
+					E('li', {}, _('验证通过后点击“重新应用当前配置”，完成后新规则才会进入运行态；若 RoutePolicy 未启用，请改用“启用并应用”。'))
+				])
+			]),
 			E('div', { 'class': 'cbi-section' }, [ E('label', {}, [_('规则类型 '), select]), title, hint, text, E('div', { 'style': 'margin-top: .75rem; display: flex; gap: .5rem' }, [check, save]), feedback ])
 		]);
 	},
