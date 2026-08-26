@@ -2,6 +2,7 @@
 'require view';
 'require form';
 'require uci';
+'require ui';
 
 function validURL(section_id, value) {
 	if (!value || value.length > 2048)
@@ -19,7 +20,7 @@ return view.extend({
 	load: function() { return uci.load('routepolicy'); },
 
 	render: function() {
-		let m = new form.Map('routepolicy', _('清单来源'), _('保存仅更新来源定义。更新动作会下载、转换、检查 HTML 错误页和条目骤降，并保留 current/previous 可回滚版本。'));
+		let m = new form.Map('routepolicy', _('清单来源'), _('“保存”只加入 LuCI 变更队列；“保存并应用”会提交来源定义。下载与替换清单仍需在运行状态页执行“更新全部来源”。'));
 		let s = m.section(form.GridSection, 'source', _('远程来源'));
 		s.anonymous = true;
 		s.addremove = true;
@@ -57,6 +58,10 @@ return view.extend({
 		return m.render();
 	},
 	handleSave: function(ev) { return this.map.save(); },
-	handleSaveApply: function(ev) { return this.map.save(); },
+	handleSaveApply: function(ev, mode) {
+		return this.handleSave(ev).then(function() {
+			return ui.changes.apply(mode == '0');
+		});
+	},
 	handleReset: function(ev) { return this.map.reset(); }
 });

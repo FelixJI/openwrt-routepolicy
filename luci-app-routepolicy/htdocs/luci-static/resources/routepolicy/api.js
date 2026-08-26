@@ -34,7 +34,8 @@ api.safeText = function(value, fallback) {
 
 api.notice = function(ui, payload, fallback) {
 	let ok = payload && payload.ok;
-	ui.addNotification(null, E('p', {}, api.safeText(payload && payload.message, fallback)), ok ? 'info' : 'error');
+	let detail = payload && (payload.error || payload.message);
+	ui.addNotification(null, E('p', {}, api.safeText(detail, fallback)), ok ? 'info' : 'error');
 	return payload;
 };
 

@@ -112,8 +112,8 @@ function loadView(filename) {
 		view: { extend: function(properties) { return properties; } },
 		form: { Map: Map, NamedSection: NamedSection, Flag: Flag, Value: Value },
 		uci: {},
-		ui: {},
-		'routepolicy/api': {},
+		ui: { createHandlerFn: function(ctx, fn) { return fn.bind(ctx); } },
+		'routepolicy/api': { safeText: function(value, fallback) { return value == null || value === '' ? (fallback || '—') : String(value); } },
 		'tools.widgets': { NetworkSelect: NetworkSelect }
 	};
 	const aliases = [];

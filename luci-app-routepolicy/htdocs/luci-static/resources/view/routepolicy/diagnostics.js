@@ -38,5 +38,9 @@ return view.extend({
 			E('p', { 'class': 'alert-message notice' }, _('迁移只允许固定的 /etc/splitroute 路径；界面不提供任意路径导入或命令执行。')),
 			output
 		]);
-	}
+	},
+
+	handleSave: null,
+	handleSaveApply: null,
+	handleReset: null
 });

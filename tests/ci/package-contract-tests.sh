@@ -16,8 +16,8 @@ fail() {
 
 grep -q '^PKG_NAME:=routepolicy$' routepolicy/Makefile || fail '核心包名不正确'
 grep -q '^PKG_NAME:=luci-app-routepolicy$' luci-app-routepolicy/Makefile || fail 'LuCI 包名不正确'
-grep -q '^PKG_VERSION:=0.2.5$' routepolicy/Makefile || fail '核心包版本未升级到 0.2.5 热修复'
-grep -q '^PKG_VERSION:=0.2.5$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.2.5 热修复'
+grep -q '^PKG_VERSION:=0.2.6$' routepolicy/Makefile || fail '核心包版本未升级到 0.2.6 热修复'
+grep -q '^PKG_VERSION:=0.2.6$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.2.6 热修复'
 grep -q "^config main 'main'$" routepolicy/files/etc/config/routepolicy || fail '缺少 main 配置段'
 grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepolicy || fail '安装默认必须禁用'
 rpcd_plugin=luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy

@@ -61,6 +61,14 @@ function serverCard(server) {
 	return card;
 }
 
+function operationResult(reply, fallback) {
+	let ok = reply && reply.ok;
+	return E('div', { class: 'alert-message ' + (ok ? 'notice' : 'error') }, [
+		E('strong', {}, ok ? _('操作成功') : _('操作失败')),
+		E('p', {}, api.safeText(reply && (reply.error || reply.message), fallback))
+	]);
+}
+
 return view.extend({
 	load: function() { return Promise.all([ api.smartdnsStatus(), api.readLocalHosts() ]); },
 
@@ -70,6 +78,7 @@ return view.extend({
 		let serverBox = E('div', { id: 'smartdns-servers' }, (this.status.servers || []).map(serverCard));
 		this.serverBox = serverBox;
 		this.hosts = E('textarea', { id: 'smartdns-local-hosts', rows: 10, style: 'width:100%' }, hosts.content || '');
+		this.feedback = E('div', { id: 'smartdns-operation-result' });
 		let statusText = this.status.ambiguous ? _('存在多个 SmartDNS 根段，写入已禁用。') :
 			(this.status.initialized ? _('已识别唯一 SmartDNS 根配置段；空白或“继承”表示该选项未显式配置。') :
 				_('未找到 SmartDNS 根配置段；首次验证并应用时会在明确确认后创建最小根段。'));
@@ -93,10 +102,11 @@ return view.extend({
 			E('p', {}, _('90 实际加载：') + String(!!(this.status.fragments && this.status.fragments['90'] && this.status.fragments['90'].loaded)) +
 				'；' + _('91 实际加载：') + String(!!(this.status.fragments && this.status.fragments['91'] && this.status.fragments['91'].loaded))),
 			E('div', { class: 'cbi-page-actions' }, [
-				E('button', { class: 'btn cbi-button-save', click: this.handleSave.bind(this) }, _('保存 SmartDNS')),
-				' ', E('button', { class: 'btn cbi-button-apply important', click: this.applyCandidate.bind(this) }, _('验证并应用 SmartDNS')),
-				' ', E('button', { class: 'btn cbi-button-reset', click: this.handleDiscard.bind(this) }, _('丢弃候选'))
-			])
+				E('button', { class: 'btn cbi-button-save', click: ui.createHandlerFn(this, this.handleSave) }, _('保存候选')),
+				' ', E('button', { class: 'btn cbi-button-apply important', click: ui.createHandlerFn(this, this.applyCandidate) }, _('验证并应用 SmartDNS')),
+				' ', E('button', { class: 'btn cbi-button-reset', click: ui.createHandlerFn(this, this.handleDiscard) }, _('丢弃候选'))
+			]),
+			this.feedback
 		]);
 	},
 
@@ -121,19 +131,30 @@ return view.extend({
 
 	handleSave: function() {
 		if (!window.confirm(_('保存只写候选和本地主机文件，不重载服务。继续？'))) return Promise.resolve();
+		let self = this;
+		this.feedback.replaceChildren(E('div', { class: 'alert-message notice' }, _('正在保存候选，请稍候…')));
 		return Promise.all([ api.smartdnsSave(this.manifest()), api.writeLocalHosts(this.hosts.value) ]).then(function(replies) {
-			api.notice(ui, replies[0], _('SmartDNS 候选保存完成')); api.notice(ui, replies[1], _('本地主机保存完成'));
-			if (!replies[0].ok || !replies[1].ok) throw new Error(_('候选保存失败'));
-			return replies;
+			let failed = replies.find(function(reply) { return !reply || !reply.ok; });
+			let result = failed || { ok: true, message: _('SmartDNS 与本地主机候选已保存；当前运行配置尚未改变。') };
+			self.feedback.replaceChildren(operationResult(result, _('候选保存失败')));
+			api.notice(ui, result, _('候选保存失败'));
+			return result;
 		});
 	},
 
 	applyCandidate: function() {
 		if (!window.confirm(_('将精确修改 SmartDNS UCI、90/91 登记并重载或启停 SmartDNS；dnsmasq、缓存删除、上游删除和 DNS 屏蔽可能产生高影响。确认继续？'))) return Promise.resolve();
+		let self = this;
+		this.feedback.replaceChildren(E('div', { class: 'alert-message notice' }, _('正在保存并验证候选，请稍候…')));
 		return Promise.all([ api.smartdnsSave(this.manifest()), api.writeLocalHosts(this.hosts.value) ])
-			.then(function(replies) { if (!replies[0].ok || !replies[1].ok) throw new Error(_('保存失败')); return api.smartdnsValidate(); })
+			.then(function(replies) {
+				let failed = replies.find(function(reply) { return !reply || !reply.ok; });
+				if (failed) throw new Error(failed.error || failed.message || _('候选保存失败'));
+				return api.smartdnsValidate();
+			})
 			.then(function(reply) {
 				if (!reply.ok) throw new Error(reply.error || reply.message);
+				self.feedback.replaceChildren(operationResult(reply, _('候选验证通过')));
 				let preview = reply.preview || {};
 				let summary = _('变更字段数：') + String(preview.changes || 0) + '\n' +
 					_('服务动作：') + String(preview.service_action || '—') + '\n' +
@@ -142,11 +163,27 @@ return view.extend({
 				if (!window.confirm(summary + '\n\n' + _('确认按此预览应用？'))) throw new Error(_('用户取消应用'));
 				return api.smartdnsApply();
 			})
-			.then(function(reply) { api.notice(ui, reply, _('SmartDNS 应用完成')); if (!reply.ok) throw new Error(reply.error || reply.message); return reply; });
+			.then(function(reply) {
+				self.feedback.replaceChildren(operationResult(reply, _('SmartDNS 应用完成')));
+				api.notice(ui, reply, _('SmartDNS 应用完成'));
+				if (!reply.ok) throw new Error(reply.error || reply.message);
+				return reply;
+			})
+			.catch(function(error) {
+				let result = { ok: false, error: error && error.message || String(error) };
+				self.feedback.replaceChildren(operationResult(result, _('SmartDNS 候选验证或应用失败')));
+				api.notice(ui, result, _('SmartDNS 候选验证或应用失败'));
+				return result;
+			});
 	},
 
 	handleDiscard: function() {
-		return api.smartdnsDiscardCandidate().then(function(reply) { api.notice(ui, reply, _('候选已丢弃')); return reply; });
+		let self = this;
+		return api.smartdnsDiscardCandidate().then(function(reply) {
+			self.feedback.replaceChildren(operationResult(reply, _('候选丢弃失败')));
+			api.notice(ui, reply, _('候选已丢弃'));
+			return reply;
+		});
 	},
 
 	handleSaveApply: null,
