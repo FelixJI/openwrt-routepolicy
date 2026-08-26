@@ -34,10 +34,10 @@ foreach ($forbidden in @('file.exec', '/bin/sh', 'exec(', 'req.path', 'req.comma
     if ($rpcText -match [regex]::Escape($forbidden)) { throw "Forbidden RPC capability found: $forbidden" }
 }
 
-if ($rpcText -notmatch "apply:\s*\[\s*'/etc/init\.d/routepolicy',\s*'restart'\s*\]") {
+if ($rpcText -notmatch "apply:\s*'/etc/init\.d/routepolicy restart'") {
     throw 'Apply RPC must reconcile the procd lifecycle through the fixed init script'
 }
-if ($rpcText -notmatch "reload:\s*\[\s*'/etc/init\.d/routepolicy',\s*'restart'\s*\]") {
+if ($rpcText -notmatch "reload:\s*'/etc/init\.d/routepolicy restart'") {
     throw 'Reload RPC must reconcile the procd lifecycle through the fixed init script'
 }
 $settingsText = Get-Content -Raw -Encoding UTF8 (Join-Path $package 'htdocs/luci-static/resources/view/routepolicy/settings.js')

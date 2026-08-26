@@ -6,7 +6,7 @@
 
 当前发布物**只面向 OpenWrt 25.12 x86_64**。请勿在其它 OpenWrt 版本、架构或衍生发行版上安装；这些组合未经过构建或运行验证。
 
-RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
+RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。LuCI 包安装流程会重载 rpcd 以注册固定 RPC 对象，但不需要重启路由器，RoutePolicy 服务仍保持禁用。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
 
 ## 安装
 
@@ -18,7 +18,11 @@ RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 n
    apk add --allow-untrusted ./routepolicy-*.apk
    apk add --allow-untrusted ./luci-app-routepolicy-*.apk
    routepolicyctl validate
+   ubus list | grep -qx routepolicy
+   ubus call routepolicy status '{}'
    ```
+
+   最后一条应返回包含 `"ok": true` 的状态对象。若对象检查失败，可执行一次 `/etc/init.d/rpcd restart` 后重试；这只是 rpcd 注册恢复，不需要重启路由器，也不需要为查看状态而重启 RoutePolicy。
 
    下载全部 Release 附件后，可先执行 `sha256sum -c SHA256SUMS`；校验失败时停止安装并重新下载。
 
@@ -35,6 +39,8 @@ sysupgrade -b /tmp/before-routepolicy.tar.gz
 apk add --allow-untrusted ./routepolicy-*.apk ./luci-app-routepolicy-*.apk
 routepolicyctl validate
 routepolicyctl diagnose
+ubus list | grep -qx routepolicy
+ubus call routepolicy status '{}'
 ```
 
 每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
@@ -90,7 +96,7 @@ apk del luci-app-routepolicy routepolicy
 ## 安全边界
 
 - 路由应用仅操作独立的 `inet routepolicy` 表和策略路由表；SmartDNS 页面可在用户授权后精确管理标准 SmartDNS UCI、上游和自有附加片段。
-- 不提供任意命令、任意 nft 文本或任意路径访问接口。
+- RPC 只执行仓库内枚举的固定完整命令字符串；请求字段不进入 shell，动态正文只通过 stdin 传递。不提供任意命令、任意 nft 文本或任意路径访问接口。
 - 远程清单经过格式、数量、地址范围和原子回滚检查；不要把不可信订阅 URL 或凭据提交到 issue。
 - 策略接口断开时设计为严格阻断，避免命中策略的流量回落到默认路径。
 
