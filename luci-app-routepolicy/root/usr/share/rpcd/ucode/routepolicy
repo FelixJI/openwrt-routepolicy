@@ -160,6 +160,9 @@ function normalize_lines(content, kind) {
             ? match(line, /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i)
             : match(line, /^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)(?:\/(?:[0-9]|[12][0-9]|3[0-2]))?$/);
 
+        if (accepted && is_domain)
+            accepted = length(line) <= 253;
+
         if (accepted && !is_domain)
             accepted = allowed_ipv4_range(line);
 
@@ -176,11 +179,11 @@ function normalize_lines(content, kind) {
         push(valid, line);
     }
 
-    return result(invalid.length == 0, invalid.length ? '发现非法规则，未保存' : '规则校验通过', {
+    return result(length(invalid) == 0, length(invalid) ? '发现非法规则，未保存' : '规则校验通过', {
         valid: valid,
-        valid_count: valid.length,
+        valid_count: length(valid),
         duplicate_count: duplicate,
-        invalid_count: invalid.length,
+        invalid_count: length(invalid),
         invalid: invalid
     });
 }
@@ -253,7 +256,7 @@ return {
             let proc = popen(LISTS[kind].write, 'w');
             if (!proc)
                 return result(false, '无法启动 RoutePolicy 控制程序');
-            let content = join('\n', checked.valid) + (checked.valid.length ? '\n' : '');
+            let content = join('\n', checked.valid) + (length(checked.valid) ? '\n' : '');
             let written = proc.write(content);
             if (written != length(content)) {
                 proc.close();

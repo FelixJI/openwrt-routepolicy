@@ -59,6 +59,9 @@ let source = fs.readFileSync(pluginPath, 'utf8')
 	/* ucode iterates array values with `in`; JavaScript uses `of`. */
 	.replace('for (let raw in split(content, /\\r?\\n/))', 'for (let raw of split(content, /\\r?\\n/))');
 
+assert.ok(!/\.length\b/.test(source),
+	'ucode collections must use length(value); JavaScript-style .length triggers a target runtime exception');
+
 const calls = [];
 /* OpenWrt 25.12 pins a ucode fs.popen() implementation that accepts strings only. */
 function popen(command, mode) {
@@ -175,6 +178,28 @@ assert.deepStrictEqual(routepolicy.write_user_list.call({ args: {
 	invalid_count: 0,
 	invalid: []
 });
+const maximumLengthDomain = [ 'a'.repeat(63), 'b'.repeat(63), 'c'.repeat(61), 'd'.repeat(63) ].join('.');
+assert.strictEqual(maximumLengthDomain.length, 253);
+assert.strictEqual(routepolicy.write_user_list.call({ args: {
+	list: 'domain-policy',
+	content: maximumLengthDomain + '\n'
+} }).ok, true, '253-character domains accepted by the core must remain writable');
+const overlongDomain = [ 'a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(63) ].join('.');
+const callsBeforeOverlongDomain = calls.length;
+assert.deepStrictEqual(routepolicy.write_user_list.call({ args: {
+	list: 'domain-policy',
+	content: overlongDomain + '\n'
+} }), {
+	ok: false,
+	message: '发现非法规则，未保存',
+	valid: [],
+	valid_count: 0,
+	duplicate_count: 0,
+	invalid_count: 1,
+	invalid: [ overlongDomain ]
+});
+assert.strictEqual(calls.length, callsBeforeOverlongDomain,
+	'domains rejected by the core length limit must be rejected before starting a write process');
 const callsBeforeReservedIpv4 = calls.length;
 for (const value of [
 	'0.0.0.0', '10.0.0.1', '100.64.0.1', '127.0.0.1', '169.254.0.1',
