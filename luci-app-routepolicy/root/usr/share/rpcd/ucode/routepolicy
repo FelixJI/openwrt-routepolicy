@@ -28,6 +28,17 @@ const LISTS = {
     }
 };
 
+/* Keep this policy aligned with converter-lib reserved(). */
+const RESERVED_IPV4_RANGES = [
+    [ 0, 16777215 ], [ 167772160, 184549375 ],
+    [ 1681915904, 1686110207 ], [ 2130706432, 2147483647 ],
+    [ 2851995648, 2852061183 ], [ 2886729728, 2887778303 ],
+    [ 3221225472, 3221225727 ], [ 3221225984, 3221226239 ],
+    [ 3227017984, 3227018239 ], [ 3232235520, 3232301055 ],
+    [ 3323068416, 3323199487 ], [ 3325256704, 3325256959 ],
+    [ 3405803776, 3405804031 ], [ 3758096384, 4294967295 ]
+];
+
 const COMMANDS = {
     status: '/usr/sbin/routepolicyctl status --json',
     validate: '/usr/sbin/routepolicyctl validate --json',
@@ -112,6 +123,28 @@ function request_args(request) {
     return request && type(request.args) == 'object' ? request.args : {};
 }
 
+function allowed_ipv4_range(value) {
+    let parts = split(value, '/');
+    let octets = split(parts[0], '.');
+    let address = 0;
+    for (let i = 0; i < length(octets); i++)
+        address = address * 256 + (+octets[i]);
+
+    let prefix = length(parts) > 1 ? +parts[1] : 32;
+    let block = 1;
+    for (let i = prefix; i < 32; i++)
+        block *= 2;
+    let first = address - (address % block);
+    let last = first + block - 1;
+
+    for (let i = 0; i < length(RESERVED_IPV4_RANGES); i++) {
+        let reserved = RESERVED_IPV4_RANGES[i];
+        if (first <= reserved[1] && reserved[0] <= last)
+            return false;
+    }
+    return true;
+}
+
 function normalize_lines(content, kind) {
     if (type(content) != 'string' || length(content) > 262144)
         return result(false, '规则内容必须是小于 256 KiB 的纯文本');
@@ -126,6 +159,9 @@ function normalize_lines(content, kind) {
         let accepted = is_domain
             ? match(line, /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i)
             : match(line, /^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)(?:\/(?:[0-9]|[12][0-9]|3[0-2]))?$/);
+
+        if (accepted && !is_domain)
+            accepted = allowed_ipv4_range(line);
 
         if (!accepted) {
             push(invalid, line);

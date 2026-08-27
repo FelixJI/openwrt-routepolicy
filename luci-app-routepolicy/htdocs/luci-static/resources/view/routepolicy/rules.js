@@ -10,6 +10,39 @@ const LISTS = {
 	'ipv4-default': { title: _('默认覆盖 IPv4/CIDR'), hint: _('每行一个 IPv4 地址或 CIDR，优先于策略 IPv4。') }
 };
 
+/* Keep this policy aligned with converter-lib reserved(). */
+const RESERVED_IPV4_RANGES = [
+	[ 0, 16777215 ], [ 167772160, 184549375 ],
+	[ 1681915904, 1686110207 ], [ 2130706432, 2147483647 ],
+	[ 2851995648, 2852061183 ], [ 2886729728, 2887778303 ],
+	[ 3221225472, 3221225727 ], [ 3221225984, 3221226239 ],
+	[ 3227017984, 3227018239 ], [ 3232235520, 3232301055 ],
+	[ 3323068416, 3323199487 ], [ 3325256704, 3325256959 ],
+	[ 3405803776, 3405804031 ], [ 3758096384, 4294967295 ]
+];
+
+function allowedIPv4Range(value) {
+	let parts = value.split('/');
+	let octets = parts[0].split('.');
+	let address = 0;
+	for (let i = 0; i < octets.length; i++)
+		address = address * 256 + Number(octets[i]);
+
+	let prefix = parts.length > 1 ? Number(parts[1]) : 32;
+	let block = 1;
+	for (let i = prefix; i < 32; i++)
+		block *= 2;
+	let first = address - (address % block);
+	let last = first + block - 1;
+
+	for (let i = 0; i < RESERVED_IPV4_RANGES.length; i++) {
+		let reserved = RESERVED_IPV4_RANGES[i];
+		if (first <= reserved[1] && reserved[0] <= last)
+			return false;
+	}
+	return true;
+}
+
 function clientCheck(kind, content) {
 	let domain = kind.indexOf('domain-') === 0;
 	let rule = domain
@@ -19,7 +52,7 @@ function clientCheck(kind, content) {
 	content.split(/\r?\n/).forEach(function(raw) {
 		let text = raw.trim();
 		if (!text || text.charAt(0) === '#') return;
-		if (!rule.test(text)) invalid.push(text);
+		if (!rule.test(text) || (!domain && !allowedIPv4Range(text))) invalid.push(text);
 		else if (seen[text.toLowerCase()]) duplicate++;
 		else { seen[text.toLowerCase()] = true; valid++; }
 	});
