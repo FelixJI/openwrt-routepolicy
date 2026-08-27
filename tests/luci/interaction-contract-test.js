@@ -285,6 +285,31 @@ async function manualRuleReservedIpv4Contract(filename) {
 	assert.strictEqual(writes, 0, 'locally rejected IPv4 ranges must not be sent as a doomed save request');
 }
 
+async function manualRuleDomainLengthContract(filename) {
+	let writes = 0;
+	const harness = createViewHarness({ api: {
+		readUserList: function() { return Promise.resolve({ ok: true, content: '' }); },
+		writeUserList: function() {
+			writes++;
+			return Promise.resolve({ ok: false, message: '核心校验或原子写入人工规则失败', invalid: [] });
+		}
+	} });
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	const root = page.render({ ok: true, content: '' });
+	const textarea = findAll(root, function(node) { return node.tagName === 'textarea'; })[0];
+	const labels = [ 'a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(63) ];
+	textarea.value = labels.join('.') + '\n';
+
+	const check = findAll(root, function(node) { return node.tagName === 'button' && nodeText(node) === '校验此列表'; })[0];
+	check.listeners.click();
+	assert.ok(nodeText(root).includes('非法 1 条'),
+		'manual rule validation must reject domains longer than the core 253-character limit');
+
+	const save = findAll(root, function(node) { return node.tagName === 'button' && nodeText(node) === '校验并保存'; })[0];
+	await Promise.resolve(save.listeners.click());
+	assert.strictEqual(writes, 0, 'overlong domains must not be sent as a doomed save request');
+}
+
 function noPhantomFormFooterContract(filename) {
 	const harness = createViewHarness();
 	const page = loadSource(filename, harness.dependencies, harness.globals);
@@ -303,6 +328,7 @@ async function main() {
 		[ 'status controls', function() { return statusContract(path.join(viewDir, 'status.js')); } ],
 		[ 'manual rule feedback', function() { return manualRuleFeedbackContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'manual rule reserved IPv4', function() { return manualRuleReservedIpv4Contract(path.join(viewDir, 'rules.js')); } ],
+		[ 'manual rule domain length', function() { return manualRuleDomainLengthContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'status phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'status.js')); } ],
 		[ 'rules phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'diagnostics phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'diagnostics.js')); } ]

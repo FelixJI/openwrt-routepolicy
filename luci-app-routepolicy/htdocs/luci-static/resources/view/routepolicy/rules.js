@@ -52,7 +52,7 @@ function clientCheck(kind, content) {
 	content.split(/\r?\n/).forEach(function(raw) {
 		let text = raw.trim();
 		if (!text || text.charAt(0) === '#') return;
-		if (!rule.test(text) || (!domain && !allowedIPv4Range(text))) invalid.push(text);
+		if (!rule.test(text) || (domain && text.length > 253) || (!domain && !allowedIPv4Range(text))) invalid.push(text);
 		else if (seen[text.toLowerCase()]) duplicate++;
 		else { seen[text.toLowerCase()] = true; valid++; }
 	});

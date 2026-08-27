@@ -29,6 +29,16 @@ after=$(cat "$tmp/etc/routepolicy/user.d/domain-policy.list")
 run_ctl user-list read domain-policy --json >"$tmp/read.json"
 grep -q '"content":"a.example.com\\nb.example.com"' "$tmp/read.json"
 
+label63=$(printf '%063d' 0 | tr 0 a)
+label61=$(printf '%061d' 0 | tr 0 b)
+label62=$(printf '%062d' 0 | tr 0 c)
+domain253="$label63.$label63.$label61.$label63"
+domain254="$label63.$label63.$label62.$label63"
+printf '%s\n' "$domain253" | run_ctl user-list write domain-policy --json >/dev/null
+if printf '%s\n' "$domain254" | run_ctl user-list write domain-policy --json >/dev/null 2>&1; then
+	printf 'overlong domain unexpectedly accepted\n' >&2; exit 1
+fi
+
 rm -f "$tmp/etc/routepolicy/user.d/ipv4-policy.list"
 ln -s "$tmp/etc/config/routepolicy" "$tmp/etc/routepolicy/user.d/ipv4-policy.list"
 if [ -L "$tmp/etc/routepolicy/user.d/ipv4-policy.list" ]; then
