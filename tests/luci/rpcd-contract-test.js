@@ -63,6 +63,8 @@ assert.ok(!/\.length\b/.test(source),
 	'ucode collections must use length(value); JavaScript-style .length triggers a target runtime exception');
 assert.ok(!/\bline\[0\]/.test(source),
 	'ucode strings must use substr(); JavaScript-style string indexing triggers a target runtime exception');
+assert.ok(!source.includes('(?:'),
+	'ucode runtime regular expressions must not use JavaScript non-capturing groups');
 
 const calls = [];
 /* OpenWrt 25.12 pins a ucode fs.popen() implementation that accepts strings only. */

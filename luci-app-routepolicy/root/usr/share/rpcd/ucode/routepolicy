@@ -157,8 +157,8 @@ function normalize_lines(content, kind) {
 
         let is_domain = (kind == 'domain-policy' || kind == 'domain-default');
         let accepted = is_domain
-            ? match(line, /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i)
-            : match(line, /^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)(?:\/(?:[0-9]|[12][0-9]|3[0-2]))?$/);
+            ? match(line, /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i)
+            : match(line, /^((25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9][0-9]?)(\/([0-9]|[12][0-9]|3[0-2]))?$/);
 
         if (accepted && is_domain)
             accepted = length(line) <= 253;
