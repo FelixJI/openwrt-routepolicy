@@ -6,6 +6,8 @@ const path = require('path');
 
 const root = path.resolve(__dirname, '..', '..');
 const pluginPath = path.join(root, 'luci-app-routepolicy', 'root', 'usr', 'share', 'rpcd', 'ucode', 'routepolicy');
+const rulesViewPath = path.join(root, 'luci-app-routepolicy', 'htdocs', 'luci-static', 'resources', 'view', 'routepolicy', 'rules.js');
+const converterPath = path.join(root, 'routepolicy', 'files', 'usr', 'libexec', 'routepolicy', 'converter-lib');
 const legacyPath = path.join(root, 'luci-app-routepolicy', 'root', 'usr', 'libexec', 'rpcd', 'routepolicy');
 const expectedMethods = [
 	'apply', 'diagnose', 'import_legacy', 'read_local_hosts', 'read_user_list', 'reload', 'rollback',
@@ -35,6 +37,21 @@ const fixedCommands = new Set([
 
 assert.ok(fs.existsSync(pluginPath), 'rpcd ucode plugin must be installed under /usr/share/rpcd/ucode');
 assert.ok(!fs.existsSync(legacyPath), 'legacy /usr/libexec/rpcd plugin must not remain in the package');
+
+function declaredReservedRanges(text) {
+	const body = text.match(/const RESERVED_IPV4_RANGES = \[([\s\S]*?)\];/);
+	assert.ok(body, 'reserved IPv4 range declaration is missing');
+	return Array.from(body[1].matchAll(/\[\s*(\d+)\s*,\s*(\d+)\s*\]/g), match => [ Number(match[1]), Number(match[2]) ]);
+}
+
+const coreReservedRanges = Array.from(
+	fs.readFileSync(converterPath, 'utf8').matchAll(/if\(overlap\(a,b,(\d+),(\d+)\)\)/g),
+	match => [ Number(match[1]), Number(match[2]) ]
+);
+assert.deepStrictEqual(declaredReservedRanges(fs.readFileSync(pluginPath, 'utf8')), coreReservedRanges,
+	'rpcd reserved IPv4 policy must stay aligned with the core converter');
+assert.deepStrictEqual(declaredReservedRanges(fs.readFileSync(rulesViewPath, 'utf8')), coreReservedRanges,
+	'LuCI reserved IPv4 policy must stay aligned with the core converter');
 
 let source = fs.readFileSync(pluginPath, 'utf8')
 	.replace(/^#![^\n]*\n/, '')
@@ -158,6 +175,23 @@ assert.deepStrictEqual(routepolicy.write_user_list.call({ args: {
 	invalid_count: 0,
 	invalid: []
 });
+const callsBeforeReservedIpv4 = calls.length;
+for (const value of [
+	'0.0.0.0', '10.0.0.1', '100.64.0.1', '127.0.0.1', '169.254.0.1',
+	'172.16.0.1', '192.0.0.1', '192.0.2.1', '192.88.99.1', '192.168.1.1',
+	'198.18.0.1', '198.51.100.1', '203.0.113.1', '224.0.0.1', '255.255.255.255',
+	'8.8.8.8/1'
+]) {
+	const reply = routepolicy.write_user_list.call({ args: { list: 'ipv4-policy', content: value + '\n' } });
+	assert.strictEqual(reply.ok, false, value + ' must be rejected consistently with the core');
+	assert.deepStrictEqual(reply.invalid, [ value ]);
+}
+assert.strictEqual(calls.length, callsBeforeReservedIpv4,
+	'IPv4 ranges rejected by the core must be rejected before starting a write process');
+assert.strictEqual(routepolicy.write_user_list.call({ args: {
+	list: 'ipv4-policy',
+	content: '8.8.8.0/24\n'
+} }).ok, true, 'public IPv4 CIDRs must remain writable');
 assert.strictEqual(
 	routepolicy.apply.call({ args: {} }).message,
 	'停用清理完成：已删除 RoutePolicy 自有状态\nRoutePolicy 未启用；已跳过应用并保持停用',

@@ -257,6 +257,34 @@ async function manualRuleFeedbackContract(filename) {
 		'manual rule save result must remain visible in the page and explain when it takes effect');
 }
 
+async function manualRuleReservedIpv4Contract(filename) {
+	let writes = 0;
+	const harness = createViewHarness({ api: {
+		readUserList: function() { return Promise.resolve({ ok: true, content: '' }); },
+		writeUserList: function() {
+			writes++;
+			return Promise.resolve({ ok: false, message: '核心校验或原子写入人工规则失败', invalid: [] });
+		}
+	} });
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	const root = page.render({ ok: true, content: '' });
+	const select = findAll(root, function(node) { return node.tagName === 'select'; })[0];
+	select.value = 'ipv4-policy';
+	select.listeners.change();
+	await new Promise(function(resolve) { setTimeout(resolve, 0); });
+
+	const textarea = findAll(root, function(node) { return node.tagName === 'textarea'; })[0];
+	textarea.value = '192.168.1.1\n';
+	const check = findAll(root, function(node) { return node.tagName === 'button' && nodeText(node) === '校验此列表'; })[0];
+	check.listeners.click();
+	assert.ok(nodeText(root).includes('非法 1 条'),
+		'manual rule validation must reject IPv4 ranges that the core refuses to save');
+
+	const save = findAll(root, function(node) { return node.tagName === 'button' && nodeText(node) === '校验并保存'; })[0];
+	await Promise.resolve(save.listeners.click());
+	assert.strictEqual(writes, 0, 'locally rejected IPv4 ranges must not be sent as a doomed save request');
+}
+
 function noPhantomFormFooterContract(filename) {
 	const harness = createViewHarness();
 	const page = loadSource(filename, harness.dependencies, harness.globals);
@@ -274,6 +302,7 @@ async function main() {
 		[ 'sources Save & Apply', function() { return formApplyContract(path.join(viewDir, 'sources.js')); } ],
 		[ 'status controls', function() { return statusContract(path.join(viewDir, 'status.js')); } ],
 		[ 'manual rule feedback', function() { return manualRuleFeedbackContract(path.join(viewDir, 'rules.js')); } ],
+		[ 'manual rule reserved IPv4', function() { return manualRuleReservedIpv4Contract(path.join(viewDir, 'rules.js')); } ],
 		[ 'status phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'status.js')); } ],
 		[ 'rules phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'diagnostics phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'diagnostics.js')); } ]
