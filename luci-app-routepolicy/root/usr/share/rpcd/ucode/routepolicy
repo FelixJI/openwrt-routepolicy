@@ -152,7 +152,7 @@ function normalize_lines(content, kind) {
     let valid = [], invalid = [], duplicate = 0, seen = {};
     for (let raw in split(content, /\r?\n/)) {
         let line = trim(raw);
-        if (!line || line[0] == '#')
+        if (!line || substr(line, 0, 1) == '#')
             continue;
 
         let is_domain = (kind == 'domain-policy' || kind == 'domain-default');

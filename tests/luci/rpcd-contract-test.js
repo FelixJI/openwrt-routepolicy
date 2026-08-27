@@ -61,6 +61,8 @@ let source = fs.readFileSync(pluginPath, 'utf8')
 
 assert.ok(!/\.length\b/.test(source),
 	'ucode collections must use length(value); JavaScript-style .length triggers a target runtime exception');
+assert.ok(!/\bline\[0\]/.test(source),
+	'ucode strings must use substr(); JavaScript-style string indexing triggers a target runtime exception');
 
 const calls = [];
 /* OpenWrt 25.12 pins a ucode fs.popen() implementation that accepts strings only. */
@@ -97,7 +99,7 @@ function popen(command, mode) {
 }
 
 const signature = new Function(
-	'popen', 'type', 'length', 'split', 'trim', 'match', 'lc', 'json', 'push', 'join',
+	'popen', 'type', 'length', 'split', 'trim', 'substr', 'match', 'lc', 'json', 'push', 'join',
 	source
 )(
 	popen,
@@ -105,6 +107,7 @@ const signature = new Function(
 	value => value.length,
 	(value, separator) => value.split(separator),
 	value => value.trim(),
+	(value, start, count) => value.slice(start, start + count),
 	(value, expression) => value.match(expression),
 	value => value.toLowerCase(),
 	JSON.parse,
