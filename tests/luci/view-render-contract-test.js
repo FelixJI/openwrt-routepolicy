@@ -173,6 +173,10 @@ for (const expected of [ [ 'enabled', '1' ], [ 'server.resolver.enabled', '1' ],
 
 const mark = renderedOptions.find(function(option) { return option.option === 'mark'; });
 const mask = renderedOptions.find(function(option) { return option.option === 'mark_mask'; });
+const localTraffic = renderedOptions.find(function(option) { return option.option === 'route_local_traffic'; });
+const sourceAccounting = renderedOptions.find(function(option) { return option.option === 'source_accounting'; });
+const sourceTimeout = renderedOptions.find(function(option) { return option.option === 'source_idle_timeout'; });
+const sourceMaximum = renderedOptions.find(function(option) { return option.option === 'source_max_entries'; });
 assert.strictEqual(typeof mark.validate, 'function', 'mark must use a backend-compatible custom validator');
 assert.strictEqual(typeof mask.validate, 'function', 'mark_mask must use a backend-compatible custom validator');
 for (const value of [ '0x1', '0x100', '0x80000000' ]) {
@@ -190,5 +194,9 @@ mark.formvalue = function() { return '0x100'; };
 mask.formvalue = function() { return '0x200'; };
 assert.notStrictEqual(mark.validate('main', '0x100'), true, 'mark and mask must be identical');
 assert.notStrictEqual(mask.validate('main', '0x200'), true, 'mask and mark must be identical');
+assert.strictEqual(localTraffic.default, '0', 'router-local traffic classification must remain opt-in by default');
+assert.strictEqual(sourceAccounting.default, '0', 'source accounting must remain opt-in by default');
+assert.strictEqual(sourceTimeout.datatype, 'range(60,86400)', 'source accounting timeout must have the backend-compatible bound');
+assert.strictEqual(sourceMaximum.datatype, 'range(256,16384)', 'source accounting capacity must have the backend-compatible bound');
 
 console.log('LuCI view render contract passed.');

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=routepolicy
-PKG_VERSION:=0.2.9
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=RoutePolicy contributors
@@ -49,6 +49,7 @@ define Package/routepolicy/install
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/converter-lib $(1)/usr/libexec/routepolicy/converter-lib
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/diagnose $(1)/usr/libexec/routepolicy/diagnose
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/import-legacy $(1)/usr/libexec/routepolicy/import-legacy
+	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/observe $(1)/usr/libexec/routepolicy/observe
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/render $(1)/usr/libexec/routepolicy/render
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/rollback $(1)/usr/libexec/routepolicy/rollback
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/scheduler $(1)/usr/libexec/routepolicy/scheduler

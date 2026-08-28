@@ -1,0 +1,304 @@
+#!/bin/sh
+
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+if [ -d "$RP_RUN_DIR/apply.lock" ]; then
+	rp_output_error observe '应用事务进行中；观测快照暂不可用'
+	exit 1
+fi
+
+MAX_EXPORT_ITEMS=16384
+SYS_CLASS_NET=${ROUTEPOLICY_SYS_CLASS_NET:-$RP_ROOT/sys/class/net}
+
+bool_json() { [ "$1" = 1 ] && printf true || printf false; }
+
+safe_device() {
+	value=${1-}
+	rp_is_device "$value" || return 1
+	case "$value" in .|-|..|.*|-*|*..*) return 1 ;; esac
+	return 0
+}
+
+generation() {
+	value=
+	file="$RP_RUN_DIR/active/generation"
+	if [ -f "$file" ] && [ ! -L "$file" ]; then
+		IFS= read -r value <"$file" || value=
+	fi
+	case "$value" in
+		''|*[!A-Za-z0-9_.-]*|?????????????????????????????????????????????????????????????????*) value=unavailable ;;
+	esac
+	printf '%s\n' "$value"
+}
+
+managed_devices() {
+	for role in lan default policy; do
+		case "$role" in
+			lan) logical=$(rp_uci_get main lan_interface lan) ;;
+			default) logical=$(rp_uci_get main default_interface wan) ;;
+			policy) logical=$(rp_uci_get main policy_interface usbwan) ;;
+		esac
+		rp_is_name "$logical" 32 || continue
+		device=$(rp_interface_device "$logical" 2>/dev/null) || device=
+		safe_device "$device" || continue
+		online=0; rp_interface_up "$logical" && online=1
+		printf '%s\t%s\t%s\t%s\n' "$device" "$role" "$logical" "$online"
+	done
+}
+
+valid_u64() {
+	value=${1-}
+	case "$value" in ''|*[!0-9]*) return 1 ;; esac
+	[ "${#value}" -le 20 ] || return 1
+	[ "${#value}" -lt 20 ] || [ "$value" \< 18446744073709551616 ]
+}
+
+read_counter() {
+	device=$1 name=$2 path="$SYS_CLASS_NET/$device/statistics/$name"
+	[ -f "$path" ] || return 1
+	IFS= read -r value <"$path" || return 1
+	valid_u64 "$value" || return 1
+	printf '%s\n' "$value"
+}
+
+interfaces_json() {
+	tmp=$(mktemp "${TMPDIR:-/tmp}/routepolicy-observe-devices.XXXXXX") || exit 1
+	trap 'rm -f "$tmp"' EXIT HUP INT TERM
+	managed_devices >"$tmp"
+	printf '{"ok":true,"generation":"%s","interfaces":[' "$(rp_json_escape "$(generation)")"
+	first=1
+	cut -f1 "$tmp" | LC_ALL=C sort -u | while IFS= read -r device; do
+		[ -n "$device" ] || continue
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"device":"%s","roles":[' "$(rp_json_escape "$device")"
+		role_first=1
+		online=0
+		while IFS="$(printf '\t')" read -r _device role logical role_online; do
+			[ "$_device" = "$device" ] || continue
+			[ "$role_online" = 1 ] && online=1
+			[ "$role_first" -eq 1 ] || printf ','
+			role_first=0
+			printf '{"role":"%s","interface":"%s"}' "$(rp_json_escape "$role")" "$(rp_json_escape "$logical")"
+		done <"$tmp"
+		printf '],"online":%s,"available":' "$(bool_json "$online")"
+		available=1 counters=
+		for name in rx_bytes tx_bytes rx_packets tx_packets rx_errors tx_errors rx_dropped tx_dropped; do
+			value=$(read_counter "$device" "$name" 2>/dev/null) || { value=null; available=0; }
+			[ -z "$counters" ] || counters="$counters,"
+			if [ "$value" = null ]; then counters="$counters\"$name\":null"; else counters="$counters\"$name\":\"$value\""; fi
+		done
+		bool_json "$available"
+		printf ',"counters":{%s}}' "$counters"
+	done
+	printf '],"unavailable_roles":['
+	first=1
+	for role in lan default policy; do
+		grep -q "$(printf '\t')$role$(printf '\t')" "$tmp" && continue
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '"%s"' "$role"
+	done
+	printf ']}\n'
+}
+
+# Emit one bounded, normalized TSV row per nft set element. nft's JSON integers
+# are kept as digit strings so counters above 2^53 never pass through a float.
+parse_nft_json() {
+	awk -v max="$MAX_EXPORT_ITEMS" '
+	function ws(c) { return c == " " || c == "\t" || c == "\r" || c == "\n" }
+	function skip_string(s, p,    i,c,esc) {
+		esc=0
+		for(i=p+1;i<=length(s);i++){ c=substr(s,i,1); if(esc){esc=0;continue} if(c=="\\"){esc=1;continue} if(c=="\"")return i }
+		return length(s)
+	}
+	function value_pos(s,key,    pat) { pat="\"" key "\"[[:space:]]*:"; return match(s,pat) ? RSTART+RLENGTH : 0 }
+	function string_value(s,key,    p,e) { p=value_pos(s,key); if(!p)return ""; while(ws(substr(s,p,1)))p++; if(substr(s,p,1)!="\"")return ""; e=skip_string(s,p); return substr(s,p+1,e-p-1) }
+	function number_value(s,key,    p,r) { p=value_pos(s,key); if(!p)return ""; while(ws(substr(s,p,1)))p++; r=substr(s,p); return match(r,/^[0-9]+/) ? substr(r,RSTART,RLENGTH) : "" }
+	function array_strings(s,key,out,    p,i,e,c,n,depth) {
+		p=value_pos(s,key); if(!p)return 0; while(ws(substr(s,p,1)))p++; if(substr(s,p,1)!="[")return 0
+		n=0; depth=1
+		for(i=p+1;i<=length(s)&&depth;i++){ c=substr(s,i,1); if(c=="\""){e=skip_string(s,i); out[++n]=substr(s,i+1,e-i-1); i=e} else if(c=="[")depth++; else if(c=="]")depth-- }
+		return n
+	}
+	function seconds(ms) { return ms == "" ? "" : sprintf("%.0f", int((ms + 999) / 1000)) }
+	function emit(obj,    a,n,val,addr,prefix,first,last,packets,bytes,expires,timeout,device) {
+		delete a; device=""; addr=""; val=string_value(obj,"val")
+		if(val!="") addr=val
+		else if((n=array_strings(obj,"concat",a))>=2){device=a[1];addr=a[2]}
+		else if((addr=string_value(obj,"addr"))!=""){prefix=number_value(obj,"len");if(prefix!="")addr=addr "/" prefix}
+		else if((n=array_strings(obj,"range",a))>=2)addr=a[1] "-" a[2]
+		if(addr=="" || length(addr)>64 || addr !~ /^[0-9.\/-]+$/ ||
+		   length(device)>32 || device ~ /[\\\t\r\n]/)return
+		if(device=="")device="-"
+		packets=number_value(obj,"packets"); bytes=number_value(obj,"bytes")
+		expires=seconds(number_value(obj,"expires")); timeout=seconds(number_value(obj,"timeout"))
+		if(packets=="")packets="0"; if(bytes=="")bytes="0"
+		if(length(packets)>20 || packets !~ /^[0-9]+$/ || length(bytes)>20 || bytes !~ /^[0-9]+$/)return
+		printf "E\t%s\t%s\t%s\t%s\t%s\t%s\n",device,addr,packets,bytes,expires,timeout
+		count++
+	}
+	{ json=json $0 "\n" }
+	END {
+		size=number_value(json,"size"); printf "M\t%s\n",size
+		for(i=1;i<=length(json)&&count<max;i++){
+			if(substr(json,i,1)!="\"")continue
+			e=skip_string(json,i); key=substr(json,i+1,e-i-1); i=e
+			if(key!="elem")continue
+			p=i+1; while(ws(substr(json,p,1)))p++; if(substr(json,p,1)!=":")continue
+			p++; while(ws(substr(json,p,1)))p++; if(substr(json,p,1)!="{")continue
+			start=p; depth=0
+			for(j=p;j<=length(json);j++){c=substr(json,j,1);if(c=="\""){j=skip_string(json,j);continue}if(c=="{")depth++;else if(c=="}"&&--depth==0)break}
+			emit(substr(json,start,j-start+1)); i=j
+		}
+		if(count>=max)print "T\t1"
+	}
+	'
+}
+
+nft_rows() {
+	set_name=$1
+	nft -j list set inet routepolicy "$set_name" 2>/dev/null | parse_nft_json
+}
+
+domain_file() {
+	case "$1" in
+		domain_policy) printf '%s\n' "$RP_RUN_DIR/active/domain-policy.list" ;;
+		domain_default) printf '%s\n' "$RP_RUN_DIR/active/domain-default.list" ;;
+		*) return 1 ;;
+	esac
+}
+
+dataset_set() {
+	case "$1" in
+		static_policy4|static_default4) printf '%s\n' "$1" ;;
+		dynamic_policy4) printf '%s\n' domain_policy4 ;;
+		dynamic_default4) printf '%s\n' domain_default4 ;;
+		source_ingress4|source_egress4) printf '%s\n' "$1" ;;
+		*) return 1 ;;
+	esac
+}
+
+dataset_volatile() { case "$1" in dynamic_*|source_*) printf true ;; *) printf false ;; esac; }
+
+devices_array() {
+	printf '['; first=1
+	managed_devices | cut -f1 | LC_ALL=C sort -u | while IFS= read -r device; do
+		[ -n "$device" ] || continue; [ "$first" -eq 1 ] || printf ','; first=0
+		printf '"%s"' "$(rp_json_escape "$device")"
+	done
+	printf ']'
+}
+
+export_dataset() {
+	dataset=$1 sort_key=${2:-address}
+	case "$dataset:$sort_key" in
+		domain_policy:domain|domain_default:domain|static_policy4:address|static_default4:address|dynamic_policy4:address|dynamic_default4:address|source_ingress4:address|source_ingress4:bytes|source_ingress4:packets|source_egress4:address|source_egress4:bytes|source_egress4:packets) ;;
+		*) rp_output_error observe_export '非法观测数据集或排序'; exit 2 ;;
+	esac
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-observe-export.XXXXXX") || exit 1
+	trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+	: >"$tmp/items"
+	truncated=false
+	if file=$(domain_file "$dataset" 2>/dev/null); then
+		if [ -f "$file" ] && [ ! -L "$file" ]; then
+			if awk -v max="$MAX_EXPORT_ITEMS" '
+				length($0)<=253 && $0 ~ /^([A-Za-z0-9-]+\.)+[A-Za-z0-9-]+$/ {
+					if(n<max){print $0;n++}else more=1
+				}
+				END{if(more)exit 3}
+			' "$file" >"$tmp/items"; then
+				:
+			else
+				status=$?; [ "$status" -eq 3 ] || exit "$status"
+				truncated=true
+			fi
+		fi
+	else
+		set_name=$(dataset_set "$dataset")
+		if nft_rows "$set_name" >"$tmp/rows"; then
+			grep '^T' "$tmp/rows" >/dev/null 2>&1 && truncated=true
+			grep '^E' "$tmp/rows" >"$tmp/items" || true
+		fi
+		case "$dataset" in
+			source_*)
+				managed_devices | cut -f1 | LC_ALL=C sort -u >"$tmp/managed-devices"
+				awk -F '\t' 'NR==FNR{if(NF)allowed[$1]=1;next} $1=="E" && ($2 in allowed)' \
+					"$tmp/managed-devices" "$tmp/items" >"$tmp/current-items"
+				mv "$tmp/current-items" "$tmp/items"
+				;;
+		esac
+		case "$sort_key" in
+			address) LC_ALL=C sort -t "$(printf '\t')" -k3,3 "$tmp/items" >"$tmp/sorted" ;;
+			packets) awk -F '\t' '{print length($4) "\t" $0}' "$tmp/items" | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k5,5r -k4,4 >"$tmp/sorted" ;;
+			bytes) awk -F '\t' '{print length($5) "\t" $0}' "$tmp/items" | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k6,6r -k4,4 >"$tmp/sorted" ;;
+		esac
+		[ "$sort_key" = address ] || cut -f2- "$tmp/sorted" >"$tmp/sorted.rows"
+		[ "$sort_key" = address ] && mv "$tmp/sorted" "$tmp/sorted.rows"
+		mv "$tmp/sorted.rows" "$tmp/items"
+	fi
+	accounting=$(rp_uci_get main source_accounting 0); rp_is_bool "$accounting" || accounting=0
+	enabled=true; case "$dataset" in source_*) enabled=$(bool_json "$accounting") ;; esac
+	printf '{"ok":true,"dataset":"%s","generation":"%s","volatile":%s,"truncated":%s,"enabled":%s,"devices":' \
+		"$dataset" "$(rp_json_escape "$(generation)")" "$(dataset_volatile "$dataset")" "$truncated" "$enabled"
+	devices_array
+	printf ',"items":['
+	first=1
+	if file=$(domain_file "$dataset" 2>/dev/null); then
+		while IFS= read -r domain; do
+			[ -n "$domain" ] || continue; [ "$first" -eq 1 ] || printf ','; first=0
+			printf '{"domain":"%s","target":"%s"}' "$(rp_json_escape "$domain")" "${dataset#domain_}"
+		done <"$tmp/items"
+	else
+		while IFS="$(printf '\t')" read -r tag device address packets bytes expires timeout; do
+			[ "$tag" = E ] || continue; [ "$first" -eq 1 ] || printf ','; first=0
+			printf '{"address":"%s"' "$(rp_json_escape "$address")"
+			case "$dataset" in source_*) printf ',"device":"%s","packets":"%s","bytes":"%s"' "$(rp_json_escape "$device")" "$packets" "$bytes" ;; esac
+			if [ -n "$expires" ]; then
+				printf ',"permanent":false,"timeout":"%s","expires":"%s"' "$timeout" "$expires"
+			else
+				printf ',"permanent":true,"timeout":null,"expires":null'
+			fi
+			printf '}'
+		done <"$tmp/items"
+	fi
+	printf ']}\n'
+}
+
+sets_json() {
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-observe-sets.XXXXXX") || exit 1
+	trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+	accounting=$(rp_uci_get main source_accounting 0); rp_is_bool "$accounting" || accounting=0
+	printf '{"ok":true,"generation":"%s","source_accounting":%s,"sets":[' "$(rp_json_escape "$(generation)")" "$(bool_json "$accounting")"
+	first=1
+	for dataset in domain_policy domain_default static_policy4 static_default4 dynamic_policy4 dynamic_default4 source_ingress4 source_egress4; do
+		[ "$first" -eq 1 ] || printf ','; first=0
+		available=1 count=0 capacity= saturated=0
+		if file=$(domain_file "$dataset" 2>/dev/null); then
+			if [ -f "$file" ] && [ ! -L "$file" ]; then count=$(awk 'NF{n++}END{print n+0}' "$file"); else available=0; fi
+		else
+			set_name=$(dataset_set "$dataset")
+			if nft_rows "$set_name" >"$tmp/$dataset"; then
+				count=$(grep -c '^E' "$tmp/$dataset" || true)
+				capacity=$(sed -n 's/^M[[:space:]]*//p' "$tmp/$dataset" | sed -n '1p')
+			else available=0
+			fi
+			case "$capacity" in ''|*[!0-9]*) capacity= ;; esac
+			[ -z "$capacity" ] || [ "$count" -lt "$capacity" ] || saturated=1
+		fi
+		enabled=true; case "$dataset" in source_*) enabled=$(bool_json "$accounting") ;; esac
+		printf '{"dataset":"%s","name":"%s","enabled":%s,"available":%s,"count":%s,"capacity":' "$dataset" "$dataset" "$enabled" "$(bool_json "$available")" "$count"
+		if [ -n "$capacity" ]; then printf '%s' "$capacity"; else printf null; fi
+		printf ',"saturated":%s,"volatile":%s}' "$(bool_json "$saturated")" "$(dataset_volatile "$dataset")"
+	done
+	printf ']}\n'
+}
+
+case ${1-} in
+	interfaces) interfaces_json ;;
+	sets) sets_json ;;
+	export) [ "$#" -eq 3 ] || { rp_output_error observe_export '缺少观测数据集或排序'; exit 2; }; export_dataset "$2" "$3" ;;
+	*) rp_output_error observe '未知观测操作'; exit 2 ;;
+esac

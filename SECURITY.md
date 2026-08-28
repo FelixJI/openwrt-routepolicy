@@ -16,6 +16,10 @@ RoutePolicy 的路由能力只管理自己的 nftables 表、策略规则和路�
 
 安全接口是枚举的 RPC 方法和仓库控制的固定完整命令字符串。请求只能包含有限协议、三态、受限长度字符串、数字范围、结构化服务器字段和固定用途的本地主机内容；任何请求字段都不会拼入 shell，动态正文只通过 stdin 传递。不提供任意命令、任意 SmartDNS 配置文本、`addition_arg`、任意 nft 文本或任意路径读写。缓存文件只允许 `/etc/smartdns/`、`/tmp/`、`/var/cache/` 下的普通非符号链接文件，候选与基线以 0600 保存并限制大小。
 
+观测 RPC 只暴露接口快照、集合摘要和枚举 dataset 查询。调用者不能指定 sysfs 路径、nft family/table/set 或任意文件；设备只能来自 RoutePolicy 配置经 ubus 解析并校验的实际设备。`query`、`cursor`、`limit`、`sort` 和返回条数都有硬上限，64 位累计计数以十进制字符串传输。源 IP nft set 同时设置 size、timeout 和 GC 上限，容量饱和不得改变 accept/route 行为。
+
+域名的 active catalog 位于 RoutePolicy 自有运行目录，只由成功的 apply 事务发布并带 generation。render 候选、失败候选和未完成事务不得作为“当前生效”返回；失败回滚同时恢复 nft、SmartDNS 配置和旧 catalog。静态/动态 IPv4 的权威状态仍来自固定的 RoutePolicy nft set，不接受浏览器提供 nft 对象名。LuCI 使用纯文本节点展示接口名、域名、IP 和查询内容，不拼接为 HTML。
+
 页面用规范化 UCI 基线和版本令牌拒绝 SSH、官方 LuCI 或其他页面产生的并发外部修改；不会靠例行 hash 猜测合并匿名段。危险操作必须确认，dnsmasq/DHCP 不会被 RoutePolicy 自行启动或直接修改，仪表盘不会自动开放防火墙。SmartDNS 应用与路由/nftables 应用分离，失败时恢复 UCI、90/91、本地主机和服务状态。
 
 卸载只清理 90/91 的登记和自有运行片段，不删除用户 SmartDNS 主配置、上游或未知字段，也不会自动执行旧方案清理。路由功能安装后默认禁用；启用前仍需由管理员核对接口和回退路径。

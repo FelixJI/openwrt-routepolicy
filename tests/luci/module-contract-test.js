@@ -93,6 +93,10 @@ if (typeof api.status !== 'function' || api.status() !== 'status')
 	throw new Error('Loaded API instance must expose the status RPC method');
 if (typeof api.smartdnsApply !== 'function' || api.smartdnsApply() !== 'smartdns_apply')
 	throw new Error('Loaded API instance must expose the SmartDNS apply RPC method');
+if (typeof api.observeInterfaces !== 'function' || api.observeInterfaces() !== 'observe_interfaces')
+	throw new Error('Loaded API instance must expose the bounded interface snapshot RPC method');
+if (typeof api.observeSets !== 'function' || api.observeSets() !== 'observe_sets')
+	throw new Error('Loaded API instance must expose the bounded set summary RPC method');
 if (api.safeText(null) !== '—')
 	throw new Error('Loaded API instance must retain safeText behavior');
 assert.deepStrictEqual(api.readUserList({ list: 'domain-policy' }), {
@@ -106,6 +110,16 @@ assert.deepStrictEqual(api.writeUserList({ list: 'domain-default', content: 'exa
 assert.deepStrictEqual(api.smartdnsSave('enabled\t1\n'), {
 	method: 'smartdns_save',
 	params: { content: 'enabled\t1\n' }
+});
+assert.deepStrictEqual(api.observeQuery({
+	dataset: 'source_ingress4', query: '192.168.', cursor: 'v1:source_ingress4:g1:50',
+	limit: 50, device: 'br-lan', sort: 'bytes'
+}), {
+	method: 'observe_query',
+	params: {
+		dataset: 'source_ingress4', query: '192.168.', cursor: 'v1:source_ingress4:g1:50',
+		limit: 50, device: 'br-lan', sort: 'bytes'
+	}
 });
 
 console.log('LuCI module constructor contract passed.');

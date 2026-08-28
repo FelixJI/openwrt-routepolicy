@@ -24,6 +24,9 @@ if ($LASTEXITCODE -ne 0) { throw 'LuCI view render contract failed' }
 & node (Join-Path $PSScriptRoot 'interaction-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'LuCI interaction contract failed' }
 
+& node (Join-Path $PSScriptRoot 'observability-contract-test.js')
+if ($LASTEXITCODE -ne 0) { throw 'LuCI observability contract failed' }
+
 & node (Join-Path $PSScriptRoot 'rpcd-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'rpcd ucode registration contract failed' }
 

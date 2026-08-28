@@ -13,6 +13,11 @@ printf '{"ok":true,"operation":"$name"}\\n'
 EOF
 	chmod +x "$tmp/$name"
 done
+cat >"$tmp/observe" <<'EOF'
+#!/bin/sh
+printf '{"ok":true,"operation":"observe-%s"}\n' "$1"
+EOF
+chmod +x "$tmp/observe"
 cp "$tmp/apply" "$tmp/import-legacy"
 cp "$tmp/apply" "$tmp/user-list"
 cat >"$tmp/smartdns-control" <<'EOF'
@@ -26,6 +31,12 @@ for command_name in validate render apply reload status diagnose update rollback
 	out=$(ROUTEPOLICY_LIBEXEC="$tmp" "$CTL" "$command_name" --json)
 	case "$out" in '{"ok":true'* ) ;; *) printf 'bad JSON contract for %s\n' "$command_name" >&2; exit 1 ;; esac
 done
+for command_name in observe-interfaces observe-sets; do
+	out=$(ROUTEPOLICY_LIBEXEC="$tmp" "$CTL" "$command_name" --json)
+	case "$out" in '{"ok":true'* ) ;; *) printf 'bad JSON contract for %s\n' "$command_name" >&2; exit 1 ;; esac
+done
+ROUTEPOLICY_LIBEXEC="$tmp" "$CTL" observe-export-domain-policy --json >/dev/null
+ROUTEPOLICY_LIBEXEC="$tmp" "$CTL" observe-export-source-ingress4-bytes --json >/dev/null
 ROUTEPOLICY_LIBEXEC="$tmp" "$CTL" import-legacy /etc/splitroute --json >/dev/null
 ROUTEPOLICY_LIBEXEC="$tmp" "$CTL" user-list read domain-policy --json >/dev/null
 for operation in status save validate apply discard read-local-hosts write-local-hosts; do

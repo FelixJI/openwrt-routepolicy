@@ -34,6 +34,11 @@ if ip -4 route show table main 2>/dev/null | grep -Eq '^default([[:space:]]|$)';
 conflicts=$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table")
 if [ -z "$conflicts" ]; then add_check mark-conflict pass '未发现 mark mask 位重叠'; else add_check mark-conflict fail '发现与 routepolicy mark mask 位重叠的规则（详情已省略）'; fi
 if nft list table inet routepolicy >/dev/null 2>&1; then add_check nft-table pass 'inet routepolicy 存在'; else add_check nft-table fail 'inet routepolicy 不存在'; fi
+missing_chains=
+for chain_name in prerouting output classify; do
+	nft list chain inet routepolicy "$chain_name" >/dev/null 2>&1 || missing_chains="$missing_chains $chain_name"
+done
+if [ -z "$missing_chains" ]; then add_check nft-topology pass 'prerouting/output adapter 与共享分类链完整'; else add_check nft-topology fail "缺少稳定 nft 链:$missing_chains"; fi
 if ip -4 rule show 2>/dev/null | grep -Fq "fwmark $mark/$mask"; then add_check policy-rule pass '掩码策略规则存在'; else add_check policy-rule fail '掩码策略规则不存在'; fi
 if ip -4 route show table "$table" 2>/dev/null | grep -Eq '^default([[:space:]]|$)'; then add_check policy-default pass '策略接口真实默认路由存在'; elif rp_interface_up "$policy"; then add_check policy-default fail '策略接口在线但真实默认路由缺失'; else add_check policy-default warn '策略接口离线，真实默认路由按设计移除'; fi
 if ip -4 route show table "$table" 2>/dev/null | grep -Eq '^blackhole default([[:space:]]|$)'; then add_check blackhole pass '策略表严格阻断存在'; else add_check blackhole fail '策略表严格阻断不存在'; fi
@@ -75,8 +80,13 @@ else add_check subnet-overlap warn '地址信息不足，无法判断网段重�
 
 if nft list set inet routepolicy domain_policy4 2>/dev/null | grep -q 'timeout'; then add_check dynamic-set pass '动态集合存在 timeout 能力'; else add_check dynamic-set fail '动态集合缺失或未启用 timeout'; fi
 if [ "$(rp_uci_get main dns_redirect 1)" = 0 ]; then add_check dns-redirect warn 'DNS 重定向已禁用';
-elif nft list chain inet routepolicy classify 2>/dev/null | grep -q 'dport 53.*redirect'; then add_check dns-redirect pass 'LAN DNS 重定向规则存在';
+elif nft list chain inet routepolicy prerouting 2>/dev/null | grep -q 'dport 53.*redirect'; then add_check dns-redirect pass 'LAN DNS 重定向规则存在';
 else add_check dns-redirect fail '配置要求 DNS 重定向但规则缺失'; fi
+if [ "$(rp_uci_get main route_local_traffic 0)" = 0 ]; then
+	if nft list chain inet routepolicy output 2>/dev/null | grep -q 'local IPv4 routing disabled'; then add_check local-routing pass '路由器本机 IPv4 分流已关闭且 OUTPUT adapter 立即返回';
+	else add_check local-routing fail '本机分流已关闭，但 OUTPUT adapter 缺少立即返回规则'; fi
+elif nft list chain inet routepolicy output 2>/dev/null | grep -q 'jump classify'; then add_check local-routing pass '路由器本机 IPv4 流量进入共享分类链';
+else add_check local-routing fail '本机分流已开启，但 OUTPUT adapter 未进入共享分类链'; fi
 sources=0
 for source in $(rp_source_sections); do
 	[ "$(rp_uci_get "$source" enabled 0)" = 1 ] || continue

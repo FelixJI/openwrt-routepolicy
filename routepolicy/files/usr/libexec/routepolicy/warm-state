@@ -3,9 +3,87 @@
 set -eu
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
-[ "$#" -eq 1 ] || exit 2
-case "$1" in save|restore) mode=$1 ;; *) exit 2 ;; esac
+[ "$#" -ge 1 ] || exit 2
+mode=$1
+case "$mode" in
+	save|restore) [ "$#" -eq 1 ] || exit 2 ;;
+	live-save|live-restore) [ "$#" -eq 2 ] || exit 2 ;;
+	*) exit 2 ;;
+esac
 rp_ensure_dirs
+
+live_snapshot_set() {
+	set_name=$1
+	target=$2
+	raw="$RP_RUN_DIR/live-$set_name.raw.$$"
+	parsed="$RP_RUN_DIR/live-$set_name.parsed.$$"
+	if ! nft list set inet routepolicy "$set_name" >"$raw" 2>/dev/null; then
+		rm -f "$raw" "$parsed"
+		return 1
+	fi
+	awk '
+		function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+		{
+			line=$0
+			if (!inside) {
+				if (line !~ /elements[[:space:]]*=[[:space:]]*\{/) next
+				sub(/^.*elements[[:space:]]*=[[:space:]]*\{/, "", line)
+				inside=1
+			}
+			text=text " " line
+			if (line ~ /}/) { sub(/}.*/, "", text); inside=0 }
+		}
+		END {
+			n=split(text, element, ",")
+			for (i=1; i<=n; i++) {
+				entry=trim(element[i])
+				if (entry == "") continue
+				fields=split(entry, token, /[[:space:]]+/)
+				ip=token[1]; expires=""
+				for (j=2; j<fields; j++) if (token[j] == "expires") { expires=token[j+1]; break }
+				printf "%s\t%s\n", ip, expires
+			}
+		}
+	' "$raw" >"$parsed"
+	rm -f "$raw"
+	valid=1
+	tab=$(printf '\t')
+	while IFS="$tab" read -r ipaddr expires; do
+		[ -n "$ipaddr" ] || continue
+		if ! rp_is_ipv4 "$ipaddr"; then valid=0; break; fi
+		if [ -n "$expires" ]; then
+			case "$expires" in [0-9]*[!0-9dhms]*) valid=0; break ;; [0-9]*) ;; *) valid=0; break ;; esac
+			printf 'add element inet routepolicy %s { %s timeout %s }\n' "$set_name" "$ipaddr" "$expires" >>"$target"
+		else
+			printf 'add element inet routepolicy %s { %s }\n' "$set_name" "$ipaddr" >>"$target"
+		fi
+	done <"$parsed"
+	rm -f "$parsed"
+	[ "$valid" -eq 1 ]
+}
+
+if [ "$mode" = live-save ]; then
+	snapshot=$2
+	case "$snapshot" in "$RP_RUN_DIR"/*) ;; *) exit 2 ;; esac
+	[ ! -L "$snapshot" ] || exit 1
+	new="$snapshot.new.$$"
+	trap 'rm -f "$new"' EXIT HUP INT TERM
+	umask 077
+	: >"$new"
+	live_snapshot_set domain_policy4 "$new" && live_snapshot_set domain_default4 "$new" || exit 1
+	mv -f "$new" "$snapshot"
+	trap - EXIT HUP INT TERM
+	exit 0
+fi
+
+if [ "$mode" = live-restore ]; then
+	snapshot=$2
+	case "$snapshot" in "$RP_RUN_DIR"/*) ;; *) exit 2 ;; esac
+	[ -f "$snapshot" ] && [ ! -L "$snapshot" ] || exit 1
+	[ -s "$snapshot" ] || exit 0
+	nft -c -f "$snapshot" >/dev/null 2>&1 && nft -f "$snapshot" >/dev/null 2>&1
+	exit $?
+fi
 
 snapshot_set() {
 	set_name=$1; target="$RP_STATE_DIR/warm-$set_name.list"

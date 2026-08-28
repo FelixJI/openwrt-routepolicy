@@ -4,7 +4,7 @@
     "read": {
       "uci": [ "routepolicy" ],
       "ubus": {
-        "routepolicy": [ "status", "validate", "diagnose", "read_user_list", "smartdns_status", "smartdns_validate", "read_local_hosts" ]
+        "routepolicy": [ "status", "observe_interfaces", "observe_sets", "observe_query", "validate", "diagnose", "read_user_list", "smartdns_status", "smartdns_validate", "read_local_hosts" ]
       }
     },
     "write": {
