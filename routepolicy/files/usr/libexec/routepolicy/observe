@@ -52,7 +52,7 @@ valid_u64() {
 	value=${1-}
 	case "$value" in ''|*[!0-9]*) return 1 ;; esac
 	[ "${#value}" -le 20 ] || return 1
-	[ "${#value}" -lt 20 ] || [ "$value" \< 18446744073709551616 ]
+	[ "${#value}" -lt 20 ] || LC_ALL=C awk -v value="$value" 'BEGIN { exit !("x" value < "x18446744073709551616") }'
 }
 
 read_counter() {
@@ -275,7 +275,7 @@ sets_json() {
 	first=1
 	for dataset in domain_policy domain_default static_policy4 static_default4 dynamic_policy4 dynamic_default4 source_ingress4 source_egress4; do
 		[ "$first" -eq 1 ] || printf ','; first=0
-		available=1 count=0 capacity= saturated=0
+		available=1 count=0 capacity='' saturated=0
 		if file=$(domain_file "$dataset" 2>/dev/null); then
 			if [ -f "$file" ] && [ ! -L "$file" ]; then count=$(awk 'NF{n++}END{print n+0}' "$file"); else available=0; fi
 		else
