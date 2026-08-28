@@ -39,7 +39,7 @@ for fragment in \
 	'type filter hook prerouting priority mangle' \
 	'chain source_postrouting {' \
 	'type filter hook postrouting priority mangle; policy accept;' \
-	'comment "routepolicy: source accounting disabled" return'; do
+	'counter return comment "routepolicy: source accounting disabled"'; do
 	grep -Fq "$fragment" "$rules" || fail "disabled topology missing: $fragment"
 done
 

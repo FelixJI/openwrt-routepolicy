@@ -21,7 +21,7 @@ grep -Fq 'type filter hook prerouting priority mangle; policy accept;' "$rules"
 grep -Fq 'chain output {' "$rules"
 grep -Fq 'type route hook output priority mangle; policy accept;' "$rules"
 grep -Fq 'chain classify {' "$rules"
-grep -Fq 'counter comment "routepolicy: local IPv4 routing disabled" return' "$rules"
+grep -Fq 'counter return comment "routepolicy: local IPv4 routing disabled"' "$rules"
 if awk '/chain output \{/{inside=1;next} inside && /^\t}/{exit} inside && /jump classify/{found=1} END{exit found ? 0 : 1}' "$rules"; then
 	printf 'disabled OUTPUT adapter still reached the shared classifier\n' >&2; exit 1
 fi
@@ -64,8 +64,15 @@ classify_line=$(grep -nF 'jump classify comment "routepolicy: classify local des
 	[ "$established_line" -lt "$socket_line" ] && [ "$socket_line" -lt "$classify_line" ] || {
 	printf 'enabled OUTPUT adapter does not preserve established/socket marks before classification\n' >&2; exit 1
 }
-grep -Fq 'meta mark set (meta mark & 0xfffffeff) | (ct mark & 0x100) comment "routepolicy: restore local connection mark" return' "$rules"
-grep -Fq 'ct mark set (ct mark & 0xfffffeff) | (meta mark & 0x100) comment "routepolicy: preserve local socket mark" return' "$rules"
+grep -Fq 'meta mark set (meta mark & 0xfffffeff) | 0x100 return comment "routepolicy: restore local connection mark"' "$rules"
+grep -Fq 'ct mark set (ct mark & 0xfffffeff) | 0x100 return comment "routepolicy: preserve local socket mark"' "$rules"
+grep -Fq 'ct mark & 0x100 == 0 meta mark set meta mark & 0xfffffeff comment "routepolicy: clear default connection mark"' "$rules"
+if grep -Eq 'comment "[^"]+"[[:space:]]+(return|accept|drop)' "$rules"; then
+	printf 'a verdict was emitted after a rule comment\n' >&2; exit 1
+fi
+if grep -Fq '| (ct mark &' "$rules" || grep -Fq '| (meta mark &' "$rules"; then
+	printf 'a mark assignment used a non-constant bitwise-or operand\n' >&2; exit 1
+fi
 for comment in \
 	'routepolicy: excluded destination' \
 	'routepolicy: dynamic default override' \

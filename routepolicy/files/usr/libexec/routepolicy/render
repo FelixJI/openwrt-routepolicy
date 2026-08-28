@@ -70,31 +70,31 @@ emit_update_rule() {
 
 emit_prerouting_rules() {
 	emitter=$1
-	"$emitter" prerouting "iifname != \"$lan_device\" comment \"routepolicy: non-LAN\" return"
+	"$emitter" prerouting "iifname != \"$lan_device\" return comment \"routepolicy: non-LAN\""
 	if [ "$dns_redirect" = 1 ]; then
 		"$emitter" prerouting 'meta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"'
 	fi
-	"$emitter" prerouting "meta mark set (meta mark & $inv) | (ct mark & $mask) comment \"routepolicy: restore connection mark\""
-	"$emitter" prerouting "ct mark & $mask != 0 counter comment \"routepolicy: established policy connection\" return"
+	"$emitter" prerouting "ct mark & $mask != 0 meta mark set (meta mark & $inv) | $mark counter return comment \"routepolicy: established policy connection\""
+	"$emitter" prerouting "ct mark & $mask == 0 meta mark set meta mark & $inv comment \"routepolicy: clear default connection mark\""
 	"$emitter" prerouting 'jump classify comment "routepolicy: classify LAN destination"'
 }
 
 emit_output_rules() {
 	emitter=$1
 	if [ "$route_local_traffic" != 1 ]; then
-		"$emitter" output 'counter comment "routepolicy: local IPv4 routing disabled" return'
+		"$emitter" output 'counter return comment "routepolicy: local IPv4 routing disabled"'
 		return
 	fi
-	"$emitter" output "ct state established,related ct mark & $mask != 0 counter meta mark set (meta mark & $inv) | (ct mark & $mask) comment \"routepolicy: restore local connection mark\" return"
-	"$emitter" output "ct state new meta mark & $mask != 0 counter ct mark set (ct mark & $inv) | (meta mark & $mask) comment \"routepolicy: preserve local socket mark\" return"
+	"$emitter" output "ct state established,related ct mark & $mask != 0 counter meta mark set (meta mark & $inv) | $mark return comment \"routepolicy: restore local connection mark\""
+	"$emitter" output "ct state new meta mark & $mask != 0 counter ct mark set (ct mark & $inv) | $mark return comment \"routepolicy: preserve local socket mark\""
 	"$emitter" output 'jump classify comment "routepolicy: classify local destination"'
 }
 
 emit_classify_rules() {
 	emitter=$1
-	"$emitter" classify 'ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter comment "routepolicy: excluded destination" return'
-	"$emitter" classify "ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment \"routepolicy: dynamic default override\" return"
-	"$emitter" classify "ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment \"routepolicy: static default override\" return"
+	"$emitter" classify 'ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter return comment "routepolicy: excluded destination"'
+	"$emitter" classify "ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv return comment \"routepolicy: dynamic default override\""
+	"$emitter" classify "ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv return comment \"routepolicy: static default override\""
 	"$emitter" classify "ip daddr @domain_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment \"routepolicy: dynamic policy\""
 	"$emitter" classify "ip daddr @static_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment \"routepolicy: static policy\""
 }
@@ -102,7 +102,7 @@ emit_classify_rules() {
 emit_source_rules() {
 	emitter=$1 chain=$2 direction=$3
 	if [ "$source_accounting" != 1 ]; then
-		"$emitter" "$chain" 'counter comment "routepolicy: source accounting disabled" return'
+		"$emitter" "$chain" 'counter return comment "routepolicy: source accounting disabled"'
 		return
 	fi
 	for device in $managed_devices; do
