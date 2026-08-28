@@ -102,6 +102,14 @@ if [ "$mode" = teardown ]; then
 		exit 1
 	fi
 	[ "$have_applied" -eq 0 ] || rm -f "$RP_STATE_DIR/applied"
+	if [ -e "$RP_ACTIVE_DIR" ]; then
+		if [ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ]; then
+			rm -rf "$RP_ACTIVE_DIR"
+		else
+			rp_output_error apply 'active catalog 不是安全目录；未删除该路径'
+			exit 1
+		fi
+	fi
 	if [ "$owned_state_found" -eq 1 ]; then
 		rp_output_ok apply '停用清理完成：已删除 RoutePolicy 自有表、规则、路由和 SmartDNS 片段'
 	else
@@ -129,8 +137,28 @@ if ! mkdir "$lock" 2>/dev/null; then
 	exit 1
 fi
 work=$(mktemp -d "$RP_RUN_DIR/apply.XXXXXX") || { rmdir "$lock"; exit 1; }
-cleanup() { rm -rf "$work"; rmdir "$lock" 2>/dev/null || true; }
-trap cleanup EXIT HUP INT TERM
+active_had_previous=0
+active_published=0
+active_swap_started=0
+active_committed=0
+cleanup() {
+	if [ "$active_committed" -ne 1 ] && [ "$active_swap_started" -eq 1 ]; then
+		[ ! -e "$RP_ACTIVE_DIR" ] || mv "$RP_ACTIVE_DIR" "$work/active.aborted" >/dev/null 2>&1 || true
+		[ ! -d "$work/active.previous" ] || mv "$work/active.previous" "$RP_ACTIVE_DIR" >/dev/null 2>&1 || true
+	fi
+	rm -rf "$work"
+	rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if [ -e "$RP_ACTIVE_DIR" ]; then
+	[ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ] || { rp_output_error apply 'active catalog 不是安全目录'; exit 1; }
+	for active_name in generation domain-policy.list domain-default.list; do
+		active_path="$RP_ACTIVE_DIR/$active_name"
+		[ ! -e "$active_path" ] || { [ -f "$active_path" ] && [ ! -L "$active_path" ]; } || { rp_output_error apply "active catalog 文件不安全: $active_name"; exit 1; }
+	done
+fi
 
 old_table=$(rp_state_get route_table 2>/dev/null) || old_table=
 old_priority=$(rp_state_get rule_priority 2>/dev/null) || old_priority=
@@ -138,22 +166,85 @@ old_mark=$(rp_state_get mark 2>/dev/null) || old_mark=
 old_mask=$(rp_state_get mark_mask 2>/dev/null) || old_mask=
 old_policy_device=$(rp_state_get policy_device 2>/dev/null) || old_policy_device=
 old_policy_cidr=$(rp_state_get policy_cidr 2>/dev/null) || old_policy_cidr=
+old_source_idle_timeout=$(rp_state_get source_idle_timeout 2>/dev/null) || old_source_idle_timeout=
+old_source_max_entries=$(rp_state_get source_max_entries 2>/dev/null) || old_source_max_entries=
+old_managed_devices=$(rp_state_get managed_devices 2>/dev/null) || old_managed_devices=
 
 if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/render" >"$work/render.log" 2>&1; then
 	rp_output_error apply "候选配置生成失败: $(tr '\n' ';' <"$work/render.log")"
 	exit 1
 fi
+managed_devices=$(rp_managed_device_signature)
+[ -n "$managed_devices" ] || { rp_output_error apply '无法生成受管实际设备签名'; exit 1; }
+
+active_new="$work/active.new"
+mkdir "$active_new" || { rp_output_error apply '无法创建 active catalog 候选目录'; exit 1; }
+smartdns_enabled=$(rp_uci_get main smartdns_enabled 1)
+if [ "$smartdns_enabled" = 1 ]; then
+	cp "$RP_RUN_DIR/lists/domain-policy.list" "$active_new/domain-policy.list" && \
+		cp "$RP_RUN_DIR/lists/domain-default.list" "$active_new/domain-default.list" || { rp_output_error apply '无法准备 active catalog 域名候选'; exit 1; }
+else
+	: >"$active_new/domain-policy.list"
+	: >"$active_new/domain-default.list"
+fi
+active_generation="$(date -u +%Y%m%dT%H%M%SZ).$$"
+case "$active_generation" in ''|*[!A-Za-z0-9_.-]*|?????????????????????????????????????????????????????????????????*) rp_output_error apply '无法生成安全的 active catalog generation'; exit 1 ;; esac
+printf '%s\n' "$active_generation" >"$active_new/generation"
+chmod 0600 "$active_new/generation" "$active_new/domain-policy.list" "$active_new/domain-default.list"
+publish_active() {
+	active_swap_started=1
+	if [ -e "$RP_ACTIVE_DIR" ]; then
+		mv "$RP_ACTIVE_DIR" "$work/active.previous" || return 1
+		active_had_previous=1
+	fi
+	if mv "$active_new" "$RP_ACTIVE_DIR"; then
+		active_published=1
+		return 0
+	fi
+	[ "$active_had_previous" -eq 0 ] || mv "$work/active.previous" "$RP_ACTIVE_DIR" >/dev/null 2>&1 || true
+	active_swap_started=0
+	return 1
+}
+
+restore_active() {
+	[ "$active_published" -eq 1 ] || return 0
+	if [ -e "$RP_ACTIVE_DIR" ]; then
+		mv "$RP_ACTIVE_DIR" "$work/active.failed" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$active_had_previous" -eq 1 ]; then
+		mv "$work/active.previous" "$RP_ACTIVE_DIR" >/dev/null 2>&1 || return 1
+	fi
+	active_published=0
+	active_swap_started=0
+}
 
 incremental=1
+live_snapshot=
 for object in \
-	'set domain_policy4' 'set domain_default4' 'set static_policy4' 'set static_default4' 'chain classify'; do
+	'set domain_policy4' 'set domain_default4' 'set static_policy4' 'set static_default4' \
+	'set source_ingress4' 'set source_egress4' \
+	'chain prerouting' 'chain output' 'chain classify' \
+	'chain source_prerouting' 'chain source_postrouting'; do
 	type=${object%% *}; name=${object#* }
 	nft "list" "$type" inet routepolicy "$name" >/dev/null 2>&1 || incremental=0
 done
+source_idle_timeout=$(rp_uci_get main source_idle_timeout 600)
+source_max_entries=$(rp_uci_get main source_max_entries 4096)
+if [ "$old_source_idle_timeout" != "$source_idle_timeout" ] || [ "$old_source_max_entries" != "$source_max_entries" ]; then
+	incremental=0
+fi
+if [ "$old_managed_devices" != "$managed_devices" ]; then
+	incremental=0
+fi
 if [ "$incremental" -eq 1 ]; then
 	candidate="$RP_RUN_DIR/update.nft"
 else
 	if nft list table inet routepolicy >"$work/nft.previous" 2>/dev/null; then
+		live_snapshot="$work/live-snapshot.nft"
+		if ! "$LIBEXEC/warm-state" live-save "$live_snapshot" >"$work/live-save.log" 2>&1; then
+			rp_output_error apply "无法在完整事务前保存动态集合 live snapshot: $(tr '\n' ';' <"$work/live-save.log")"
+			exit 1
+		fi
 		{ printf 'delete table inet routepolicy\n'; cat "$RP_NFT_FILE"; } >"$work/nft.full"
 		candidate="$work/nft.full"
 	else
@@ -191,6 +282,7 @@ fi
 uci -q export smartdns >"$work/smartdns.uci.previous" 2>/dev/null || : >"$work/smartdns.uci.previous"
 
 restore_previous() {
+	restore_active || true
 	if [ -s "$work/nft.previous" ]; then
 		{ printf 'delete table inet routepolicy\n'; cat "$work/nft.previous"; } >"$work/nft.restore"
 		nft -f "$work/nft.restore" >/dev/null 2>&1 || true
@@ -224,9 +316,15 @@ if ! nft -f "$candidate" >"$work/nft-apply.log" 2>&1; then
 	failed="nft 原子事务失败: $(tr '\n' ';' <"$work/nft-apply.log")"
 fi
 
-if [ -z "$failed" ] && [ "$incremental" -eq 0 ] && [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
-	if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
-		printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
+if [ -z "$failed" ] && [ "$incremental" -eq 0 ]; then
+	if [ -n "$live_snapshot" ]; then
+		if ! "$LIBEXEC/warm-state" live-restore "$live_snapshot" >"$work/live-restore.log" 2>&1; then
+			failed="动态集合 live snapshot 恢复失败: $(tr '\n' ';' <"$work/live-restore.log")"
+		fi
+	elif [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
+		if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
+			printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
+		fi
 	fi
 fi
 
@@ -263,8 +361,10 @@ if [ -z "$failed" ]; then
 	fi
 fi
 
-smartdns_enabled=$(rp_uci_get main smartdns_enabled 1)
 smartdns_changed=0
+if [ -z "$failed" ] && ! publish_active; then
+	failed='无法原子发布 active catalog'
+fi
 if [ -z "$failed" ] && [ "$smartdns_enabled" = 1 ]; then
 	mkdir -p "$(dirname "$RP_SMARTDNS_FILE")"
 	if [ -e "$RP_SMARTDNS_FILE" ] && { [ ! -f "$RP_SMARTDNS_FILE" ] || [ -L "$RP_SMARTDNS_FILE" ]; }; then
@@ -324,6 +424,11 @@ mark_mask=$mask
 policy_interface=$policy_if
 policy_device=$policy_device
 policy_cidr=$policy_cidr
+source_accounting=$(rp_uci_get main source_accounting 0)
+source_idle_timeout=$source_idle_timeout
+source_max_entries=$source_max_entries
+managed_devices=$managed_devices
 EOF
 date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-apply"
+active_committed=1
 rp_output_ok apply "已应用；nft 使用$([ "$incremental" -eq 1 ] && printf '增量事务并保留动态集合' || printf '完整原子事务')"

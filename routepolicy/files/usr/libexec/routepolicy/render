@@ -34,6 +34,16 @@ mark=$(rp_uci_get main mark 0x100)
 mask=$(rp_uci_get main mark_mask 0x100)
 inv=$(rp_inverse_mask "$mask")
 dns_redirect=$(rp_uci_get main dns_redirect 1)
+route_local_traffic=$(rp_uci_get main route_local_traffic 0)
+source_accounting=$(rp_uci_get main source_accounting 0)
+source_idle_timeout=$(rp_uci_get main source_idle_timeout 600)
+source_max_entries=$(rp_uci_get main source_max_entries 4096)
+managed_devices=$lan_device
+for managed_if in "$(rp_uci_get main default_interface wan)" "$(rp_uci_get main policy_interface usbwan)"; do
+	managed_device=$(rp_interface_device "$managed_if" 2>/dev/null) || managed_device=
+	rp_is_device "$managed_device" || continue
+	case " $managed_devices " in *" $managed_device "*) ;; *) managed_devices="$managed_devices $managed_device" ;; esac
+done
 
 elements() {
 	file=$1
@@ -43,6 +53,65 @@ elements() {
 		if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
 		printf '%s' "$item"
 	done <"$file"
+}
+
+emit_full_rule() {
+	chain=$1
+	shift
+	: "$chain"
+	printf '\t\t%s\n' "$*"
+}
+
+emit_update_rule() {
+	chain=$1
+	shift
+	printf 'add rule inet routepolicy %s %s\n' "$chain" "$*"
+}
+
+emit_prerouting_rules() {
+	emitter=$1
+	"$emitter" prerouting "iifname != \"$lan_device\" return comment \"routepolicy: non-LAN\""
+	if [ "$dns_redirect" = 1 ]; then
+		"$emitter" prerouting 'meta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"'
+	fi
+	"$emitter" prerouting "ct mark & $mask != 0 meta mark set (meta mark & $inv) | $mark counter return comment \"routepolicy: established policy connection\""
+	"$emitter" prerouting "ct mark & $mask == 0 meta mark set meta mark & $inv comment \"routepolicy: clear default connection mark\""
+	"$emitter" prerouting 'jump classify comment "routepolicy: classify LAN destination"'
+}
+
+emit_output_rules() {
+	emitter=$1
+	if [ "$route_local_traffic" != 1 ]; then
+		"$emitter" output 'counter return comment "routepolicy: local IPv4 routing disabled"'
+		return
+	fi
+	"$emitter" output "ct state established,related ct mark & $mask != 0 counter meta mark set (meta mark & $inv) | $mark return comment \"routepolicy: restore local connection mark\""
+	"$emitter" output "ct state new meta mark & $mask != 0 counter ct mark set (ct mark & $inv) | $mark return comment \"routepolicy: preserve local socket mark\""
+	"$emitter" output 'jump classify comment "routepolicy: classify local destination"'
+}
+
+emit_classify_rules() {
+	emitter=$1
+	"$emitter" classify 'ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter return comment "routepolicy: excluded destination"'
+	"$emitter" classify "ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv return comment \"routepolicy: dynamic default override\""
+	"$emitter" classify "ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv return comment \"routepolicy: static default override\""
+	"$emitter" classify "ip daddr @domain_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment \"routepolicy: dynamic policy\""
+	"$emitter" classify "ip daddr @static_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment \"routepolicy: static policy\""
+}
+
+emit_source_rules() {
+	emitter=$1 chain=$2 direction=$3
+	if [ "$source_accounting" != 1 ]; then
+		"$emitter" "$chain" 'counter return comment "routepolicy: source accounting disabled"'
+		return
+	fi
+	for device in $managed_devices; do
+		if [ "$direction" = ingress ]; then
+			"$emitter" "$chain" "iifname \"$device\" update @source_ingress4 { iifname . ip saddr counter } comment \"routepolicy: account ingress source\""
+		else
+			"$emitter" "$chain" "oifname \"$device\" update @source_egress4 { oifname . ip saddr counter } comment \"routepolicy: account egress source\""
+		fi
+	done
 }
 
 full="$work/rules.nft"
@@ -77,21 +146,52 @@ EOF
 	if [ -s "$RP_RUN_DIR/lists/ipv4-default.list" ]; then printf '\t\telements = { '; elements "$RP_RUN_DIR/lists/ipv4-default.list"; printf ' }\n'; fi
 	cat <<EOF
 	}
-	chain classify {
+	set source_ingress4 {
+		type ifname . ipv4_addr
+		flags dynamic,timeout
+		timeout ${source_idle_timeout}s
+		gc-interval 60s
+		size $source_max_entries
+		policy memory
+		counter
+	}
+	set source_egress4 {
+		type ifname . ipv4_addr
+		flags dynamic,timeout
+		timeout ${source_idle_timeout}s
+		gc-interval 60s
+		size $source_max_entries
+		policy memory
+		counter
+	}
+	chain prerouting {
 		type filter hook prerouting priority mangle; policy accept;
-		iifname != "$lan_device" comment "routepolicy: non-LAN" return
 EOF
-	if [ "$dns_redirect" = 1 ]; then
-		printf '\t\tmeta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"\n'
-	fi
+	emit_prerouting_rules emit_full_rule
 	cat <<EOF
-		meta mark set (meta mark & $inv) | (ct mark & $mask) comment "routepolicy: restore connection mark"
-		ct mark & $mask != 0 counter comment "routepolicy: established policy connection" return
-		ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter comment "routepolicy: excluded destination" return
-		ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: dynamic default override" return
-		ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: static default override" return
-		ip daddr @domain_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: dynamic policy"
-		ip daddr @static_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: static policy"
+	}
+	chain output {
+		type route hook output priority mangle; policy accept;
+EOF
+	emit_output_rules emit_full_rule
+	cat <<EOF
+	}
+	chain classify {
+EOF
+	emit_classify_rules emit_full_rule
+	cat <<EOF
+	}
+	chain source_prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+EOF
+	emit_source_rules emit_full_rule source_prerouting ingress
+	cat <<EOF
+	}
+	chain source_postrouting {
+		type filter hook postrouting priority mangle; policy accept;
+EOF
+	emit_source_rules emit_full_rule source_postrouting egress
+	cat <<EOF
 	}
 }
 EOF
@@ -106,19 +206,17 @@ EOF
 	if [ -s "$RP_RUN_DIR/lists/ipv4-policy.list" ]; then printf 'add element inet routepolicy static_policy4 { '; elements "$RP_RUN_DIR/lists/ipv4-policy.list"; printf ' }\n'; fi
 	if [ -s "$RP_RUN_DIR/lists/ipv4-default.list" ]; then printf 'add element inet routepolicy static_default4 { '; elements "$RP_RUN_DIR/lists/ipv4-default.list"; printf ' }\n'; fi
 	cat <<EOF
+flush chain inet routepolicy prerouting
+flush chain inet routepolicy output
 flush chain inet routepolicy classify
-add rule inet routepolicy classify iifname != "$lan_device" comment "routepolicy: non-LAN" return
+flush chain inet routepolicy source_prerouting
+flush chain inet routepolicy source_postrouting
 EOF
-	if [ "$dns_redirect" = 1 ]; then printf 'add rule inet routepolicy classify meta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"\n'; fi
-	cat <<EOF
-add rule inet routepolicy classify meta mark set (meta mark & $inv) | (ct mark & $mask) comment "routepolicy: restore connection mark"
-add rule inet routepolicy classify ct mark & $mask != 0 counter comment "routepolicy: established policy connection" return
-add rule inet routepolicy classify ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 } counter comment "routepolicy: excluded destination" return
-add rule inet routepolicy classify ip daddr @domain_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: dynamic default override" return
-add rule inet routepolicy classify ip daddr @static_default4 counter ct mark set ct mark & $inv meta mark set meta mark & $inv comment "routepolicy: static default override" return
-add rule inet routepolicy classify ip daddr @domain_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: dynamic policy"
-add rule inet routepolicy classify ip daddr @static_policy4 counter ct mark set (ct mark & $inv) | $mark meta mark set (meta mark & $inv) | $mark comment "routepolicy: static policy"
-EOF
+	emit_prerouting_rules emit_update_rule
+	emit_output_rules emit_update_rule
+	emit_classify_rules emit_update_rule
+	emit_source_rules emit_update_rule source_prerouting ingress
+	emit_source_rules emit_update_rule source_postrouting egress
 } >"$update"
 
 smartdns="$work/90-routepolicy.conf"

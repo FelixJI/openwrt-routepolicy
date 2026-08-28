@@ -4,6 +4,7 @@
 
 const METHODS = [
 	'status', 'validate', 'apply', 'reload', 'update', 'rollback',
+	'observe_interfaces', 'observe_sets', 'observe_query',
 	'diagnose', 'import_legacy', 'read_user_list', 'write_user_list',
 	'smartdns_status', 'smartdns_save', 'smartdns_validate', 'smartdns_apply',
 	'smartdns_discard_candidate', 'read_local_hosts', 'write_local_hosts'
@@ -11,6 +12,7 @@ const METHODS = [
 const PARAMS = {
 	read_user_list: { list: true },
 	write_user_list: { list: true, content: true },
+	observe_query: { dataset: true, query: true, cursor: true, limit: true, device: true, sort: true },
 	smartdns_save: [ 'content' ],
 	write_local_hosts: [ 'content' ]
 };

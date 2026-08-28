@@ -26,4 +26,9 @@ let rejected = signature.routepolicy.write_user_list.call({
 assert(type(rejected) == 'object', 'write_user_list must return a structured reply in target ucode');
 assert(rejected.ok === false, 'invalid domain must be rejected without throwing a target runtime exception');
 assert(rejected.invalid_count == 1, 'target ucode must report the rejected domain count');
+rejected = signature.routepolicy.observe_query.call({
+    args: { dataset: 'source_ingress4; reboot', query: '', cursor: '', limit: 50, device: '', sort: 'bytes' }
+});
+assert(type(rejected) == 'object' && rejected.ok === false,
+    'target ucode must reject an unknown observation dataset before popen');
 print('ucode fixed-string popen contract passed.\n');

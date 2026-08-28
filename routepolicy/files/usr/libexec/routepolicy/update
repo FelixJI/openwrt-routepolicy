@@ -36,7 +36,7 @@ for section in $sections; do
 			rp_output_error update "来源 $section 要求策略接口更新，但接口不在线"
 			exit 1
 		fi
-		set -- "$@" --interface "$device"
+		set -- "$@" --interface "if!$device"
 	fi
 	if ! curl "$@" "$url" >"$work/$section.curl.log" 2>&1; then
 		rp_output_error update "来源 $section 下载失败"

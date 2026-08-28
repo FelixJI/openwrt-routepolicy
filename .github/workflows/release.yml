@@ -38,7 +38,7 @@ jobs:
         run: |
           set -eu
           sudo apt-get update
-          sudo apt-get install --yes shellcheck zstd
+          sudo apt-get install --yes nftables shellcheck zstd
           sh tests/ci/static-checks.sh
           sh tests/ci/package-contract-tests.sh
           sh tests/converters/run.sh

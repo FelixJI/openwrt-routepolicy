@@ -8,6 +8,20 @@
 
 RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。LuCI 包安装流程会重载 rpcd 以注册固定 RPC 对象，但不需要重启路由器，RoutePolicy 服务仍保持禁用。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
 
+## 本机分流与可观测性
+
+0.3.0 在原有 LAN 转发分类之外增加可选的“路由器本机 IPv4 分流”。该开关默认关闭；开启并应用后，路由器上的下载器、插件和守护进程产生的未显式打标 IPv4 新连接会按同一组 dynamic/static policy/default 集合分类。已有 RoutePolicy socket/meta mark 和已建立连接的 conntrack mark 会被保留；保留地址仍不进入策略路径。策略出口离线时，命中策略的连接继续由 table 200 的 blackhole default 严格阻断，不回落默认出口。
+
+“服务 → 路由策略 → 流量与集合”提供三类只读观测：
+
+- 三个受管逻辑接口解析后的实际 L3 设备 RX/TX 累计量与实时速率；重复设备只采集一次并保留角色标签。
+- 可选的“按源 IP 统计”；默认关闭，启用后用两个容量和超时均受限的 nftables IPv4 set 记录入站/出站 packets、bytes 和剩余活动时间。
+- 四个业务 nft set 的摘要，以及当前生效域名、静态 IPv4、SmartDNS 动态 IPv4 的受限检索与分页。
+
+接口总量与按 IP 归因口径不同。接口计数可能包含 IPv6、非 IP、桥接和其他服务流量；按源 IP 统计只覆盖经过 RoutePolicy hooks 的 IPv4，flow/hardware offload 也可能绕过逐 IP 计数。页面不会用二者相减推断“未知流量”。折线只保留当前页面最多 5 分钟/150 点，页面隐藏时暂停采样，不写闪存。
+
+设置页还提供“归因闲置超时”（60..86400 秒）和“每方向最大 IP 数”（256..16384）；默认分别为 600 秒和 4096。达到容量时只可能遗漏新的归因键，不影响数据包转发，页面会显示 saturated 提示。关闭 `source_accounting` 并重新应用可停止归因；关闭 `route_local_traffic` 并重新应用可恢复升级前的路由器本机出站行为，LAN 转发分类不受影响。
+
 ## 安装
 
 1. 在 [Releases](../../releases) 下载与目标版本对应的 `routepolicy-*.apk`、`luci-app-routepolicy-*.apk`、`*-packages.adb` 索引文件、`INSTALL.txt` 和 `SHA256SUMS`。
@@ -72,6 +86,8 @@ ubus call routepolicy status '{}'
 
 每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
 
+从 0.2.9 升级到 0.3.0 时会因新增 nft 对象执行一次完整事务。应用会先取得当前两个 SmartDNS 动态业务 set 的 live snapshot，并在新表建立后尽量按剩余 TTL 恢复；源 IP 归因统计允许在完整重建时归零。升级不会自动开启本机分流或按源 IP 统计。
+
 ## SmartDNS 管理
 
 LuCI 入口为“服务 → 路由策略 → SmartDNS”。它不依赖官方 `luci-app-smartdns`，但可以与其共存；若 SSH、官方页面或其他工具在本页面打开后修改了 SmartDNS UCI，版本/基线比较会拒绝覆盖并要求刷新。SmartDNS 的“保存候选/验证并应用”与 RoutePolicy 的 nftables、策略路由应用完全分离，RoutePolicy 停用时仍可管理 DNS。
@@ -126,6 +142,7 @@ apk del luci-app-routepolicy routepolicy
 
 - 路由应用仅操作独立的 `inet routepolicy` 表和策略路由表；SmartDNS 页面可在用户授权后精确管理标准 SmartDNS UCI、上游和自有附加片段。
 - RPC 只执行仓库内枚举的固定完整命令字符串；请求字段不进入 shell，动态正文只通过 stdin 传递。不提供任意命令、任意 nft 文本或任意路径访问接口。
+- 观测查询只接受固定 dataset、排序和设备枚举；query、cursor、limit 都有长度/范围上限。域名 active catalog 只在完整应用成功后发布，失败候选不会显示为“当前生效”。
 - 远程清单经过格式、数量、地址范围和原子回滚检查；不要把不可信订阅 URL 或凭据提交到 issue。
 - 策略接口断开时设计为严格阻断，避免命中策略的流量回落到默认路径。
 

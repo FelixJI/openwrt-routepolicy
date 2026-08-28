@@ -6,7 +6,7 @@ LIBEXEC="${ROUTEPOLICY_LIBEXEC:-/usr/libexec/routepolicy}"
 
 usage() {
 	cat >&2 <<'EOF'
-Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollback} [--json]
+Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollback|observe-interfaces|observe-sets} [--json]
        routepolicyctl import-legacy DIRECTORY [--json]
        routepolicyctl user-list {read|write} {domain-policy|domain-default|ipv4-policy|ipv4-default} [--json]
        routepolicyctl smartdns-{status|save|validate|apply|discard|read-local-hosts|write-local-hosts} [--json]
@@ -27,6 +27,44 @@ case "$command_name" in
 		fi
 		[ "$command_name" = reload ] && command_name=apply
 		exec "$LIBEXEC/$command_name"
+		;;
+	observe-interfaces|observe-sets)
+		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then
+			export ROUTEPOLICY_OUTPUT=json
+		elif [ "$#" -ne 0 ]; then
+			usage
+		fi
+		exec "$LIBEXEC/observe" "${command_name#observe-}"
+		;;
+	observe-export-domain-policy|observe-export-domain-default)
+		[ "$#" -eq 1 ] && [ "$1" = --json ] || usage
+		export ROUTEPOLICY_OUTPUT=json
+		case "$command_name" in
+			observe-export-domain-policy) dataset=domain_policy ;;
+			observe-export-domain-default) dataset=domain_default ;;
+		esac
+		exec "$LIBEXEC/observe" export "$dataset" domain
+		;;
+	observe-export-static-policy4|observe-export-static-default4|observe-export-dynamic-policy4|observe-export-dynamic-default4)
+		[ "$#" -eq 1 ] && [ "$1" = --json ] || usage
+		export ROUTEPOLICY_OUTPUT=json
+		case "$command_name" in
+			observe-export-static-policy4) dataset=static_policy4 ;;
+			observe-export-static-default4) dataset=static_default4 ;;
+			observe-export-dynamic-policy4) dataset=dynamic_policy4 ;;
+			observe-export-dynamic-default4) dataset=dynamic_default4 ;;
+		esac
+		exec "$LIBEXEC/observe" export "$dataset" address
+		;;
+	observe-export-source-ingress4-address|observe-export-source-ingress4-bytes|observe-export-source-ingress4-packets|observe-export-source-egress4-address|observe-export-source-egress4-bytes|observe-export-source-egress4-packets)
+		[ "$#" -eq 1 ] && [ "$1" = --json ] || usage
+		export ROUTEPOLICY_OUTPUT=json
+		case "$command_name" in
+			observe-export-source-ingress4-*) dataset=source_ingress4 ;;
+			observe-export-source-egress4-*) dataset=source_egress4 ;;
+		esac
+		sort_key=${command_name##*-}
+		exec "$LIBEXEC/observe" export "$dataset" "$sort_key"
 		;;
 	import-legacy)
 		if [ "$#" -eq 2 ] && [ "$2" = --json ]; then

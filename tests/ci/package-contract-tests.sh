@@ -13,11 +13,12 @@ fail() {
 [ -f routepolicy/Makefile ] || fail '缺少 routepolicy Makefile'
 [ -f luci-app-routepolicy/Makefile ] || fail '缺少 luci-app-routepolicy Makefile'
 [ -f routepolicy/files/etc/config/routepolicy ] || fail '缺少默认 UCI 配置'
+[ -f routepolicy/files/usr/libexec/routepolicy/observe ] || fail '缺少 observation 深模块'
 
 grep -q '^PKG_NAME:=routepolicy$' routepolicy/Makefile || fail '核心包名不正确'
 grep -q '^PKG_NAME:=luci-app-routepolicy$' luci-app-routepolicy/Makefile || fail 'LuCI 包名不正确'
-grep -q '^PKG_VERSION:=0.2.9$' routepolicy/Makefile || fail '核心包版本未升级到 0.2.9 热修复'
-grep -q '^PKG_VERSION:=0.2.9$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.2.9 热修复'
+grep -q '^PKG_VERSION:=0.3.0$' routepolicy/Makefile || fail '核心包版本未升级到 0.3.0 功能版本'
+grep -q '^PKG_VERSION:=0.3.0$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.3.0 功能版本'
 grep -q "^config main 'main'$" routepolicy/files/etc/config/routepolicy || fail '缺少 main 配置段'
 grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepolicy || fail '安装默认必须禁用'
 rpcd_plugin=luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
@@ -27,10 +28,15 @@ grep -Fq '+rpcd-mod-ucode' luci-app-routepolicy/Makefile || fail 'LuCI 包缺少
 grep -Fq 'luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy' .github/workflows/build.yml || fail '构建工作流未编译正式 rpcd ucode 路径'
 grep -Fq 'luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy' .github/workflows/release.yml || fail '发布工作流未编译正式 rpcd ucode 路径'
 [ -f tests/luci/ucode-popen-contract.uc ] || fail '缺少 OpenWrt 25.12 ucode popen 运行时合同'
+[ -f tests/core/nft-syntax-test.sh ] || fail '缺少真实 nft 语法门禁'
 grep -Fq 'tests/luci/ucode-popen-contract.uc' .github/workflows/build.yml || fail '构建工作流未执行目标 ucode popen 运行时合同'
 grep -Fq 'tests/luci/ucode-popen-contract.uc' .github/workflows/release.yml || fail '发布工作流未执行目标 ucode popen 运行时合同'
+grep -Fq 'nft-syntax-test.sh' tests/core/run.sh || fail 'core 测试未执行真实 nft 语法门禁'
+grep -Fq 'nftables shellcheck' .github/workflows/build.yml || fail '构建工作流未安装 nft 语法检查器'
+grep -Fq 'nftables shellcheck' .github/workflows/release.yml || fail '发布工作流未安装 nft 语法检查器'
 if grep -R -Fq 'luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy' .github tests/luci/README.md; then fail 'CI 或测试说明仍引用错误的 rpcd exec 路径'; fi
 grep -Fq 'smartdns-control' routepolicy/Makefile || fail '核心包未安装 SmartDNS 深模块'
+grep -Fq 'files/usr/libexec/routepolicy/observe' routepolicy/Makefile || fail '核心包未安装 observation 深模块'
 grep -Fq '/etc/routepolicy/user.d/local-hosts.list' routepolicy/Makefile || fail '本地主机文件未声明为 conffile'
 grep -Fq '91-routepolicy-smartdns-extra.conf' routepolicy/Makefile || fail '卸载脚本未清理 91 片段登记'
 grep -Fq 'routepolicy-*.apk' scripts/ci/prepare-release.sh || fail 'Release 收集必须使用 OpenWrt APK 连字符命名'
@@ -40,6 +46,9 @@ if grep -Fq -- "-name 'Packages'" scripts/ci/prepare-release.sh; then fail 'Rele
 grep -Fq "ubus list | grep -qx routepolicy" scripts/ci/prepare-release.sh || fail 'Release 安装说明缺少 rpcd 对象 smoke'
 grep -Fq "ubus call routepolicy status '{}'" scripts/ci/prepare-release.sh || fail 'Release 安装说明缺少 RPC 执行 smoke'
 grep -Fq "ubus call routepolicy status '{}'" README.md || fail 'README 升级流程缺少 RPC 执行 smoke'
+grep -Fq '路由器本机 IPv4 分流' README.md || fail 'README 缺少本机 IPv4 分流开关说明'
+grep -Fq '按源 IP 统计' README.md || fail 'README 缺少有界源 IP 统计说明'
+grep -Fq 'active catalog' SECURITY.md || fail '安全文档缺少 active catalog 生效态边界'
 
 # 发布树不得捆绑或引用仅供现场迁移后使用的本地清理脚本。
 if grep -R -n -E 'cleanup-legacy-splitroute-after-package-install\.sh' \

@@ -23,6 +23,9 @@ case "${1:-}" in
 			routepolicy.main.policy_interface) echo usbwan ;;
 			routepolicy.main.strict_enforcement) echo "${TEST_STRICT:-1}" ;;
 			routepolicy.main.smartdns_enabled) echo "${TEST_SMARTDNS_ENABLED:-1}" ;;
+			routepolicy.main.source_accounting) echo "${TEST_SOURCE_ACCOUNTING:-0}" ;;
+			routepolicy.main.source_idle_timeout) echo "${TEST_SOURCE_IDLE_TIMEOUT:-600}" ;;
+			routepolicy.main.source_max_entries) echo "${TEST_SOURCE_MAX_ENTRIES:-4096}" ;;
 			routepolicy.main.dns_redirect|routepolicy.main.warm_restore|routepolicy.main.auto_update|routepolicy.main.update_via_policy_interface) echo 1 ;;
 			routepolicy.main.route_table) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo not-a-number || echo "${TEST_ROUTE_TABLE:-200}" ;;
 			routepolicy.main.rule_priority) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo -1 || echo "${TEST_RULE_PRIORITY:-12000}" ;;

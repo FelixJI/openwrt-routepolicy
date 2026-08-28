@@ -29,7 +29,7 @@ jobs:
       # 官方 actions 使用稳定主版本；其余步骤均为 runner 内置命令，减少供应链面。
       - uses: actions/checkout@v5
       - name: Install offline check tools
-        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes nftables shellcheck
       - name: Check shell, ucode and JavaScript
         run: sh tests/ci/static-checks.sh
       - name: Run package contract tests

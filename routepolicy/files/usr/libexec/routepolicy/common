@@ -11,6 +11,7 @@ RP_MANAGED_CURRENT="$RP_ETC/managed.d/current"
 RP_MANAGED_PREVIOUS="$RP_ETC/managed.d/previous"
 RP_STATE_DIR="$RP_ETC/state"
 RP_RUN_DIR="$RP_ROOT/tmp/routepolicy"
+RP_ACTIVE_DIR="$RP_RUN_DIR/active"
 RP_NFT_FILE="$RP_RUN_DIR/rules.nft"
 RP_SMARTDNS_FILE="$RP_ROOT/etc/smartdns/conf.d/90-routepolicy.conf"
 RP_SMARTDNS_EXTRA_FILE="$RP_ROOT/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf"
@@ -191,6 +192,17 @@ rp_interface_up() {
 	[ "$value" = true ] || [ "$value" = 1 ]
 }
 
+rp_managed_device_signature() {
+	for managed_interface in \
+		"$(rp_uci_get main lan_interface lan)" \
+		"$(rp_uci_get main default_interface wan)" \
+		"$(rp_uci_get main policy_interface usbwan)"; do
+		managed_device=$(rp_interface_device "$managed_interface" 2>/dev/null) || managed_device=
+		rp_is_device "$managed_device" || continue
+		printf '%s\n' "$managed_device"
+	done | LC_ALL=C sort -u | awk 'BEGIN{first=1} NF{if(!first)printf ",";printf "%s",$0;first=0} END{print ""}'
+}
+
 rp_schedule_due() {
 	now_date=$1 now_hour=$2 now_minute=$3 target_hour=$4 target_minute=$5 last_date=${6-}
 	case "$now_date" in ????-??-??) ;; *) return 1 ;; esac
@@ -227,58 +239,66 @@ rp_mark_conflicts() {
 }
 
 rp_validate_main() {
-	errors=0
+	main_errors=0
 	for command_name in uci ubus jsonfilter nft ip; do
-		rp_have "$command_name" || { rp_err "缺少命令: $command_name"; errors=$((errors + 1)); }
+		rp_have "$command_name" || { rp_err "缺少命令: $command_name"; main_errors=$((main_errors + 1)); }
 	done
 	for field in enabled strict_enforcement dns_redirect warm_restore smartdns_enabled auto_update update_via_policy_interface; do
 		value=$(rp_uci_get main "$field" '')
-		rp_is_bool "$value" || { rp_err "main.$field 必须为 0 或 1"; errors=$((errors + 1)); }
+		rp_is_bool "$value" || { rp_err "main.$field 必须为 0 或 1"; main_errors=$((main_errors + 1)); }
 	done
+	route_local_traffic=$(rp_uci_get main route_local_traffic 0)
+	rp_is_bool "$route_local_traffic" || { rp_err 'main.route_local_traffic 必须为 0 或 1'; main_errors=$((main_errors + 1)); }
+	source_accounting=$(rp_uci_get main source_accounting 0)
+	rp_is_bool "$source_accounting" || { rp_err 'main.source_accounting 必须为 0 或 1'; main_errors=$((main_errors + 1)); }
+	source_idle_timeout=$(rp_uci_get main source_idle_timeout 600)
+	rp_uint_between "$source_idle_timeout" 60 86400 || { rp_err 'main.source_idle_timeout 必须在 60..86400'; main_errors=$((main_errors + 1)); }
+	source_max_entries=$(rp_uci_get main source_max_entries 4096)
+	rp_uint_between "$source_max_entries" 256 16384 || { rp_err 'main.source_max_entries 必须在 256..16384'; main_errors=$((main_errors + 1)); }
 	for field in lan_interface default_interface policy_interface; do
 		value=$(rp_uci_get main "$field" '')
-		rp_is_name "$value" 32 || { rp_err "main.$field 不是合法逻辑接口名"; errors=$((errors + 1)); }
+		rp_is_name "$value" 32 || { rp_err "main.$field 不是合法逻辑接口名"; main_errors=$((main_errors + 1)); }
 	done
 	table=$(rp_uci_get main route_table '')
-	rp_uint_between "$table" 1 252 || { rp_err 'main.route_table 必须在 1..252'; errors=$((errors + 1)); }
+	rp_uint_between "$table" 1 252 || { rp_err 'main.route_table 必须在 1..252'; main_errors=$((main_errors + 1)); }
 	priority=$(rp_uci_get main rule_priority '')
-	rp_uint_between "$priority" 1 32765 || { rp_err 'main.rule_priority 必须在 1..32765'; errors=$((errors + 1)); }
+	rp_uint_between "$priority" 1 32765 || { rp_err 'main.rule_priority 必须在 1..32765'; main_errors=$((main_errors + 1)); }
 	mark=$(rp_uci_get main mark '')
 	mask=$(rp_uci_get main mark_mask '')
-	rp_is_mark_bit "$mark" || { rp_err 'main.mark 必须是 32 位范围内的单一非零 bit'; errors=$((errors + 1)); }
-	rp_is_mark_bit "$mask" || { rp_err 'main.mark_mask 必须是 32 位范围内的单一非零 bit'; errors=$((errors + 1)); }
-	[ "$mark" = "$mask" ] || { rp_err 'main.mark 与 main.mark_mask 必须表示同一 bit'; errors=$((errors + 1)); }
+	rp_is_mark_bit "$mark" || { rp_err 'main.mark 必须是 32 位范围内的单一非零 bit'; main_errors=$((main_errors + 1)); }
+	rp_is_mark_bit "$mask" || { rp_err 'main.mark_mask 必须是 32 位范围内的单一非零 bit'; main_errors=$((main_errors + 1)); }
+	[ "$mark" = "$mask" ] || { rp_err 'main.mark 与 main.mark_mask 必须表示同一 bit'; main_errors=$((main_errors + 1)); }
 	group=$(rp_uci_get main smartdns_policy_group '')
-	rp_is_group "$group" || { rp_err 'main.smartdns_policy_group 非法'; errors=$((errors + 1)); }
+	rp_is_group "$group" || { rp_err 'main.smartdns_policy_group 非法'; main_errors=$((main_errors + 1)); }
 	hour=$(rp_uci_get main update_hour '')
 	minute=$(rp_uci_get main update_minute '')
-	rp_uint_between "$hour" 0 23 || { rp_err 'main.update_hour 必须在 0..23'; errors=$((errors + 1)); }
-	rp_uint_between "$minute" 0 59 || { rp_err 'main.update_minute 必须在 0..59'; errors=$((errors + 1)); }
-	[ "$errors" -eq 0 ]
+	rp_uint_between "$hour" 0 23 || { rp_err 'main.update_hour 必须在 0..23'; main_errors=$((main_errors + 1)); }
+	rp_uint_between "$minute" 0 59 || { rp_err 'main.update_minute 必须在 0..59'; main_errors=$((main_errors + 1)); }
+	[ "$main_errors" -eq 0 ]
 }
 
 rp_validate_sources() {
-	errors=0
+	source_errors=0
 	for section in $(rp_source_sections); do
-		rp_is_name "$section" 32 || { rp_err "非法 source 节名: $section"; errors=$((errors + 1)); continue; }
+		rp_is_name "$section" 32 || { rp_err "非法 source 节名: $section"; source_errors=$((source_errors + 1)); continue; }
 		enabled=$(rp_uci_get "$section" enabled 0)
-		rp_is_bool "$enabled" || { rp_err "$section.enabled 必须为 0 或 1"; errors=$((errors + 1)); }
+		rp_is_bool "$enabled" || { rp_err "$section.enabled 必须为 0 或 1"; source_errors=$((source_errors + 1)); }
 		[ "$enabled" = 1 ] || continue
 		url=$(rp_uci_get "$section" url '')
-		rp_is_https_url "$url" || { rp_err "$section.url 必须是长度受限、无空白的 HTTPS URL"; errors=$((errors + 1)); }
+		rp_is_https_url "$url" || { rp_err "$section.url 必须是长度受限、无空白的 HTTPS URL"; source_errors=$((source_errors + 1)); }
 		format=$(rp_uci_get "$section" format '')
-		case "$format" in plain-domain|plain-ipv4|hosts-domain|adblock-domain|dnsmasq-domain|clash-domain|clash-ipv4) ;; *) rp_err "$section.format 不受支持"; errors=$((errors + 1)) ;; esac
+		case "$format" in plain-domain|plain-ipv4|hosts-domain|adblock-domain|dnsmasq-domain|clash-domain|clash-ipv4) ;; *) rp_err "$section.format 不受支持"; source_errors=$((source_errors + 1)) ;; esac
 		target=$(rp_uci_get "$section" target '')
-		case "$target" in domain-policy|domain-default|ipv4-policy|ipv4-default) ;; *) rp_err "$section.target 不受支持"; errors=$((errors + 1)) ;; esac
-		case "$format:$target" in *domain:domain-*|*ipv4:ipv4-*) ;; *) rp_err "$section.format 与 target 类型不一致"; errors=$((errors + 1)) ;; esac
+		case "$target" in domain-policy|domain-default|ipv4-policy|ipv4-default) ;; *) rp_err "$section.target 不受支持"; source_errors=$((source_errors + 1)) ;; esac
+		case "$format:$target" in *domain:domain-*|*ipv4:ipv4-*) ;; *) rp_err "$section.format 与 target 类型不一致"; source_errors=$((source_errors + 1)) ;; esac
 		minimum=$(rp_uci_get "$section" min_entries 1)
 		shrink=$(rp_uci_get "$section" max_shrink_percent 50)
-		rp_uint_between "$minimum" 1 10000000 || { rp_err "$section.min_entries 必须在 1..10000000"; errors=$((errors + 1)); }
-		rp_uint_between "$shrink" 0 100 || { rp_err "$section.max_shrink_percent 必须在 0..100"; errors=$((errors + 1)); }
+		rp_uint_between "$minimum" 1 10000000 || { rp_err "$section.min_entries 必须在 1..10000000"; source_errors=$((source_errors + 1)); }
+		rp_uint_between "$shrink" 0 100 || { rp_err "$section.max_shrink_percent 必须在 0..100"; source_errors=$((source_errors + 1)); }
 		via=$(rp_uci_get "$section" update_via_policy_interface "$(rp_uci_get main update_via_policy_interface 1)")
-		rp_is_bool "$via" || { rp_err "$section.update_via_policy_interface 必须为 0 或 1"; errors=$((errors + 1)); }
+		rp_is_bool "$via" || { rp_err "$section.update_via_policy_interface 必须为 0 或 1"; source_errors=$((source_errors + 1)); }
 	done
-	[ "$errors" -eq 0 ]
+	[ "$source_errors" -eq 0 ]
 }
 
 rp_ensure_dirs() {
@@ -315,8 +335,8 @@ rp_render_smartdns90() {
 	cat >"$smartdns_output" <<EOF
 # Generated by routepolicy. Do not edit.
 nftset-timeout yes
-domain-set -name routepolicy_policy -type list -file /tmp/routepolicy/lists/domain-policy.list
-domain-set -name routepolicy_default -type list -file /tmp/routepolicy/lists/domain-default.list
+domain-set -name routepolicy_policy -type list -file /tmp/routepolicy/active/domain-policy.list
+domain-set -name routepolicy_default -type list -file /tmp/routepolicy/active/domain-default.list
 nftset /domain-set:routepolicy_policy/#4:inet#routepolicy#domain_policy4
 nftset /domain-set:routepolicy_default/#4:inet#routepolicy#domain_default4
 domain-rules /domain-set:routepolicy_policy/ -nameserver $group -speed-check-mode none

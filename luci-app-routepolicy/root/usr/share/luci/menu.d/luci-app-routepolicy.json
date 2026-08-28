@@ -11,6 +11,12 @@
     "action": { "type": "view", "path": "routepolicy/status" },
     "depends": { "acl": [ "luci-app-routepolicy" ] }
   },
+  "admin/services/routepolicy/observability": {
+    "title": "流量与集合",
+    "order": 15,
+    "action": { "type": "view", "path": "routepolicy/observability" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
   "admin/services/routepolicy/settings": {
     "title": "基础设置",
     "order": 20,

@@ -59,6 +59,14 @@ return view.extend({
 		o.default = '1';
 		o.description = _('重启后的短暂保底；随后由 SmartDNS 的 TTL 写入重新接管。');
 
+		o = s.option(form.Flag, 'route_local_traffic', _('路由器本机 IPv4 分流'));
+		o.default = '0';
+		o.description = _('默认关闭。开启后，路由器上的下载器、插件和守护进程产生的 IPv4 流量也会按 RoutePolicy 分类。');
+
+		o = s.option(form.Flag, 'source_accounting', _('按源 IP 统计'));
+		o.default = '0';
+		o.description = _('默认关闭。启用后会消耗额外内存和 CPU；只覆盖受管 IPv4 路径，硬件或 flow offload 可能造成与接口总量的正常差异。');
+
 		s.tab('advanced', _('高级设置'));
 		let a = s.taboption('advanced', form.Value, 'route_table', _('策略路由表号'));
 		a.tab = 'advanced';
@@ -110,6 +118,18 @@ return view.extend({
 		a = s.taboption('advanced', form.Flag, 'update_via_policy_interface', _('更新经策略接口'));
 		a.tab = 'advanced';
 		a.default = '1';
+
+		a = s.taboption('advanced', form.Value, 'source_idle_timeout', _('归因闲置超时（秒）'));
+		a.tab = 'advanced';
+		a.default = '600';
+		a.datatype = 'range(60,86400)';
+		a.description = _('归因 IP 在无新流量后的保留时间。该值只影响有界的源 IP 统计，不影响业务分流集合。');
+
+		a = s.taboption('advanced', form.Value, 'source_max_entries', _('每方向最大 IP 数'));
+		a.tab = 'advanced';
+		a.default = '4096';
+		a.datatype = 'range(256,16384)';
+		a.description = _('达到上限时转发不受影响，但新的归因 IP 可能遗漏；观测页会显示“已饱和”。');
 
 		this.map = m;
 		return m.render();

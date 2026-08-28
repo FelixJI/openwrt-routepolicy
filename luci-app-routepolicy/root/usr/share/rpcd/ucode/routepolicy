@@ -54,7 +54,57 @@ const COMMANDS = {
     smartdns_discard_candidate: '/usr/sbin/routepolicyctl smartdns-discard --json',
     read_local_hosts: '/usr/sbin/routepolicyctl smartdns-read-local-hosts --json',
     write_local_hosts: '/usr/sbin/routepolicyctl smartdns-write-local-hosts --json',
-    import_legacy: '/usr/sbin/routepolicyctl import-legacy /etc/splitroute --json'
+    import_legacy: '/usr/sbin/routepolicyctl import-legacy /etc/splitroute --json',
+    observe_interfaces: '/usr/sbin/routepolicyctl observe-interfaces --json',
+    observe_sets: '/usr/sbin/routepolicyctl observe-sets --json'
+};
+
+/*
+ * OpenWrt 25.12 popen() is single-directional. Query input therefore never
+ * enters a child process: rpcd selects one complete literal export command,
+ * then performs bounded filtering and pagination in-process.
+ */
+const OBSERVE_DATASETS = {
+    domain_policy: {
+        field: 'domain', default_sort: 'domain', source: false,
+        commands: { domain: '/usr/sbin/routepolicyctl observe-export-domain-policy --json' }
+    },
+    domain_default: {
+        field: 'domain', default_sort: 'domain', source: false,
+        commands: { domain: '/usr/sbin/routepolicyctl observe-export-domain-default --json' }
+    },
+    static_policy4: {
+        field: 'address', default_sort: 'address', source: false,
+        commands: { address: '/usr/sbin/routepolicyctl observe-export-static-policy4 --json' }
+    },
+    static_default4: {
+        field: 'address', default_sort: 'address', source: false,
+        commands: { address: '/usr/sbin/routepolicyctl observe-export-static-default4 --json' }
+    },
+    dynamic_policy4: {
+        field: 'address', default_sort: 'address', source: false,
+        commands: { address: '/usr/sbin/routepolicyctl observe-export-dynamic-policy4 --json' }
+    },
+    dynamic_default4: {
+        field: 'address', default_sort: 'address', source: false,
+        commands: { address: '/usr/sbin/routepolicyctl observe-export-dynamic-default4 --json' }
+    },
+    source_ingress4: {
+        field: 'address', default_sort: 'bytes', source: true,
+        commands: {
+            address: '/usr/sbin/routepolicyctl observe-export-source-ingress4-address --json',
+            bytes: '/usr/sbin/routepolicyctl observe-export-source-ingress4-bytes --json',
+            packets: '/usr/sbin/routepolicyctl observe-export-source-ingress4-packets --json'
+        }
+    },
+    source_egress4: {
+        field: 'address', default_sort: 'bytes', source: true,
+        commands: {
+            address: '/usr/sbin/routepolicyctl observe-export-source-egress4-address --json',
+            bytes: '/usr/sbin/routepolicyctl observe-export-source-egress4-bytes --json',
+            packets: '/usr/sbin/routepolicyctl observe-export-source-egress4-packets --json'
+        }
+    }
 };
 
 function result(ok, message, extra) {
@@ -121,6 +171,148 @@ function list_name(req) {
 
 function request_args(request) {
     return request && type(request.args) == 'object' ? request.args : {};
+}
+
+function array_has(values, wanted) {
+    if (type(values) != 'array')
+        return false;
+    for (let value in values)
+        if (value == wanted)
+            return true;
+    return false;
+}
+
+function valid_device(value) {
+    return type(value) == 'string' && length(value) > 0 && length(value) <= 32 &&
+        match(value, /^[A-Za-z0-9_.:@-]+$/) && substr(value, 0, 1) != '.' &&
+        substr(value, 0, 1) != '-' && !match(value, /\.\./);
+}
+
+function valid_ipv4_query(value) {
+    if (value == '')
+        return true;
+    if (!match(value, /^[0-9.\/]+$/))
+        return false;
+    let slash = split(value, '/');
+    if (length(slash) > 2)
+        return false;
+    let octets = split(slash[0], '.');
+    if (length(octets) > 4)
+        return false;
+    for (let i = 0; i < length(octets); i++) {
+        if (octets[i] == '') {
+            if (i != length(octets) - 1 || length(slash) > 1)
+                return false;
+            continue;
+        }
+        if (!match(octets[i], /^[0-9]{1,3}$/) || +octets[i] > 255)
+            return false;
+    }
+    if (length(slash) == 2) {
+        if (length(octets) != 4 || slash[1] == '' || !match(slash[1], /^[0-9]{1,2}$/) || +slash[1] > 32)
+            return false;
+    }
+    return true;
+}
+
+function observe_query(request) {
+    let req = request_args(request);
+    if (type(req.dataset) != 'string' || !OBSERVE_DATASETS[req.dataset])
+        return result(false, '未知的观测数据集');
+    let spec = OBSERVE_DATASETS[req.dataset];
+    let query = req.query == null ? '' : req.query;
+    if (type(query) != 'string' || length(query) > 128)
+        return result(false, '查询必须是不超过 128 字节的文本');
+    if (spec.field == 'domain') {
+        if (query != '' && !match(query, /^[A-Za-z0-9.-]+$/))
+            return result(false, '域名查询只能包含字母、数字、点和连字符');
+    }
+    else if (!valid_ipv4_query(query)) {
+        return result(false, 'IP 查询必须是 IPv4、CIDR 或点号数字前缀');
+    }
+
+    let sort_key = req.sort == null || req.sort == '' ? spec.default_sort : req.sort;
+    if (type(sort_key) != 'string' || !spec.commands[sort_key])
+        return result(false, '该数据集不支持请求的排序');
+    let limit = req.limit == null ? 50 : req.limit;
+    let limit_type = type(limit);
+    if (limit_type != 'int' && limit_type != 'double' && limit_type != 'number')
+        return result(false, 'limit 必须是 1..200 的整数');
+    if (limit < 1 || limit > 200 || limit % 1 != 0)
+        return result(false, 'limit 必须是 1..200 的整数');
+    let cursor = req.cursor == null ? '' : req.cursor;
+    if (type(cursor) != 'string' || length(cursor) > 256)
+        return result(false, 'cursor 超出长度上限');
+    if (cursor != '') {
+        let early_cursor = split(cursor, ':');
+        if (length(early_cursor) != 4 || early_cursor[0] != 'v1' ||
+            early_cursor[1] != req.dataset || early_cursor[2] == 'unavailable')
+            return result(false, 'cursor 已失效或不属于当前数据集');
+    }
+    let device = req.device == null ? '' : req.device;
+    if (type(device) != 'string' || (!spec.source && device != '') || (device != '' && !valid_device(device)))
+        return result(false, 'device 不是该数据集允许的设备过滤条件');
+
+    let proc = popen(spec.commands[sort_key], 'r');
+    if (!proc)
+        return result(false, '无法启动 RoutePolicy 观测程序');
+    let output = proc.read('all') || '';
+    let exitcode = proc.close();
+    let payload = null;
+    try { payload = json(output); } catch (e) {}
+    if (exitcode != 0 || type(payload) != 'object' || payload.ok !== true ||
+        payload.dataset != req.dataset || type(payload.items) != 'array' ||
+        length(payload.items) > 16384 || type(payload.generation) != 'string' ||
+        length(payload.generation) < 1 || length(payload.generation) > 64 ||
+        !match(payload.generation, /^[A-Za-z0-9_.-]+$/) || type(payload.devices) != 'array' ||
+        length(payload.devices) > 3)
+        return result(false, 'RoutePolicy 观测程序返回非法数据');
+    if (device != '' && !array_has(payload.devices, device))
+        return result(false, 'device 不属于当前受管实际设备');
+
+    let offset = 0;
+    if (cursor != '') {
+        let parts = split(cursor, ':');
+        if (length(parts) != 4 || parts[0] != 'v1' || parts[1] != req.dataset ||
+            parts[2] != payload.generation || !match(parts[3], /^(0|[1-9][0-9]{0,4})$/))
+            return result(false, 'cursor 已失效或不属于当前数据集');
+        offset = +parts[3];
+        if (offset > 16384)
+            return result(false, 'cursor 页偏移超出上限');
+    }
+
+    let matches = [];
+    for (let item in payload.items) {
+        if (type(item) != 'object' || type(item[spec.field]) != 'string')
+            continue;
+        if (device != '' && item.device != device)
+            continue;
+        if (query != '' && index(lc(item[spec.field]), lc(query)) < 0)
+            continue;
+        push(matches, item);
+    }
+    if (offset > length(matches))
+        return result(false, 'cursor 页偏移已超出当前结果');
+    let items = [];
+    for (let i = offset; i < length(matches) && length(items) < limit; i++)
+        push(items, matches[i]);
+    let next_offset = offset + length(items);
+    let stable_generation = payload.generation != 'unavailable';
+    let more_items = next_offset < length(matches);
+    let next_cursor = more_items && stable_generation
+        ? 'v1:' + req.dataset + ':' + payload.generation + ':' + next_offset
+        : null;
+    return {
+        ok: true,
+        dataset: req.dataset,
+        items: items,
+        next_cursor: next_cursor,
+        total_matched: payload.truncated === true ? null : length(matches),
+        generation: payload.generation,
+        enabled: payload.enabled !== false,
+        volatile: payload.volatile === true,
+        truncated: payload.truncated === true || (more_items && !stable_generation)
+    };
 }
 
 function allowed_ipv4_range(value) {
@@ -191,6 +383,12 @@ function normalize_lines(content, kind) {
 return {
     routepolicy: {
     status: { args: {}, call: function(req) { return run('status'); } },
+    observe_interfaces: { args: {}, call: function(req) { return run('observe_interfaces'); } },
+    observe_sets: { args: {}, call: function(req) { return run('observe_sets'); } },
+    observe_query: {
+        args: { dataset: 'String', query: 'String', cursor: 'String', limit: 'Integer', device: 'String', sort: 'String' },
+        call: observe_query
+    },
     validate: { args: {}, call: function(req) { return run('validate'); } },
     apply: { args: {}, call: function(req) { return run('apply'); } },
     reload: { args: {}, call: function(req) { return run('reload'); } },

@@ -330,6 +330,7 @@ async function main() {
 		[ 'manual rule reserved IPv4', function() { return manualRuleReservedIpv4Contract(path.join(viewDir, 'rules.js')); } ],
 		[ 'manual rule domain length', function() { return manualRuleDomainLengthContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'status phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'status.js')); } ],
+		[ 'observability phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'observability.js')); } ],
 		[ 'rules phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'diagnostics phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'diagnostics.js')); } ]
 	];
