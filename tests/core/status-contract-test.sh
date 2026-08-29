@@ -9,6 +9,7 @@ mkdir -p "$tmp/etc/config" "$tmp/etc/routepolicy/state" "$tmp/etc/smartdns/conf.
 PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
 	ROUTEPOLICY_OUTPUT=json "$ROOT/routepolicy/files/usr/libexec/routepolicy/status" >"$tmp/status.json"
 for fragment in \
+	'"versions":{"luci_app_routepolicy":"0.3.1-r1","smartdns":"46.1-r2"}' \
 	'"service":{"running":true,"applied":true,"enabled":true}' \
 	'"routing":{"real_default":true,"blackhole":true' \
 	'"smartdns":{"running":true,"fragment_loaded":false}' \

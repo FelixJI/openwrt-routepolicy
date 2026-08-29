@@ -19,6 +19,17 @@ rp_is_name "$lan_if" 32 || lan_if=lan
 rp_is_name "$default_if" 32 || default_if=wan
 rp_is_name "$policy_if" 32 || policy_if=usbwan
 bool_json() { [ "$1" = 1 ] && printf true || printf false; }
+package_version() {
+	package_name=$1
+	rp_have apk || return 0
+	LC_ALL=C apk info -a "$package_name" 2>/dev/null |
+		awk -v prefix="$package_name-" '
+			NR == 1 && index($0, prefix) == 1 && $0 ~ / description:$/ {
+				version = substr($0, length(prefix) + 1)
+				sub(/ description:$/, "", version)
+				print version
+			}'
+}
 
 table_present=0; nft list table inet routepolicy >/dev/null 2>&1 && table_present=1
 rule_present=0; ip -4 rule show 2>/dev/null | awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" '$1==p&&index($0,m)>0&&($0~("lookup "t"([[:space:]]|$)")||$0~("table "t"([[:space:]]|$)")){f=1}END{exit !f}' && rule_present=1
@@ -51,9 +62,13 @@ dpc=$(set_count domain_policy4); ddc=$(set_count domain_default4); spc=$(set_cou
 last_apply=; [ ! -f "$RP_STATE_DIR/last-apply" ] || last_apply=$(sed -n '1p' "$RP_STATE_DIR/last-apply")
 last_update=; [ ! -f "$RP_STATE_DIR/last-update" ] || last_update=$(sed -n '1p' "$RP_STATE_DIR/last-update")
 last_error=; [ ! -f "$RP_STATE_DIR/last-error" ] || last_error=$(sed -n '1p' "$RP_STATE_DIR/last-error")
+luci_app_version=$(package_version luci-app-routepolicy)
+smartdns_version=$(package_version smartdns)
 
 if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
-	printf '{"ok":true,"service":{"running":%s,"applied":%s,"enabled":%s},' "$(bool_json "$service_running")" "$(bool_json "$applied")" "$(bool_json "$enabled")"
+	printf '{"ok":true,"versions":{"luci_app_routepolicy":"%s","smartdns":"%s"},"service":{"running":%s,"applied":%s,"enabled":%s},' \
+		"$(rp_json_escape "$luci_app_version")" "$(rp_json_escape "$smartdns_version")" \
+		"$(bool_json "$service_running")" "$(bool_json "$applied")" "$(bool_json "$enabled")"
 	printf '"routing":{"real_default":%s,"blackhole":%s,"main_default":%s,"ip_rule":%s,"table":%s,"route_local_traffic":%s},' "$(bool_json "$policy_default")" "$(bool_json "$blackhole")" "$(bool_json "$main_default")" "$(bool_json "$rule_present")" "$table" "$(bool_json "$route_local_traffic")"
 	printf '"smartdns":{"running":%s,"fragment_loaded":%s},' "$(bool_json "$smartdns_running")" "$(bool_json "$smartdns_fragment")"
 	printf '"interfaces":{"lan":%s,"default":%s,"policy":%s},' "$(interface_object "$lan_if")" "$(interface_object "$default_if")" "$(interface_object "$policy_if")"
@@ -61,6 +76,7 @@ if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
 	printf '"timestamps":{"last_apply":"%s","last_update":"%s"},"last_apply":"%s","last_update":"%s","last_error":"%s",' "$(rp_json_escape "$last_apply")" "$(rp_json_escape "$last_update")" "$(rp_json_escape "$last_apply")" "$(rp_json_escape "$last_update")" "$(rp_json_escape "$last_error")"
 	printf '"enabled":%s,"applied":%s,"nft_table":%s,"policy_default":%s,"blackhole_default":%s}\n' "$(bool_json "$enabled")" "$(bool_json "$applied")" "$(bool_json "$table_present")" "$(bool_json "$policy_default")" "$(bool_json "$blackhole")"
 else
+	printf 'versions luci_app_routepolicy=%s smartdns=%s\n' "$luci_app_version" "$smartdns_version"
 	printf 'enabled=%s running=%s applied=%s nft_table=%s ip_rule=%s route_local_traffic=%s\n' "$enabled" "$service_running" "$applied" "$table_present" "$rule_present" "$route_local_traffic"
 	printf 'main_default=%s policy_default=%s blackhole=%s smartdns_running=%s smartdns_fragment=%s\n' "$main_default" "$policy_default" "$blackhole" "$smartdns_running" "$smartdns_fragment"
 	printf 'sets domain_policy4=%s domain_default4=%s static_policy4=%s static_default4=%s\n' "$dpc" "$ddc" "$spc" "$sdc"

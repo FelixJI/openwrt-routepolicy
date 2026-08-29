@@ -4,6 +4,47 @@
 'require uci';
 'require routepolicy/api as api';
 
+const UPDATE_SCRIPT = [
+	'set -eu',
+	'',
+	'sysupgrade -b /tmp/before-routepolicy.tar.gz',
+	'',
+	'REPO=FelixJI/openwrt-routepolicy',
+	'ASSET_URLS="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" \\',
+	'  | jsonfilter -e \'@.assets[*].browser_download_url\')"',
+	'CORE_URL="$(printf \'%s\\n\' "$ASSET_URLS" \\',
+	'  | grep \'/routepolicy-[0-9][^/]*\\.apk$\' | head -n 1)"',
+	'LUCI_URL="$(printf \'%s\\n\' "$ASSET_URLS" \\',
+	'  | grep \'/luci-app-routepolicy-[0-9][^/]*\\.apk$\' | head -n 1)"',
+	'',
+	'[ -n "$CORE_URL" ] && [ -n "$LUCI_URL" ] || {',
+	'  echo \'未在 latest Release 中找到完整的 RoutePolicy APK\'',
+	'  exit 1',
+	'}',
+	'',
+	'LATEST_DOWNLOAD="https://github.com/${REPO}/releases/latest/download"',
+	'CORE_ASSET="${CORE_URL##*/}"',
+	'LUCI_ASSET="${LUCI_URL##*/}"',
+	'',
+	'cd /tmp',
+	'wget -O routepolicy-latest.apk "${LATEST_DOWNLOAD}/${CORE_ASSET}"',
+	'wget -O luci-app-routepolicy-latest.apk "${LATEST_DOWNLOAD}/${LUCI_ASSET}"',
+	'apk add --allow-untrusted \\',
+	'  ./routepolicy-latest.apk \\',
+	'  ./luci-app-routepolicy-latest.apk',
+	'routepolicyctl validate',
+	'routepolicyctl diagnose',
+	'ubus list | grep -qx routepolicy',
+	'ubus call routepolicy status \'{}\''
+].join('\n');
+
+const ENABLE_COMMAND = [
+	'routepolicyctl validate &&',
+	'uci set routepolicy.main.enabled=\'1\' &&',
+	'uci commit routepolicy &&',
+	'/etc/init.d/routepolicy restart'
+].join('\n');
+
 function stateText(value, yes, no) {
 	if (value === true) return yes || _('正常');
 	if (value === false) return no || _('否');
@@ -18,6 +59,14 @@ function statusRow(label, value, description) {
 			description ? E('div', { 'class': 'cbi-value-description' }, api.safeText(description)) : ''
 		])
 	]);
+}
+
+function commandBlock(content, label) {
+	return E('pre', {
+		'class': 'command',
+		'aria-label': label,
+		'style': 'white-space:pre-wrap;overflow-wrap:anywhere;user-select:text'
+	}, api.safeText(content));
 }
 
 function resultNode(reply, fallback) {
@@ -41,6 +90,7 @@ return view.extend({
 		let dns = status.smartdns || {};
 		let sets = status.sets || {};
 		let interfaces = status.interfaces || {};
+		let versions = status.versions || {};
 		let feedback = E('div', { 'id': 'routepolicy-operation-result' });
 		let self = this;
 
@@ -123,6 +173,8 @@ return view.extend({
 			E('div', { 'class': 'cbi-map-descr' }, _('查看保存配置与实际运行态，并通过 LuCI 标准应用流程执行启停。验证只检查候选，不会修改网络。')),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('服务与配置')),
+				statusRow(_('RoutePolicy LuCI 版本'), api.safeText(versions.luci_app_routepolicy, _('未检测到')), _('已安装 luci-app-routepolicy APK 的完整版本。')),
+				statusRow(_('SmartDNS 版本'), api.safeText(versions.smartdns, _('未检测到')), _('已安装 smartdns APK 的完整版本。')),
 				statusRow(_('管理开关'), stateText(service.enabled, _('已启用'), _('已停用')), _('决定应用时启动策略，还是停用并清理自有状态。')),
 				statusRow(_('守护进程'), stateText(service.running === undefined ? service.state : service.running, _('运行中'), _('未运行')), service.message),
 				statusRow(_('配置应用状态'), stateText(service.applied, _('已应用'), _('未应用')), status.last_apply),
@@ -143,6 +195,15 @@ return view.extend({
 					E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': function() { window.location.reload(); } }, _('刷新状态'))
 				]),
 				feedback
+			]),
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('升级与启用命令')),
+				E('p', { 'class': 'cbi-section-descr' }, _('以下内容仅供管理员复制到 SSH 执行，页面不会自动执行命令。升级脚本会先备份配置，再从本仓库 latest Release 精确更新两个 APK。')),
+				E('h4', {}, _('更新脚本')),
+				commandBlock(UPDATE_SCRIPT, _('RoutePolicy latest Release 更新脚本')),
+				E('h4', {}, _('启用命令')),
+				E('p', {}, _('请先核对接口和 SmartDNS 配置，并保留可用的控制台回退入口。该命令会校验配置、提交启用开关并同步服务运行态。')),
+				commandBlock(ENABLE_COMMAND, _('RoutePolicy 启用命令'))
 			]),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('接口观测')),

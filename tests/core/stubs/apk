@@ -1,0 +1,13 @@
+#!/bin/sh
+
+case "$*" in
+	'info -a luci-app-routepolicy')
+		printf '%s\n' 'luci-app-routepolicy-0.3.1-r1 description:'
+		;;
+	'info -a smartdns')
+		printf '%s\n' 'smartdns-46.1-r2 description:'
+		;;
+	*)
+		exit 1
+		;;
+esac
