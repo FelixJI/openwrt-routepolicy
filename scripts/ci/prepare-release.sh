@@ -42,7 +42,7 @@ RoutePolicy 安装说明（仅 OpenWrt 25.12 x86_64）
   ubus list | grep -qx routepolicy
   ubus call routepolicy status '{}'
 
-最后一条应返回包含 "ok": true 的状态对象。LuCI 包安装流程会重载 rpcd，不需要重启路由器；若对象检查失败，可执行一次 /etc/init.d/rpcd restart 后重试。安装后 RoutePolicy 保持默认禁用状态，先在 LuCI/UCI 核对接口与 SmartDNS 配置。不要在未验证的版本或架构上安装。
+最后一条应返回包含 "ok": true 的状态对象。LuCI 包安装流程会清理 LuCI 服务端缓存并同步重启 rpcd；重启失败会使包脚本报错，不需要重启路由器。若对象检查仍失败，请先运行 logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100 保存插件加载错误，不要启用 RoutePolicy。安装后 RoutePolicy 保持默认禁用状态，先在 LuCI/UCI 核对接口与 SmartDNS 配置。不要在未验证的版本或架构上安装。
 *-packages.adb 是本次构建产生的 apk 仓库索引，*-index.json 供人工审计；发布 APK 未签名，直接安装时仅应使用本仓库 Release 中的文件。
 下载全部 Release 附件后，先运行：
   sha256sum -c SHA256SUMS

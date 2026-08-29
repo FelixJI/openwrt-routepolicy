@@ -20,7 +20,7 @@
   "admin/services/routepolicy/settings": {
     "title": "基础设置",
     "order": 20,
-    "action": { "type": "view", "path": "routepolicy/settings" },
+    "action": { "type": "view", "path": "routepolicy/settings-v2" },
     "depends": { "acl": [ "luci-app-routepolicy" ] }
   },
   "admin/services/routepolicy/sources": {

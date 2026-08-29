@@ -143,9 +143,16 @@ function loadView(filename) {
 }
 
 const repo = path.resolve(__dirname, '../..');
+const menu = JSON.parse(fs.readFileSync(path.join(
+	repo,
+	'luci-app-routepolicy/root/usr/share/luci/menu.d/luci-app-routepolicy.json'
+), 'utf8'));
+const settingsView = menu['admin/services/routepolicy/settings'].action.path;
+assert.match(settingsView, /^routepolicy\/settings-v[0-9]+$/,
+	'the settings route must use a package-owned asset generation so an old form.NetworkSelect view cannot survive an upgrade');
 const settings = loadView(path.join(
 	repo,
-	'luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/settings.js'
+	'luci-app-routepolicy/htdocs/luci-static/resources/view', settingsView + '.js'
 ));
 
 assert.strictEqual(settings.render(), 'rendered');

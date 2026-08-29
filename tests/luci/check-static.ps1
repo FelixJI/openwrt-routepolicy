@@ -30,6 +30,9 @@ if ($LASTEXITCODE -ne 0) { throw 'LuCI observability contract failed' }
 & node (Join-Path $PSScriptRoot 'rpcd-contract-test.js')
 if ($LASTEXITCODE -ne 0) { throw 'rpcd ucode registration contract failed' }
 
+& node (Join-Path $PSScriptRoot 'package-lifecycle-contract-test.js')
+if ($LASTEXITCODE -ne 0) { throw 'LuCI package lifecycle contract failed' }
+
 $rpcText = Get-Content -Raw -Encoding UTF8 $rpc
 $methods = @(
     'status', 'validate', 'apply', 'reload', 'update', 'rollback', 'diagnose', 'import_legacy',
@@ -49,7 +52,9 @@ if ($rpcText -notmatch "apply:\s*'/etc/init\.d/routepolicy restart'") {
 if ($rpcText -notmatch "reload:\s*'/etc/init\.d/routepolicy restart'") {
     throw 'Reload RPC must reconcile the procd lifecycle through the fixed init script'
 }
-$settingsText = Get-Content -Raw -Encoding UTF8 (Join-Path $package 'htdocs/luci-static/resources/view/routepolicy/settings.js')
+$menuObject = Get-Content -Raw -Encoding UTF8 $menu | ConvertFrom-Json
+$settingsView = $menuObject.'admin/services/routepolicy/settings'.action.path
+$settingsText = Get-Content -Raw -Encoding UTF8 (Join-Path $package "htdocs/luci-static/resources/view/$settingsView.js")
 if ($settingsText -notmatch 'handleSaveApply[\s\S]*ui\.changes\.apply') {
     throw 'Save & Apply must commit staged UCI through the LuCI apply workflow'
 }

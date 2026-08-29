@@ -328,9 +328,14 @@ function noPhantomFormFooterContract(filename) {
 async function main() {
 	const repo = path.resolve(__dirname, '../..');
 	const viewDir = path.join(repo, 'luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy');
+	const menu = JSON.parse(fs.readFileSync(path.join(
+		repo,
+		'luci-app-routepolicy/root/usr/share/luci/menu.d/luci-app-routepolicy.json'
+	), 'utf8'));
+	const settingsView = menu['admin/services/routepolicy/settings'].action.path.split('/').pop() + '.js';
 	const checks = [
 		[ 'RPC error visibility', function() { return loadApi(path.join(repo, 'luci-app-routepolicy/htdocs/luci-static/resources/routepolicy/api.js')); } ],
-		[ 'settings Save & Apply', function() { return formApplyContract(path.join(viewDir, 'settings.js')); } ],
+		[ 'settings Save & Apply', function() { return formApplyContract(path.join(viewDir, settingsView)); } ],
 		[ 'sources Save & Apply', function() { return formApplyContract(path.join(viewDir, 'sources.js')); } ],
 		[ 'status controls', function() { return statusContract(path.join(viewDir, 'status.js')); } ],
 		[ 'manual rule feedback', function() { return manualRuleFeedbackContract(path.join(viewDir, 'rules.js')); } ],
