@@ -6,7 +6,7 @@
 
 当前发布物**只面向 OpenWrt 25.12 x86_64**。请勿在其它 OpenWrt 版本、架构或衍生发行版上安装；这些组合未经过构建或运行验证。
 
-RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。LuCI 包安装流程会重载 rpcd 以注册固定 RPC 对象，但不需要重启路由器，RoutePolicy 服务仍保持禁用。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
+RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。LuCI 包安装流程会清理 LuCI 服务端缓存并同步重启 rpcd 以注册固定 RPC 对象；rpcd 重启失败会使包脚本报错，不会静默留下无法调用的页面。该动作不需要重启路由器，RoutePolicy 服务仍保持禁用。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
 
 ## 本机分流与可观测性
 
@@ -36,7 +36,7 @@ RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 n
    ubus call routepolicy status '{}'
    ```
 
-   最后一条应返回包含 `"ok": true` 的状态对象。若对象检查失败，可执行一次 `/etc/init.d/rpcd restart` 后重试；这只是 rpcd 注册恢复，不需要重启路由器，也不需要为查看状态而重启 RoutePolicy。
+   最后一条应返回包含 `"ok": true` 的状态对象。LuCI 包脚本已同步重启 rpcd；若对象检查仍失败，不要重复安装或启用 RoutePolicy，请先运行 `logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100` 保存插件加载错误。
 
    下载全部 Release 附件后，可先执行 `sha256sum -c SHA256SUMS`；校验失败时停止安装并重新下载。
 
@@ -84,7 +84,7 @@ ubus list | grep -qx routepolicy
 ubus call routepolicy status '{}'
 ```
 
-该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，并在任一 APK 未找到或下载失败时停止。这里使用 `apk add` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器；若 LuCI 仍显示旧页面，请强制刷新浏览器缓存。
+该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，并在任一 APK 未找到或下载失败时停止。这里使用 `apk add` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器。基础设置页使用新的静态资源 generation，避免继续命中旧版 `form.NetworkSelect` 页面；已打开的旧标签页仍需重新载入一次菜单。
 
 每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
 
