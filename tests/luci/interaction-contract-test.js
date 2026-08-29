@@ -212,6 +212,7 @@ async function statusContract(filename) {
 	const page = loadSource(filename, harness.dependencies, harness.globals);
 	const root = page.render({
 		service: { enabled: false },
+		versions: { luci_app_routepolicy: '0.3.1-r1', smartdns: '46.1-r2' },
 		interfaces: {
 			lan: { device: 'br-lan', address: '192.0.2.1/24', online: true, message: 'LAN 正常' },
 			wan: { device: 'eth0', address: '198.51.100.2/24', online: true, message: '默认出口正常' },
@@ -228,6 +229,12 @@ async function statusContract(filename) {
 		'interface rows must render as DOM rows instead of a stringified nested element array');
 	for (const expected of [ 'br-lan', 'eth0', 'eth1', '192.0.2.1/24', '198.51.100.2/24', '203.0.113.2/24' ])
 		assert.ok(nodeText(root).includes(expected), 'interface table must display ' + expected);
+	for (const expected of [
+		'RoutePolicy LuCI 版本', '0.3.1-r1', 'SmartDNS 版本', '46.1-r2',
+		'升级与启用命令', 'sysupgrade -b /tmp/before-routepolicy.tar.gz',
+		'apk add --allow-untrusted', "uci set routepolicy.main.enabled='1'"
+	])
+		assert.ok(nodeText(root).includes(expected), 'status page must display version or command guidance: ' + expected);
 	const validate = buttons.find(function(button) { return nodeText(button) === '验证候选配置'; });
 	assert.ok(validate && validate.listeners.click, 'validate action must be rendered');
 	await validate.listeners.click();

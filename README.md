@@ -46,6 +46,8 @@ RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 n
 
 ## 升级
 
+LuCI 的“服务 → 路由策略 → 运行状态”会显示当前安装的 luci-app-routepolicy 与 SmartDNS 完整 APK 版本，并提供同一份更新脚本和显式启用命令，供管理员复制到 SSH 执行；页面不会自动执行这些命令。
+
 升级前先备份配置，并保留上一个 Release 的 APK。下面的命令会从 GitHub `latest` Release 自动识别两个最新版 APK，分别保存为固定文件名并一次性更新，无需手工填写版本号：
 
 ```sh
