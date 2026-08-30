@@ -11,6 +11,7 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/warm-state-test.sh"
 "$HERE/live-snapshot-test.sh"
 "$HERE/mark-conflict-test.sh"
+"$HERE/validate-test.sh"
 "$HERE/render-test.sh"
 "$HERE/source-accounting-test.sh"
 "$HERE/nft-syntax-test.sh"

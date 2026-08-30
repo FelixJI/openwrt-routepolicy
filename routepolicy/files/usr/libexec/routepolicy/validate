@@ -7,6 +7,14 @@ LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 tmp=$(mktemp "${TMPDIR:-/tmp}/routepolicy-validate.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 
+user_list_has_content() {
+	LC_ALL=C awk '
+		/^[[:space:]]*($|[#;])/ { next }
+		{ found = 1; exit }
+		END { exit found ? 0 : 1 }
+	' "$1"
+}
+
 errors=0
 {
 	[ -f "$RP_UCI_CONFIG" ] || { rp_err "配置文件不存在: $RP_UCI_CONFIG"; errors=$((errors + 1)); }
@@ -24,7 +32,7 @@ errors=0
 		file="$RP_USER_DIR/$name.list"
 		[ -e "$file" ] || continue
 		[ -f "$file" ] && [ ! -L "$file" ] || { rp_err "$file 必须是普通文件且不能是符号链接"; errors=$((errors + 1)); continue; }
-		[ -s "$file" ] || continue
+		user_list_has_content "$file" || continue
 		ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$format" "$file" >/dev/null 2>&1 || { rp_err "$file 包含非法条目或没有可用条目"; errors=$((errors + 1)); }
 	done
 

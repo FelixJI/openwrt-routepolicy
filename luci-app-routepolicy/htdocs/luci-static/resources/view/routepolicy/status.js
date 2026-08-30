@@ -133,10 +133,18 @@ return view.extend({
 					uci.set('routepolicy', 'main', 'enabled', enabled ? '1' : '0');
 					return uci.save().then(function() {
 						feedback.replaceChildren(E('div', { 'class': 'alert-message notice' }, [
-							E('strong', {}, _('配置已保存')),
-							E('p', {}, _('LuCI 正在应用变更；完成后页面会自动刷新并显示新的运行状态。'))
+							E('strong', {}, _('配置已提交')),
+							E('p', {}, _('正在等待 UCI 提交并同步 RoutePolicy 运行态。'))
 						]));
-						return ui.changes.apply(true);
+						return uci.apply();
+					}).then(function() {
+						return api.apply();
+					}).then(function(reply) {
+						feedback.replaceChildren(resultNode(reply, label));
+						api.notice(ui, reply, label);
+						if (reply && reply.ok)
+							window.location.reload();
+						return reply;
 					}, function(error) {
 						feedback.replaceChildren(resultNode({ ok: false, error: error && error.message || String(error) }, label));
 						throw error;
