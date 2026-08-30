@@ -134,6 +134,11 @@ function createViewHarness(overrides) {
 		}
 	}
 	const notifications = [];
+	const uci = {
+		set: function(config, section, option, value) { events.push([ 'uci-set', config, section, option, value ].join(':')); },
+		save: function() { events.push('uci-save'); return Promise.resolve(); },
+		apply: function() { events.push('uci-apply'); return Promise.resolve(); }
+	};
 	const ui = {
 		changes: { apply: function() { events.push('apply'); return Promise.resolve(); } },
 		createHandlerFn: function(ctx, fn) {
@@ -158,7 +163,7 @@ function createViewHarness(overrides) {
 		dependencies: {
 			view: { extend: function(properties) { return properties; } },
 			form: { Map: Map, NamedSection: NamedSection, GridSection: GridSection, Flag: Flag, Value: Value, ListValue: ListValue },
-			uci: {}, ui: ui, 'routepolicy/api': api,
+			uci: uci, ui: ui, 'routepolicy/api': api,
 			'tools.widgets': { NetworkSelect: NetworkSelect }
 		},
 		globals: {
@@ -239,6 +244,38 @@ async function statusContract(filename) {
 	assert.ok(validate && validate.listeners.click, 'validate action must be rendered');
 	await validate.listeners.click();
 	assert.strictEqual(harness.reloads.length, 0, 'failed validation must remain visible instead of reloading the page');
+}
+
+async function statusEnableFailureContract(filename) {
+	const expected = '应用前校验失败：默认覆盖域名没有可用条目';
+	const harness = createViewHarness({ api: {
+		apply: function() { return Promise.resolve({ ok: false, error: expected }); }
+	} });
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	const root = page.render({ service: { enabled: false } });
+	const enable = findAll(root, function(node) {
+		return node.tagName === 'button' && nodeText(node) === '启用并应用';
+	})[0];
+	assert.ok(enable && enable.listeners.click, 'enable action must be rendered');
+	await enable.listeners.click();
+	assert.ok(nodeText(root).includes(expected),
+		'enable failure must remain visible with the RoutePolicy lifecycle error');
+	assert.strictEqual(harness.reloads.length, 0,
+		'failed RoutePolicy lifecycle must not refresh away the error');
+}
+
+async function statusEnableSuccessContract(filename) {
+	const harness = createViewHarness({ api: {
+		apply: function() { return Promise.resolve({ ok: true, message: 'RoutePolicy 已应用并启动' }); }
+	} });
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	const root = page.render({ service: { enabled: false } });
+	const enable = findAll(root, function(node) {
+		return node.tagName === 'button' && nodeText(node) === '启用并应用';
+	})[0];
+	await enable.listeners.click();
+	assert.strictEqual(harness.reloads.length, 1,
+		'successful RoutePolicy lifecycle must refresh the visible runtime status');
 }
 
 async function manualRuleFeedbackContract(filename) {
@@ -338,6 +375,8 @@ async function main() {
 		[ 'settings Save & Apply', function() { return formApplyContract(path.join(viewDir, settingsView)); } ],
 		[ 'sources Save & Apply', function() { return formApplyContract(path.join(viewDir, 'sources.js')); } ],
 		[ 'status controls', function() { return statusContract(path.join(viewDir, 'status.js')); } ],
+		[ 'status enable failure feedback', function() { return statusEnableFailureContract(path.join(viewDir, 'status.js')); } ],
+		[ 'status enable success refresh', function() { return statusEnableSuccessContract(path.join(viewDir, 'status.js')); } ],
 		[ 'manual rule feedback', function() { return manualRuleFeedbackContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'manual rule reserved IPv4', function() { return manualRuleReservedIpv4Contract(path.join(viewDir, 'rules.js')); } ],
 		[ 'manual rule domain length', function() { return manualRuleDomainLengthContract(path.join(viewDir, 'rules.js')); } ],
