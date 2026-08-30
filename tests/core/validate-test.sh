@@ -11,7 +11,7 @@ cp "$ROOT"/routepolicy/files/etc/routepolicy/user.d/*.list "$tmp/etc/routepolicy
 
 run_validate() {
 	PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
-		"$VALIDATE" "$@"
+		"$VALIDATE"
 }
 
 run_validate >/dev/null || {
