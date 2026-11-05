@@ -363,6 +363,10 @@ for link_fault in link-up-fail link-dad-fail link-kill; do
 	[ ! -f "$tmp/commits" ]
 	if [ "$link_fault" = link-kill ]; then phase_is applying; "$TX" recover >/dev/null; fi
 	phase_is rolled_back
+	if [ "$link_fault" = link-dad-fail ]; then
+		"$TX" status | grep -Fq '"failed_stage":"link-dad"'
+		"$TX" status | grep -Fq 'ARP-DAD conflict or missing carrier'
+	fi
 	[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
 	restored
 done

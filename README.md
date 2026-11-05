@@ -55,6 +55,8 @@ routepolicyctl init-prepare lan wan policy - - - - - - - -
 
 `-` 表示保留对应设置。三个角色之后依次为新建出口的角色、网卡、协议、IPv4 地址、前缀长度、网关，以及接入侧的新管理地址和前缀长度。为尚未配置的独立网卡创建出口时，逻辑接口名使用 `rp_init_default` 或 `rp_init_policy`。`dhcp` 出口的静态地址、前缀和网关填 `-`。`static` 出口需填写这三项。
 
+如果新静态出口的网卡处于 DOWN，预览会标记地址冲突探测待执行，网卡保持原状态。显式应用后，事务才临时启用这块网卡，等待链路就绪并用 ARP 探测候选地址。发现地址已占用或无法确认链路时，事务停止，并在网卡仍由本事务管理时恢复原状态。
+
 核对 `init-prepare` 返回的变更和管理入口，保存该次返回的 token。确认要应用时执行 `routepolicyctl init-apply TOKEN`。从接入侧通过 SSH 连接预览中的管理地址，检查管理连接与网络，再执行 `routepolicyctl init-confirm TOKEN`。可从带外控制台运行 `routepolicyctl init-status` 查看状态；待确认期间可用 `routepolicyctl init-recover` 主动回滚。超过确认时限，守卫会回滚本次变更。若状态为 `conflict`，从控制台核对外部改动后再处理。
 
 初始化仅管理所选接口。受管接入侧停止提供 DHCPv4 及本机 RA/DHCPv6，出口 DHCP client 保留。终端仍须通过现有 DHCP 或其网络设置，把网关和 DNS 指向旁路由的接入地址。首期仅分流 IPv4；防火墙拒绝经本机的新 IPv6 转发连接，已有连接可持续至连接跟踪过期。外部路由器通告的 IPv6 网关可能让终端直接绕过旁路由。
