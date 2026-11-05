@@ -367,7 +367,7 @@ EOF
 		case "$destination" in */*) ;; *) destination="$destination/32" ;; esac
 		address=${destination%/*}; prefix=${destination#*/}
 		rp_is_ipv4 "$address" && rp_uint_between "$prefix" 0 32 || fail 'address overlap: unsupported effective route'
-		if [ "$protocol:$scope" = kernel:link ]; then
+		if [ "$scope" = link ] && { [ "$protocol" = kernel ] || [ "$protocol" = static ]; }; then
 			[ "$dev:$destination" != "$access_device:$access_cidr" ] || continue
 			[ "$dev:$destination" != "$access_device:$current_access_cidr" ] || continue
 			[ "$dev:$destination" != "$default_device:$default_cidr" ] || continue
@@ -380,7 +380,9 @@ $(printf '%s\n' "$routes" | awk '
 			target=$1;start=2;if(target=="local"||target=="broadcast"||target=="multicast")next
 			if(target=="blackhole"||target=="unreachable"||target=="prohibit"||target=="throw"){target=$2;start=3}
 			if(target=="default"||target=="0.0.0.0/0")next
-			dev="-";proto="-";scope="-";for(i=start;i<=NF;i++){if($i=="dev")dev=$(i+1);if($i=="proto")proto=$(i+1);if($i=="scope")scope=$(i+1)}
+			dev="-";proto="-";scope="-";direct=1
+			for(i=start;i<=NF;i++){if($i=="dev")dev=$(i+1);if($i=="proto")proto=$(i+1);if($i=="scope")scope=$(i+1);if($i=="via" || ($i=="table" && $(i+1)!="main"))direct=0}
+			if(!direct)scope="-"
 			print target "\t" dev "\t" proto "\t" scope
 		}')
 EOF

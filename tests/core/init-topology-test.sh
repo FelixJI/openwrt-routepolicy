@@ -498,7 +498,8 @@ baseline
 "$tool" plan lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/new-policy-final"
 apply_mock_plan "$tmp/new-policy-final"
 sed -e 's/_policy/_rp_init_policy/g' -e 's/Handle policy /Handle rp_init_policy /g' -e 's/accept policy /accept rp_init_policy /g' -e 's/eth2/eth3/g' "$tmp/nft" >"$tmp/policy-runtime.nft"
-TEST_NFT_FILE="$tmp/policy-runtime.nft" "$tool" verify lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/verify-new-policy"
+TEST_EXTRA_ROUTE='10.3.0.0/24 dev eth3 proto static scope link metric 200' TEST_NFT_FILE="$tmp/policy-runtime.nft" "$tool" verify lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/verify-new-policy"
+reject env TEST_EXTRA_ROUTE='10.3.0.0/24 via 10.3.0.1 dev eth3 proto static scope link metric 200' TEST_NFT_FILE="$tmp/policy-runtime.nft" "$tool" verify lan wan rp_init_policy policy eth3 dhcp - - - - -
 baseline
 TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 "$tool" plan lan lan policy >"$tmp/single-arm-final"
 apply_mock_plan "$tmp/single-arm-final"
