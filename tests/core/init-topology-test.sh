@@ -295,6 +295,44 @@ baseline
 awk '/chain forward_lan \{/{print;print "meta nfproto 2 counter packets 0 bytes 0 drop comment \"!fw4: existing IPv4 deny-all\"";next}{print}' "$tmp/nft" >"$tmp/early-ipv4-drop.nft"
 reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" plan lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
+# Candidate management DNS must remain reachable through INPUT, separately
+# for TCP/UDP. Existing rules are inspected without changing their config.
+dns_bad=0
+for rule in \
+	'ip daddr 192.168.1.2 tcp dport 53 counter drop comment "!fw4: existing-tcp-dns-block"' \
+	'ip daddr 192.168.1.2 udp dport 53 counter log prefix "DNS blocked: " reject comment "!fw4: existing-udp-dns-block"' \
+	'ip saddr 192.168.1.99 ip daddr 192.168.1.2 udp dport 53 counter drop' \
+	'ip daddr 192.168.1.2 meta l4proto 6 counter drop' \
+	'tcp dport 53 counter jump custom_dns_filter'; do
+	dns_bad=$((dns_bad + 1))
+	insert_rule_pair input_lan "$rule" '' "$tmp/dns-bad-$dns_bad.nft"
+	reject env TEST_NFT_FILE="$tmp/dns-bad-$dns_bad.nft" "$tool" plan lan wan policy - - - - - - 192.168.1.2 24
+	grep -Fq 'DNS INPUT blocked or unproven (input_lan)' "$tmp/error"
+	case "$rule" in *existing-tcp-dns-block*) grep -Fq 'existing-tcp-dns-block' "$tmp/error" ;; esac
+done
+insert_rule_pair input 'ip daddr 192.168.1.2 udp dport 53 counter drop comment "!fw4: root-dns-block"' '' "$tmp/dns-root-block.nft"
+reject env TEST_NFT_FILE="$tmp/dns-root-block.nft" "$tool" plan lan wan policy - - - - - - 192.168.1.2 24
+grep -Fq 'DNS INPUT blocked or unproven (input)' "$tmp/error"
+dns_safe=0
+for rule in \
+	'ip daddr 192.168.1.1 tcp dport 53 counter drop' \
+	'ip saddr 192.168.2.0/24 udp dport 53 counter drop' \
+	'ip daddr 192.168.1.2 tcp dport 80 counter drop' \
+	'ip daddr 192.168.1.2 udp sport 67 udp dport 68 counter accept' \
+	'meta nfproto 10 tcp dport 53 counter drop' \
+	'iifname "eth1" udp dport 53 counter drop'; do
+	dns_safe=$((dns_safe + 1))
+	insert_rule_pair input_lan "$rule" '' "$tmp/dns-safe-$dns_safe.nft"
+	TEST_NFT_FILE="$tmp/dns-safe-$dns_safe.nft" "$tool" plan lan wan policy - - - - - - 192.168.1.2 24 >"$tmp/dns-management-plan"
+done
+awk '/chain input \{/{print;print "iif \"lo\" accept comment \"!fw4: Accept traffic from loopback\"";print "ct state vmap { 0x2 : accept, 0x4 : accept } comment \"!fw4: Handle inbound flows\"";print "tcp flags & (0x1 | 0x2 | 0x4 | 0x10) == 0x2 jump syn_flood comment \"!fw4: Rate limit TCP syn packets\"";next}
+	/chain handle_reject \{/{print "chain syn_flood {";print "limit rate 25/second burst 50 packets return comment \"!fw4: Accept SYN packets below rate-limit\"";print "drop comment \"!fw4: Drop excess packets\"";print "}"}{print}' "$tmp/nft" >"$tmp/dns-stock-input.nft"
+TEST_NFT_FILE="$tmp/dns-stock-input.nft" "$tool" plan lan wan policy >"$tmp/dns-stock-plan"
+cmp "$tmp/plan" "$tmp/dns-stock-plan"
+sed '/routepolicy-init-dns/d;/routepolicy-init-default4/d;/routepolicy-init-policy4/d;/routepolicy-init-ipv6/d;s/jump handle_reject comment "!fw4: Reject any other traffic"/reject comment "!fw4: Reject any other traffic"/' "$tmp/dns-stock-input.nft" >"$tmp/dns-stock-before.nft"
+awk '/chain input_lan \{/{print;print "jump accept_from_lan";next}{print}' "$tmp/dns-stock-before.nft" >"$tmp/dns-stock-fresh.nft"
+TEST_NFT_FILE="$tmp/dns-stock-fresh.nft" "$tool" plan lan wan policy >"$tmp/dns-stock-fresh-plan"
+cmp "$tmp/plan" "$tmp/dns-stock-fresh-plan"
 # Nonmatching or partial ACCEPT must not hide a later DROP on the same path.
 coverage_bad=0
 for first in \
@@ -579,6 +617,15 @@ grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
 multidevice_config
 TEST_NFT_FILE="$tmp/multidevice.nft" "$tool" verify lan wan policy >"$tmp/verify-multidevice"
 for invalid in extra missing duplicate unknown; do reject env TEST_NFT_FILE="$tmp/multidevice-$invalid.nft" "$tool" verify lan wan policy; done
+baseline
+apply_mock_plan "$tmp/plan"
+TEST_NFT_FILE="$tmp/dns-stock-input.nft" "$tool" verify lan wan policy >"$tmp/verify-dns-stock"
+apply_mock_plan "$tmp/dns-management-plan"
+for blocked in "$tmp"/dns-bad-*.nft "$tmp/dns-root-block.nft"; do
+	reject env TEST_MANAGEMENT_IP=192.168.1.2 TEST_NFT_FILE="$blocked" "$tool" verify lan wan policy - - - - - - 192.168.1.2 24
+	grep -Fq 'DNS INPUT blocked or unproven' "$tmp/error"
+done
+for safe in "$tmp"/dns-safe-*.nft; do TEST_MANAGEMENT_IP=192.168.1.2 TEST_NFT_FILE="$safe" "$tool" verify lan wan policy - - - - - - 192.168.1.2 24 >"$tmp/verify-dns-safe"; done
 baseline
 apply_mock_plan "$tmp/plan"
 for blocked in "$tmp"/coverage-bad-*.nft; do

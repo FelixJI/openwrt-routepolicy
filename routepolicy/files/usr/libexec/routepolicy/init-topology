@@ -583,7 +583,7 @@ forward_include_guard() {
 ipv4_forward_guard() {
 	local mode=$1 snapshot=$2
 	printf '%s\n' "$snapshot" | awk -v mode="$mode" -v zone="$access_zone" -v default_zone="$default_zone" -v policy_zone="$policy_zone" \
-		-v access="$access_device" -v default_dev="$default_device" -v policy_dev="$policy_device" -v lan="$access_cidr" '
+		-v access="$access_device" -v default_dev="$default_device" -v policy_dev="$policy_device" -v lan="$access_cidr" -v dns_ip="$access_ip" '
 		# Quoted log/comment operands are data, never control-flow keywords.
 		function lex(s, i,c,word,quoted,escaped,n,k) {
 			for(k in t)delete t[k]
@@ -617,7 +617,9 @@ ipv4_forward_guard() {
 			for(i=1;i<=4;i++)if(!uint(b[i])||b[i]+0>255)return 0
 			network=ipnum(a[1]);return 1
 		}
-		function parse(s,dp,pp,helper, n,i,w,v,field,minbits,block) {
+		# In DNS mode the two pending paths are TCP/UDP 53 to the local
+		# candidate address; forwarding mode keeps its default/policy paths.
+		function parse(s,dp,pp,helper,dns, n,i,w,v,field,minbits,block) {
 			n=lex(s);if(n<0)return 0
 			pd=dp;ppending=pp;ud=dp;up=pp;oif=0;action="";target="";comment=""
 			for(i=1;i<=n;) {
@@ -646,24 +648,36 @@ ipv4_forward_guard() {
 				if(w=="meta"&&t[i+1]=="l4proto") {
 					v=t[i+2];if(v=="58"||v=="ipv6-icmp"){pd=0;ppending=0;ud=0;up=0;return 1}
 					else if(v!~/^(1|6|17|icmp|tcp|udp)$/)return 0
-					ud=0;up=0;i+=3;continue
+					if(dns){if(v=="6"||v=="tcp"){ppending=0;up=0}else if(v=="17"||v=="udp"){pd=0;ud=0}else{pd=0;ppending=0;ud=0;up=0;return 1}}
+					else{ud=0;up=0}i+=3;continue
 				}
 				if(w=="ip"&&(t[i+1]=="saddr"||t[i+1]=="daddr")) {
 					field=t[i+1];if(!prefix(t[i+2]))return 0
 					minbits=bits<lan_bits?bits:lan_bits;block=2^(32-minbits)
 					if(field=="saddr"&&int(network/block)!=int(lan_network/block)){pd=0;ppending=0;ud=0;up=0}
-					if(field=="saddr"&&bits>lan_bits||field=="daddr"&&bits!=0){ud=0;up=0}
+					if(dns&&field=="daddr") {
+						block=2^(32-bits);if(int(network/block)!=int(ipnum(dns_ip)/block)){pd=0;ppending=0;ud=0;up=0}
+					} else if(field=="saddr"&&bits>lan_bits||field=="daddr"&&bits!=0){ud=0;up=0}
+					if(dns&&!pd&&!ppending)return 1
 					i+=3;continue
 				}
 				if(w=="ip6"||w=="icmpv6"){pd=0;ppending=0;ud=0;up=0;return 1}
+				if(dns&&w=="icmp"&&t[i+1]=="type"){pd=0;ppending=0;ud=0;up=0;return 1}
 				if(w=="iifname"||w=="oifname") {
 					if(!device(t[i+1]))return 0
 					v=substr(t[i+1],2,length(t[i+1])-2)
 					if(w=="iifname"&&v!=access){pd=0;ppending=0;ud=0;up=0}
+					if(dns){if(!pd&&!ppending)return 1;if(w=="oifname")return 0;i+=2;continue}
 					if(w=="oifname"){oif=1;if(v!=default_dev){pd=0;ud=0}if(v!=policy_dev){ppending=0;up=0}}
 					i+=2;continue
 				}
-				if((w=="tcp"||w=="udp")&&(t[i+1]=="sport"||t[i+1]=="dport")&&uint(t[i+2])&&t[i+2]+0<=65535){ud=0;up=0;i+=3;continue}
+				if((w=="tcp"||w=="udp")&&(t[i+1]=="sport"||t[i+1]=="dport")&&uint(t[i+2])&&t[i+2]+0<=65535){
+					if(dns){
+						if(w=="tcp"){ppending=0;up=0}else{pd=0;ud=0}
+						if(t[i+1]=="dport"&&t[i+2]+0!=53){pd=0;ppending=0;ud=0;up=0;return 1}
+						if(t[i+1]=="sport"){ud=0;up=0}
+					}else{ud=0;up=0}i+=3;continue
+				}
 				if(w=="ct"&&t[i+1]=="state") {
 					v=t[i+2];if(v!="0x1"&&v!="invalid")return 0
 					pd=0;ppending=0;ud=0;up=0
@@ -678,7 +692,7 @@ ipv4_forward_guard() {
 				return 0
 			}
 			if(!pd&&!ppending||action=="")return 1
-			if(action=="accept")return oif
+			if(action=="accept")return dns||oif
 			if(action=="jump"&&!helper&&target~/^accept_to_/) {
 				if(mode=="plan"&&comment~/^"!fw4: routepolicy-init-(default4|policy4)"$/&&target!="accept_to_" default_zone&&target!="accept_to_" policy_zone)return 1
 				return safe[target]
@@ -691,6 +705,29 @@ ipv4_forward_guard() {
 			if(n!=4||t[3]!="comment"||t[2]!~/^accept_to_/)return 0
 			dest=substr(t[2],11);return t[4]=="\"!fw4: Accept " zone " to " dest " forwarding\""
 		}
+		function plain(s){sub(/ comment ".*"$/,"",s);gsub(/counter packets [0-9]+ bytes [0-9]+/,"counter",s);gsub(/[[:space:]]+/," ",s);sub(/^ /,"",s);sub(/ $/,"",s);return s}
+		function dns_guard( c,r,s,tcp,udp,entered) {
+			tcp=1;udp=1;c="input"
+			for(r=1;r<=count[c]&&(tcp||udp);r++) {
+				s=plain(rules[c,r]);if(s~/^type filter hook input /)continue
+				if(s=="iif \"lo\" accept"&&access!="lo"||s=="ct state vmap { 0x2 : accept, 0x4 : accept }"||s=="ct state established,related accept")continue
+				if(s=="tcp flags & (0x1 | 0x2 | 0x4 | 0x10) == 0x2 jump syn_flood"&&count["syn_flood"]==2&&plain(rules["syn_flood",1])~/^limit rate [1-9][0-9]*\/second burst [1-9][0-9]* packets return$/&&plain(rules["syn_flood",2])=="drop")continue
+				if(s=="iifname \"" access "\" jump input_" zone){entered=1;break}
+				if(!parse(rules[c,r],tcp,udp,1,1)){dns_error(c,r);return 0}
+				if(action=="accept"){if(pd&&ud)tcp=0;if(ppending&&up)udp=0}
+			}
+			if(!tcp&&!udp)return 1
+			if(!entered){print "DNS INPUT: selected access dispatch is not proven" >"/dev/stderr";return 0}
+			c="input_" zone
+			for(r=1;r<=count[c]&&(tcp||udp);r++) {
+				if(mode=="plan"&&plain(rules[c,r])=="jump accept_from_" zone)return 1
+				if(!parse(rules[c,r],tcp,udp,1,1)){dns_error(c,r);return 0}
+				if(action=="accept"){if(pd&&ud)tcp=0;if(ppending&&up)udp=0}
+			}
+			if(!tcp&&!udp||mode=="plan")return 1
+			print "DNS INPUT: TCP/UDP 53 reachability is not proven" >"/dev/stderr";return 0
+		}
+		function dns_error(c,r){print "DNS INPUT blocked or unproven (" c "): " rules[c,r] >"/dev/stderr"}
 		BEGIN{split(lan,own,"/");lan_network=ipnum(own[1]);lan_bits=own[2]}
 		$1=="chain"&&$3=="{"{chain=$2;present[chain]=1;next}
 		$1=="}"{chain="";next}
@@ -716,8 +753,9 @@ ipv4_forward_guard() {
 					if(action=="jump"&&target=="accept_to_" policy_zone&&ppending&&up)p=0
 				}
 			}
+			if(!bad&&!dns_guard())bad=1
 			exit bad
-		}' || fail 'IPv4 forwarding: preceding control flow cannot be proven safe; resolve the conflicting rule manually'
+		}' || fail 'IPv4 forwarding/DNS INPUT: preceding control flow cannot be proven safe; resolve the conflicting rule manually'
 }
 
 ipv6_forward_guard() {
