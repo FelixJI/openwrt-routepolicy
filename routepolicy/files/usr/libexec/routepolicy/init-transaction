@@ -1,0 +1,368 @@
+#!/bin/sh
+# Initialization owns only its journaled fields; never restore whole UCI packages.
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+umask 077
+TX="$RP_STATE_DIR/init-transaction"
+WAL="$TX/current"
+TAB=$(printf '\t')
+PACKAGES='network dhcp firewall routepolicy'
+
+fail() { rp_output_error "init-${operation:-transaction}" "$*"; exit 1; }
+phase() { printf '%s\n' "$1" >"$WAL/phase.new" && mv "$WAL/phase.new" "$WAL/phase" && sync; }
+read_phase() { cat "$WAL/phase" 2>/dev/null || printf absent; }
+safe_dir() {
+	[ ! -L "$1" ] || fail '事务目录不能是符号链接'
+	[ ! -e "$1" ] || [ -d "$1" ] || fail '事务目录类型非法'
+	mkdir -p "$1" && chmod 700 "$1" || fail '无法创建受限事务目录'
+}
+lock() {
+	for parent in "$RP_ETC" "$RP_STATE_DIR"; do
+		[ ! -L "$parent" ] && { [ ! -e "$parent" ] || [ -d "$parent" ]; } || fail '事务父目录不安全'
+	done
+	mkdir -p "$RP_STATE_DIR" || fail '不能创建事务父目录'
+	safe_dir "$TX"
+	[ ! -L "$TX/lock" ] || fail '事务锁不是安全文件'
+	exec 9>"$TX/lock"
+	flock -n 9 || fail '另一个初始化事务正在写入'
+	[ ! -L "$WAL" ] && [ ! -L "$TX/previous" ] || fail '事务记录路径不安全'
+	# Restore the previous terminal/prepared generation if power failed during promotion.
+	if [ ! -e "$WAL" ] && [ -d "$TX/previous" ]; then
+		mv "$TX/previous" "$WAL" && sync || fail '不能恢复准备事务记录'
+	fi
+}
+uci_private() { uci -t "$WAL/delta" "$@" 9>&-; }
+no_pending() {
+	for pkg in $PACKAGES; do
+		pending=$(uci -q changes "$pkg") || return 1
+		[ -z "$pending" ] || return 1
+	done
+}
+args_valid() {
+	[ "$#" -eq 11 ] || return 1
+	for argument do
+		[ -n "$argument" ] && [ "${#argument}" -le 64 ] || return 1
+		case "$argument" in *[!A-Za-z0-9_.:/-]*) return 1 ;; esac
+	done
+}
+plan_valid() {
+	# The topology helper validates values and role semantics; this is the write boundary.
+	awk -F '\t' '
+		NF != 3 || $1 != "set" || length($3)>256 || $3 ~ /[^ -~]/ {exit 1}
+		$2 !~ /^(network|dhcp|firewall|routepolicy)\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$/ {exit 1}
+		seen[$2]++ {exit 1}
+		{
+			key=$2
+			if(key ~ /^routepolicy\.main\.(lan_interface|default_interface|policy_interface)$/) next
+			if(key ~ /^network\.[A-Za-z0-9_]+\.(ipaddr|netmask)$/) next
+			if(key ~ /^network\.rp_init_(default|policy)(\.(device|proto|gateway|defaultroute|peerdns|metric))?$/) next
+			if(key ~ /^dhcp\.[A-Za-z0-9_]+\.(ignore|ra|dhcpv6|ndp)$/) next
+			if(key ~ /^firewall\.rp_init_(default|policy|default4|policy4|default_nat|policy_nat|default_dhcp_client|policy_dhcp_client|dns|ipv6|dhcp4|dhcp6|ra|redirects)(\.(name|network|input|output|forward|src|dest|src_ip|family|proto|target|src_port|dest_port|icmp_type))?$/) next
+			exit 1
+		}
+		END {if (NR<1 || NR>128) exit 1}
+	' "$1"
+}
+make_plan() { "$LIBEXEC/init-topology" plan "$@" 9>&-; }
+read_current() {
+	# Sentinel retains trailing newlines, which shell command substitution otherwise loses.
+	raw=$(uci -q get "$1" 2>/dev/null && printf '.') || return 1
+	FIELD_VALUE=${raw%.}
+	newline='
+'
+	case "$FIELD_VALUE" in *"$newline") FIELD_VALUE=${FIELD_VALUE%"$newline"} ;; *) return 2 ;; esac
+	case "$FIELD_VALUE" in *"$newline"*) return 2 ;; esac
+	[ "${#FIELD_VALUE}" -le 256 ] || return 2
+	if printf '%s' "$FIELD_VALUE" | LC_ALL=C grep -q '[^ -~]'; then return 2; fi
+	FIELD_TYPE=scalar
+	case "$1" in
+		*.*.*)
+			field_package=${1%%.*}; field_rest=${1#*.}; field_section=${field_rest%%.*}; field_option=${field_rest#*.}
+			exported=$(uci -q export "$field_package") || return 2
+			FIELD_TYPE=$(printf '%s\n' "$exported" | awk -v section="$field_section" -v option="$field_option" '
+				$1=="config" {name=$3; gsub(/\047/,"",name); selected=(name==section)}
+				selected && ($1=="option" || $1=="list") {name=$2; gsub(/\047/,"",name); if(name==option){n++;type=$1}}
+				END {if(n==1) print type; else exit 1}
+			') || return 2
+			case "$FIELD_TYPE" in
+				option) FIELD_TYPE=scalar ;;
+				list)
+					# First-release network addresses may use one CIDR-valued UCI list item.
+					case "$1" in network.*.ipaddr) ;; *) return 2 ;; esac
+					case "$FIELD_VALUE" in *' '*) return 2 ;; esac
+					ip=${FIELD_VALUE%/*}; rp_is_ipv4 "$ip" || return 2
+					if [ "$ip" != "$FIELD_VALUE" ]; then rp_uint_between "${FIELD_VALUE##*/}" 0 32 || return 2; fi
+					;;
+				*) return 2 ;;
+			esac
+			;;
+	esac
+}
+snapshot() {
+	while IFS="$TAB" read -r _action key value; do
+		if read_current "$key"; then
+			printf '%s\t%s\t%s\n' "$key" "$FIELD_TYPE" "$FIELD_VALUE"
+		else
+			[ "$?" -eq 1 ] || return 1
+			printf '%s\t0\t-\n' "$key"
+		fi
+	done <"$1"
+}
+preview_json() {
+	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":120,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
+		"$operation" "$(rp_json_escape "$1")"
+	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
+	printf '}\n'
+}
+smartdns_coordinate() {
+	# The fixed four-phase seam reserves #18 ownership; #17 never changes DNS manager state.
+	case "$1" in prepare|apply|verify|rollback) ;; *) return 1 ;; esac
+	printf '%s\n' "$1" >>"$WAL/smartdns-stages" && sync
+}
+check_token() {
+	[ "$#" -eq 1 ] && [ "${#1}" -eq 32 ] || fail '事务 token 非法'
+	case "$1" in *[!0-9a-f]*) fail '事务 token 非法' ;; esac
+	[ -f "$WAL/token" ] && [ ! -L "$WAL" ] && [ "$(cat "$WAL/token")" = "$1" ] || fail '事务 token 不匹配'
+}
+load_args() {
+	[ -f "$WAL/parameters" ] || return 1
+	# Values are fixed-position validated words, never shell source or eval.
+	set -f
+	IFS="$TAB" read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 <"$WAL/parameters"
+	args_valid "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11"
+}
+topology() { "$LIBEXEC/init-topology" "$1" "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&-; }
+verify_runtime() {
+	# Only the fixed topology verifier writes this private diagnostic; no UCI export is exposed.
+	topology verify >"$WAL/verify-result" 2>"$WAL/verify-error"
+}
+services_reload() {
+	for service in network firewall dnsmasq odhcpd; do
+		[ -x "$RP_ROOT/etc/init.d/$service" ] || return 1
+		printf 'reload:%s\n' "$service" >"$WAL/stage" && sync || return 1
+		timeout 15 "$RP_ROOT/etc/init.d/$service" reload 9>&- >/dev/null 2>&1 || return 1
+	done
+}
+guard_start() {
+	[ -x "$RP_ROOT/etc/init.d/routepolicy-initguard" ] || return 1
+	"$RP_ROOT/etc/init.d/routepolicy-initguard" start 9>&- >/dev/null 2>&1 || return 1
+	guard_attempt=0
+	while [ "$guard_attempt" -lt 10 ]; do
+		if service_state=$(ubus call service list '{"name":"routepolicy-initguard"}' 9>&- 2>/dev/null); then
+			running=$(printf '%s\n' "$service_state" | jsonfilter -e '@["routepolicy-initguard"].instances.guard.running') || running=
+		else running=; fi
+		[ "$running" != true ] || return 0
+		guard_attempt=$((guard_attempt + 1)); sleep 0.2
+	done
+	return 1
+}
+rollback_fields() {
+	phase rolling_back || return 1
+	no_pending || { phase conflict; return 1; }
+	# A failed commit may leave unapplied private changes; never commit those during restore.
+	[ -d "$WAL/delta" ] && [ ! -L "$WAL/delta" ] || { phase conflict; return 1; }
+	find "$WAL/delta" -type f -exec rm -f '{}' ';' || { phase conflict; return 1; }
+	conflicts=0
+	smartdns_coordinate rollback || conflicts=1
+	count=$(cat "$WAL/count" 2>/dev/null) || { phase conflict; return 1; }
+	rp_uint_between "$count" 1 128 || { phase conflict; return 1; }
+	while [ "$count" -gt 0 ]; do
+		entry="$WAL/fields/$count"
+		if [ ! -f "$entry/attempted" ]; then count=$((count - 1)); continue; fi
+		key=$(cat "$entry/key") || return 1
+		expected=$(cat "$entry/expected") || return 1
+		existed=$(cat "$entry/existed") || return 1
+		old=$(cat "$entry/old") || return 1
+		oldtype=$(cat "$entry/type") || return 1
+		present=0; current=; currenttype=
+		if read_current "$key"; then
+			present=1; current=$FIELD_VALUE; currenttype=$FIELD_TYPE
+		elif [ "$?" -ne 1 ]; then
+			printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+		fi
+		if { [ "$existed" = 0 ] && [ "$present" = 0 ]; } || { [ "$existed" = 1 ] && [ "$present" = 1 ] && [ "$current" = "$old" ] && [ "$currenttype" = "$oldtype" ]; }; then
+			:
+		elif [ "$present" = 1 ] && [ "$current" = "$expected" ] && [ "$currenttype" = scalar ]; then
+			case "$key" in
+				*.*.*) ;;
+				*)
+					# Unknown children make a newly created section user-owned; preserve it.
+					if [ "$(uci -q show "$key" | wc -l)" -ne 1 ]; then
+						printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+					fi
+					;;
+			esac
+			if [ "$existed" = 1 ]; then
+				if [ "$oldtype" = list ]; then
+					uci_private delete "$key" && uci_private add_list "$key=$old" || { phase conflict; return 1; }
+				else
+					uci_private set "$key=$old" || { phase conflict; return 1; }
+				fi
+			else
+				uci_private delete "$key" || { phase conflict; return 1; }
+			fi
+			# Commit a single owned field, never import or overwrite a package.
+			no_pending && uci_private commit "${key%%.*}" || { phase conflict; return 1; }
+		else
+			printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
+		fi
+		count=$((count - 1))
+	done
+	services_reload || conflicts=1
+	if [ "$conflicts" -eq 0 ]; then phase rolled_back; else phase conflict; return 1; fi
+}
+recover_locked() {
+	case "$(read_phase)" in
+		applying|rolling_back|pending) rollback_fields ;;
+		prepared|confirmed|rolled_back|absent) return 0 ;;
+		conflict) rollback_fields ;;
+		*) phase conflict; return 1 ;;
+	esac
+}
+status_json() {
+	p=$(read_phase)
+	printf '{"ok":true,"operation":"init-status","phase":"%s"' "$(rp_json_escape "$p")"
+	if [ -f "$WAL/deadline" ]; then printf ',"deadline":"%s"' "$(rp_json_escape "$(cat "$WAL/deadline")")"; fi
+	if [ -f "$WAL/stage" ]; then printf ',"stage":"%s"' "$(rp_json_escape "$(cat "$WAL/stage")")"; fi
+	if [ -f "$WAL/failed-stage" ]; then printf ',"failed_stage":"%s"' "$(rp_json_escape "$(cat "$WAL/failed-stage")")"; fi
+	if [ -f "$WAL/conflicts" ]; then printf ',"conflicts":"%s"' "$(rp_json_escape "$(cat "$WAL/conflicts")")"; fi
+	if [ -s "$WAL/verify-error" ]; then printf ',"verification_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/verify-error")")"; fi
+	printf '}\n'
+}
+
+operation=${1:-}; [ "$#" -eq 0 ] || shift
+case "$operation" in
+	discover) [ "$#" -eq 0 ] || fail 'discover 不接受参数'; exec "$LIBEXEC/init-topology" discover ;;
+	preview)
+		args_valid "$@" || fail '初始化参数非法'
+		no_pending || fail '存在外部 UCI pending changes'
+		candidate=$(make_plan "$@") || fail '拓扑预检失败'
+		# Read-only preview validates the same plan without creating any files.
+		printf '%s\n' "$candidate" | plan_valid /dev/stdin || fail '候选格式非法'
+		preview_json "$candidate"
+		;;
+	prepare)
+		args_valid "$@" || fail '初始化参数非法'
+		lock
+		case "$(read_phase)" in absent|prepared|confirmed|rolled_back) ;; *) fail '存在未完成事务；请先恢复' ;; esac
+		no_pending || fail '存在外部 UCI pending changes'
+		candidate=$(make_plan "$@") || fail '拓扑预检失败'
+		# Build a complete replacement before discarding the previous reviewable candidate.
+		original_wal=$WAL
+		WAL="$TX/preparing"
+		[ ! -L "$WAL" ] || fail '事务准备目录不安全'
+		rm -rf "$WAL"
+		safe_dir "$WAL"; safe_dir "$WAL/delta"; safe_dir "$WAL/fields"
+		printf '%s\n' "$candidate" >"$WAL/candidate"
+		plan_valid "$WAL/candidate" || fail '候选字段超出初始化白名单'
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >"$WAL/parameters"
+		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
+		token=$(sed 's/-//g' /proc/sys/kernel/random/uuid) || fail '无法读取内核随机 token'
+		[ "${#token}" -eq 32 ] || fail '无法生成事务 token'
+		case "$token" in *[!0-9a-f]*) fail '内核随机 token 格式非法' ;; esac
+		printf '%s\n' "$token" >"$WAL/token"
+		smartdns_coordinate prepare || fail 'SmartDNS 协调准备阶段失败'
+		phase prepared || fail '持久化准备状态失败'
+		[ ! -L "$TX/previous" ] || fail '事务旧代目录不安全'
+		rm -rf "$TX/previous"
+		if [ -e "$original_wal" ]; then mv "$original_wal" "$TX/previous" || fail '不能保留旧候选'; fi
+		mv "$WAL" "$original_wal" && sync || fail '不能提升准备事务'
+		WAL=$original_wal
+		rm -rf "$TX/previous"
+		preview_json "$candidate" "$token"
+		;;
+	apply)
+		lock; check_token "$@"
+		case "$(read_phase)" in pending|confirmed) status_json; exit 0 ;; prepared) ;; *) fail '事务阶段不能应用' ;; esac
+		load_args || fail '事务参数损坏'
+		no_pending || fail '存在外部 UCI pending changes'
+		topology plan >"$WAL/recheck" && cmp -s "$WAL/candidate" "$WAL/recheck" || fail '候选已陈旧；请重新准备'
+		snapshot "$WAL/candidate" >"$WAL/baseline-now" && cmp -s "$WAL/baseline" "$WAL/baseline-now" || fail '配置基线已变化；拒绝陈旧提交'
+		# A failed pre-apply guard readiness check leaves a prepared, safely retryable candidate.
+		rm -rf "$WAL/fields"
+		safe_dir "$WAL/fields"
+		count=0
+		while IFS="$TAB" read -r _action key value; do
+			count=$((count + 1)); entry="$WAL/fields/$count"; mkdir "$entry" || fail '无法准备 WAL'
+			printf '%s\n' "$key" >"$entry/key"; printf '%s' "$value" >"$entry/expected"
+			if read_current "$key"; then
+				printf 1 >"$entry/existed"; printf '%s' "$FIELD_VALUE" >"$entry/old"; printf '%s' "$FIELD_TYPE" >"$entry/type"
+			else
+				[ "$?" -eq 1 ] || fail 'WAL 基线字段不能保真'
+				printf 0 >"$entry/existed"; : >"$entry/old"; printf scalar >"$entry/type"
+			fi
+		done <"$WAL/candidate"
+		printf '%s\n' "$count" >"$WAL/count"
+		printf '%s\n' "$(( $(date +%s) + 120 ))" >"$WAL/deadline"
+		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
+		phase applying || fail '持久化 WAL 失败'
+		failed_stage=
+		smartdns_coordinate apply || failed_stage='smartdns-apply'
+		index=0
+		while IFS="$TAB" read -r _action key value; do
+			[ -z "$failed_stage" ] || break
+			index=$((index + 1)); entry="$WAL/fields/$index"
+			present=0; current=; currenttype=scalar
+			if read_current "$key"; then present=1; current=$FIELD_VALUE; currenttype=$FIELD_TYPE
+			elif [ "$?" -ne 1 ]; then failed_stage='concurrent-write'; break; fi
+			old=$(cat "$entry/old")
+			if [ "$present" != "$(cat "$entry/existed")" ] || [ "$current" != "$old" ] || [ "$currenttype" != "$(cat "$entry/type")" ]; then failed_stage='concurrent-write'; break; fi
+			printf 'commit:%s\n' "$key" >"$WAL/stage"; sync
+			: >"$entry/attempted"; sync
+			no_pending && uci_private set "$key=$value" && uci_private commit "${key%%.*}" || { failed_stage=commit; break; }
+		done <"$WAL/candidate"
+		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage"; timeout 15 fw4 check 9>&- >/dev/null 2>&1 || failed_stage='firewall-check'; }
+		[ -n "$failed_stage" ] || { services_reload || failed_stage='service-reload'; }
+		[ -n "$failed_stage" ] || { printf '%s\n' runtime-verify >"$WAL/stage"; verify_runtime || failed_stage='runtime-verify'; }
+		[ -n "$failed_stage" ] || { smartdns_coordinate verify || failed_stage='smartdns-verify'; }
+		if [ -n "$failed_stage" ]; then
+			printf '%s\n' "$failed_stage" >"$WAL/failed-stage"
+			rollback_fields || fail "阶段 $failed_stage 失败；恢复有冲突，需人工处理"
+			fail "阶段 $failed_stage 失败；本事务字段已恢复"
+		fi
+		phase pending || fail '不能记录待连通性确认状态'
+		status_json
+		;;
+	confirm)
+		lock; check_token "$@"
+		[ "$(read_phase)" != confirmed ] || { status_json; exit 0; }
+		[ "$(read_phase)" = pending ] || fail '事务不在待确认阶段'
+		load_args || fail '事务参数损坏'
+		[ "$(date +%s)" -lt "$(cat "$WAL/deadline")" ] || { rollback_fields; fail '连通性确认已超时'; }
+		set -f; set -- ${SSH_CONNECTION:-}
+		[ "$#" -eq 4 ] || fail '确认需要来自新管理入口的可信 SSH 会话'
+		management=$(topology management-address) || fail '无法确认当前管理地址'
+		[ "$3" = "$management" ] || fail 'SSH 会话未连接到预览的新管理入口'
+		no_pending && verify_runtime || fail '服务或规则运行证据不满足确认条件'
+		phase confirmed || fail '不能持久化确认状态'
+		status_json
+		;;
+	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
+	guard-needed)
+		case "$(read_phase)" in prepared|applying|pending|rolling_back) exit 0 ;; *) exit 1 ;; esac
+		;;
+	recover)
+		[ "$#" -eq 0 ] || fail 'recover 不接受参数'
+		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ]; then status_json; exit 0; fi
+		lock; recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; status_json
+		;;
+	guard)
+		[ "$#" -eq 0 ] || fail 'guard 不接受参数'
+		while :; do
+			case "$(read_phase)" in
+				applying|rolling_back) "$0" recover >/dev/null 2>&1 || true ;;
+				pending) deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
+					if ! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then "$0" recover >/dev/null 2>&1 || true; fi ;;
+				prepared)
+					deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
+					if ! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then
+						ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit 0
+					fi ;;
+				*) ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit 0 ;;
+			esac
+			sleep 2
+		done
+		;;
+	*) fail '未知初始化操作' ;;
+esac

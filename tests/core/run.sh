@@ -6,6 +6,8 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/user-list-test.sh"
 "$HERE/cli-contract-test.sh"
 "$HERE/init-lifecycle-test.sh"
+"$HERE/init-topology-test.sh"
+"$HERE/init-transaction-test.sh"
 "$HERE/status-contract-test.sh"
 "$HERE/observe-contract-test.sh"
 "$HERE/warm-state-test.sh"

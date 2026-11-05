@@ -1,6 +1,6 @@
 # OpenWrt RoutePolicy 详细实施计划
 
-> 目标形态：核心包 `routepolicy` + LuCI 包 `luci-app-routepolicy` + 少量首次手工配置。
+> 历史设计。首次配置和旁路由初始化的现行范围见 [Goal #16](https://github.com/FelixJI/openwrt-routepolicy/issues/16)。
 > 公开仓库建议名：`openwrt-routepolicy`。
 > 许可证：MIT。
 > 本地清理脚本不进入公开仓库。

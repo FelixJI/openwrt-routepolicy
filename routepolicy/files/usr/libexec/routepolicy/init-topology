@@ -1,0 +1,394 @@
+#!/bin/sh
+# Read-only topology discovery, constrained UCI planning and runtime verification.
+# OpenWrt ash supports function-local variables.
+# shellcheck disable=SC3043
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+
+fail() { rp_err "init-topology: $*"; exit 1; }
+get() { uci -q get "$1" 2>/dev/null || true; }
+ident() { [ "${#1}" -le 32 ] && printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; }
+sections() { uci -q show "$1" | sed -n "s/^$1\.\([^.=]*\)=$2$/\1/p"; }
+field() { jsonfilter -e "$2" <<EOF
+$1
+EOF
+}
+json_string() { printf '"%s"' "$(rp_json_escape "$1")"; }
+required='uci ubus jsonfilter ip nft fw4 netstat'
+
+discover() {
+	local missing='' command_name package section first=1 data runtime_ok=1 conflict_check
+	printf '{"schema":1,"missing_dependencies":['
+	for command_name in $required; do
+		if ! rp_have "$command_name"; then
+			[ "$first" = 1 ] || printf ','; first=0
+			json_string "$command_name"; missing="$missing $command_name"
+		fi
+	done
+	printf '],"devices":'; data=$(ubus call network.device status 2>/dev/null) || { data='null'; runtime_ok=0; }
+	printf '%s' "${data:-null}"
+	printf ',"netifd":'; data=$(ubus call network.interface dump 2>/dev/null) || { data='null'; runtime_ok=0; }
+	printf '%s' "${data:-null}"
+	printf ',"dhcp_roles":['; first=1
+	if rp_have uci; then
+		for section in $(sections dhcp dhcp); do
+			[ "$first" = 1 ] || printf ','; first=0
+			printf '{"section":'; json_string "$section"
+			for package in interface ignore ra dhcpv6 ndp; do
+				printf ',"%s":' "$package"; json_string "$(get "dhcp.$section.$package")"
+			done
+			printf '}'
+		done
+	fi
+	printf '],"observations":{'
+	printf '"addresses":'; json_string "$(ip -o addr show 2>/dev/null || true)"
+	printf ',"routes4":'; json_string "$(ip -4 route show table all 2>/dev/null || true)"
+	printf ',"rules4":'; json_string "$(ip -4 rule show 2>/dev/null || true)"
+	printf ',"rules6":'; json_string "$(ip -6 rule show 2>/dev/null || true)"
+	printf ',"dns_listeners":'; json_string "$(netstat -lnptu 2>/dev/null | awk '$4 ~ /:53$/ {print}' || true)"
+	printf ',"firewall_zones":'; json_string "$(uci -q show firewall 2>/dev/null | grep -E '=zone$|\.(name|network|input|forward|masq)=' || true)"
+	printf ',"mark_rules":'; json_string "$(nft list ruleset 2>/dev/null | grep -E 'table |mark' || true)"
+	printf ',"fw4":'; if fw4 check >/dev/null 2>&1; then json_string valid; else json_string unavailable_or_invalid; runtime_ok=0; fi
+	printf ',"mark_table_preflight":'
+	if [ -n "$missing" ]; then json_string 'unavailable: missing dependencies'
+	elif conflict_check=$(conflicts 2>&1); then json_string clear
+	else json_string "$conflict_check"; runtime_ok=0; fi
+	printf ',"dhcp_clients":'; json_string "$(uci -q show network 2>/dev/null | grep -E '\.proto=.?(dhcp|dhcpv6)' || true)"
+	printf ',"warning":'; json_string 'New IPv6 forwarding connections through this router are rejected by the plan; existing conntrack sessions are not forcibly cut off. IPv6 management is preserved. External RA and direct L2 IPv6 bypass require upstream/client configuration; no external path is claimed blocked.'
+	printf '},"ok":'; [ -z "$missing" ] && [ "$runtime_ok" = 1 ] && printf true || printf false
+	printf '}\n'
+}
+
+host4() {
+	case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+	rp_is_ipv4 "$1" && rp_uint_between "$2" 1 30 || return 1
+	awk -v ip="$1" -v p="$2" 'BEGIN{split(ip,a,".");n=((a[1]*256+a[2])*256+a[3])*256+a[4];b=2^(32-p);exit !(a[1]>0&&a[1]<224&&a[1]!=127&&n%b!=0&&n%b!=b-1)}'
+}
+netmask() {
+	awk -v p="$1" 'BEGIN{for(i=0;i<4;i++){b=p>=8?255:p<=0?0:256-2^(8-p);printf "%s%d",i?".":"",b;p-=8}print ""}'
+}
+overlap() {
+	local left=$1 right=$2 bits=${1#*/}
+	[ "$bits" -le "${right#*/}" ] || bits=${right#*/}
+	[ "$(rp_network_cidr "${left%/*}" "$bits")" = "$(rp_network_cidr "${right%/*}" "$bits")" ]
+}
+runtime() {
+	local raw
+	raw=$(rp_interface_json "$1") || fail "netifd interface unavailable: $1"
+	[ "$(field "$raw" '@.up')" = true ] || fail "interface not up: $1"
+	field "$raw" "$2" | sed -n '1p'
+}
+zone_for() {
+	local section networks found=''
+	for section in $(sections firewall zone); do
+		networks=$(get "firewall.$section.network")
+		case " $networks " in
+			*" $1 "*) [ -z "$found" ] || fail "multiple firewall zones for $1"; found=$section ;;
+		esac
+	done
+	printf '%s\n' "$found"
+}
+zone_name() {
+	local name
+	name=$(get "firewall.$1.name"); ident "$name" || fail "invalid firewall zone name: $1"
+	printf '%s\n' "$name"
+}
+probe_address() {
+	local candidate=$1 device=$2 existing
+	existing=$(ip -4 -o addr show) || fail 'cannot inspect local IPv4 addresses'
+	if printf '%s\n' "$existing" | awk -v ip="$candidate" '{split($4,a,"/");if(a[1]==ip)found=1}END{exit !found}'; then
+		fail "address already assigned locally: $candidate"
+	fi
+	rp_have arping || fail 'arping is required to check a new static/management address'
+	arping -D -c 2 -w 3 -I "$device" "$candidate" >/dev/null 2>&1 || fail "address conflict or inconclusive ARP probe: $candidate"
+}
+own_section() {
+	local existing
+	existing=$(get "$1")
+	# A pre-existing object is never adopted on the strength of its prefix alone.
+	[ -z "$existing" ] || [ "$operation" != plan ] || fail "reserved section already exists: $1"
+}
+check_rp_filter() {
+	local global device specific effective
+	global=$(cat "$RP_ROOT/proc/sys/net/ipv4/conf/all/rp_filter" 2>/dev/null) || fail 'cannot inspect global rp_filter'
+	case "$global" in 0|1|2) ;; *) fail 'invalid global rp_filter evidence' ;; esac
+	for device in "$@"; do
+		specific=$(cat "$RP_ROOT/proc/sys/net/ipv4/conf/$device/rp_filter" 2>/dev/null) || fail "cannot inspect rp_filter: $device"
+		case "$specific" in 0|1|2) ;; *) fail "invalid rp_filter evidence: $device" ;; esac
+		# Linux uses max(all, device); off and loose allow asymmetric return paths.
+		effective=$global; [ "$specific" -le "$effective" ] || effective=$specific
+		[ "$effective" != 1 ] || fail "strict rp_filter blocks asymmetric routing: $device (all=$global device=$specific effective=1); configure a reversible device-level policy before initialization"
+	done
+}
+
+parse() {
+	[ "$#" -eq 3 ] || [ "$#" -eq 11 ] || fail 'expected ACCESS DEFAULT POLICY [NEW_ROLE DEVICE PROTO IP PREFIX GATEWAY MANAGEMENT_IP MANAGEMENT_PREFIX]'
+	access=$1 default_if=$2 policy=$3
+	shift 3
+	new_role=${1:--} new_device=${2:--} new_proto=${3:--} new_ip=${4:--} new_prefix=${5:--} new_gateway=${6:--} management_ip=${7:--} management_prefix=${8:--}
+	for argument in "$access" "$default_if" "$policy"; do ident "$argument" || fail 'invalid logical interface name'; done
+	[ "$policy" != "$access" ] && [ "$policy" != "$default_if" ] || fail 'policy egress must be independent'
+	for command_name in $required; do rp_have "$command_name" || fail "missing dependency: $command_name"; done
+	[ "$(get "network.$access")" = interface ] || fail 'access must be an existing named interface'
+	[ "$(get "network.$access.proto")" = static ] || fail 'access management requires a static IPv4 interface'
+	case "$(get "network.$access.ipaddr")" in *[[:space:]]*) fail 'multiple access management addresses require explicit manual configuration' ;; esac
+	access_device=$(runtime "$access" '@.l3_device'); rp_is_device "$access_device" || fail 'invalid access L3 device'
+	access_ip=$(runtime "$access" '@["ipv4-address"][0].address')
+	access_prefix=$(runtime "$access" '@["ipv4-address"][0].mask')
+	host4 "$access_ip" "$access_prefix" || fail 'access requires a usable IPv4 address and prefix'
+	if [ "$management_ip" != - ]; then
+		host4 "$management_ip" "$management_prefix" || fail 'invalid management IPv4 address/prefix'
+		if [ "$management_ip" != "$access_ip" ] && [ "$operation" = plan ]; then probe_address "$management_ip" "$access_device"; fi
+		access_ip=$management_ip access_prefix=$management_prefix
+	else
+		[ "$management_prefix" = - ] || fail 'management prefix without address'
+	fi
+	access_cidr=$(rp_network_cidr "$access_ip" "$access_prefix")
+	case "$new_role" in
+		-) [ "$new_device:$new_proto:$new_ip:$new_prefix:$new_gateway" = '-:-:-:-:-' ] || fail 'new interface parameters without NEW_ROLE' ;;
+		default|policy)
+			[ "$new_role" = default ] && new_if=$default_if || new_if=$policy
+			[ "$new_if" = "rp_init_$new_role" ] || fail 'new logical interface must use the reserved role name'
+			rp_is_device "$new_device" || fail 'invalid new device'
+			case "$new_device" in *[!A-Za-z0-9_-]*|lo) fail 'only ordinary independent network cards are supported' ;; esac
+			[ -d "$RP_ROOT/sys/class/net/$new_device/device" ] && [ ! -e "$RP_ROOT/sys/class/net/$new_device/master" ] && [ ! -d "$RP_ROOT/sys/class/net/$new_device/bridge" ] && [ ! -d "$RP_ROOT/sys/class/net/$new_device/wireless" ] || fail 'device is not an identified standalone physical card'
+			[ "$(cat "$RP_ROOT/sys/class/net/$new_device/ifindex")" = "$(cat "$RP_ROOT/sys/class/net/$new_device/iflink")" ] || fail 'stacked devices are not supported for creation'
+			if [ "$operation" = plan ]; then
+				[ -z "$(get "network.$new_if")" ] || fail 'new logical interface already exists'
+				for section in $(sections network interface); do
+					[ "$(get "network.$section.device")" != "$new_device" ] || fail 'new device already belongs to an interface'
+					if [ "$(get "network.$section.ifname")" = "$new_device" ]; then fail 'new device already belongs to an interface'; fi
+				done
+			fi
+			case "$new_proto" in
+				dhcp) [ "$new_ip:$new_prefix:$new_gateway" = '-:-:-' ] || fail 'DHCP client does not take static parameters' ;;
+				static)
+					host4 "$new_ip" "$new_prefix" && host4 "$new_gateway" "$new_prefix" || fail 'invalid static egress address/gateway'
+					[ "$new_ip" != "$new_gateway" ] && [ "$(rp_network_cidr "$new_ip" "$new_prefix")" = "$(rp_network_cidr "$new_gateway" "$new_prefix")" ] || fail 'static gateway must be a different host in the egress subnet'
+					[ "$operation" != plan ] || probe_address "$new_ip" "$new_device"
+					;;
+				*) fail 'only DHCP-client or static creation is supported' ;;
+			esac
+			;;
+		*) fail 'NEW_ROLE must be default, policy or -' ;;
+	esac
+	access_zone_section=$(zone_for "$access"); [ -n "$access_zone_section" ] || fail 'access needs an existing dedicated management firewall zone'
+	[ "$(get "firewall.$access_zone_section.network")" = "$access" ] || fail 'access zone must contain only the selected access interface'
+	access_zone=$(zone_name "$access_zone_section")
+	[ "$(get "firewall.$access_zone_section.input")" = ACCEPT ] || fail 'existing access management input must be ACCEPT; automatic management-port changes are not supported'
+	for role in default policy; do
+		[ "$role" = default ] && selected=$default_if || selected=$policy
+		if [ "$new_role" = "$role" ] && [ "$operation" = plan ]; then
+			device=$new_device address=$new_ip prefix=$new_prefix gateway=$new_gateway
+		else
+			[ "$(get "network.$selected")" = interface ] || fail "egress is not a named logical interface: $selected"
+			device=$(runtime "$selected" '@.l3_device'); rp_is_device "$device" || fail 'invalid egress L3 device'
+			address=$(runtime "$selected" '@["ipv4-address"][0].address')
+			prefix=$(runtime "$selected" '@["ipv4-address"][0].mask')
+			gateway=$(runtime "$selected" '@.route[@.target="0.0.0.0"].nexthop')
+			host4 "$address" "$prefix" && rp_is_ipv4 "$gateway" || fail "egress lacks an IPv4 address/default gateway: $selected"
+		fi
+		if [ "$gateway" != - ]; then
+			[ "$gateway" != "$access_ip" ] && [ "$gateway" != "$address" ] || fail 'gateway loops back to this router'
+			if ip -4 -o addr show | awk -v ip="$gateway" '{split($4,a,"/");if(a[1]==ip)found=1}END{exit !found}'; then fail 'gateway is a local router address'; fi
+		fi
+		zone_section=$(zone_for "$selected")
+		if [ -z "$zone_section" ]; then
+			zone="rp_init_$role"; own_section "firewall.$zone"
+			for section in $(sections firewall zone); do
+				[ "$(get "firewall.$section.name")" != "$zone" ] || fail "reserved firewall zone name already exists: $zone"
+			done
+		else
+			zone=$(zone_name "$zone_section")
+		fi
+		if [ "$device" = "$access_device" ]; then
+			[ "$role" = default ] && [ "$zone" = "$access_zone" ] || fail 'only access/default may share an L3 device and firewall zone'
+		else
+			[ "$zone" != "$access_zone" ] || fail 'separated egress must not share the access firewall zone'
+			if [ -n "$zone_section" ]; then
+				case "$(get "firewall.$zone_section.input")" in REJECT|DROP) ;; *) fail 'egress zone has permissive management input' ;; esac
+			fi
+			if [ "$address" != - ] && overlap "$address/$prefix" "$access_cidr"; then fail 'separated egress overlaps the access subnet'; fi
+		fi
+		if [ "$address" = - ]; then egress_cidr=-; else egress_cidr=$(rp_network_cidr "$address" "$prefix"); fi
+		if [ "$role" = default ]; then default_device=$device default_zone=$zone default_zone_section=$zone_section default_cidr=$egress_cidr
+		else policy_device=$device policy_zone=$zone policy_zone_section=$zone_section policy_cidr=$egress_cidr; fi
+	done
+	[ "$default_device" != "$policy_device" ] || fail 'default and policy egress cannot share an L3 device'
+	[ "$default_zone" != "$policy_zone" ] || fail 'default and policy egress need distinct firewall zones'
+	if [ "$default_cidr" != - ] && [ "$policy_cidr" != - ] && overlap "$default_cidr" "$policy_cidr"; then fail 'default and policy egress subnets overlap'; fi
+	dhcp_sections=''
+	for section in $(sections dhcp dhcp); do
+		[ "$(get "dhcp.$section.interface")" = "$access" ] || continue
+		ident "$section" || fail 'anonymous DHCP sections require a stable named section before initialization'
+		dhcp_sections="$dhcp_sections $section"
+	done
+	# Earlier user rules must not bypass the appended IPv6 fail-closed rule.
+	for section in $(sections firewall rule); do
+		[ "$(get "firewall.$section.enabled")" != 0 ] || continue
+		case "$(get "firewall.$section.src")" in "$access_zone"|'*') ;; *) continue ;; esac
+		[ -n "$(get "firewall.$section.dest")" ] || continue
+		[ "$(get "firewall.$section.target")" = ACCEPT ] || continue
+		case "$(get "firewall.$section.family")" in ipv4) ;; *) fail 'existing IPv6/any forwarding ACCEPT rule precedes managed IPv6 rejection' ;; esac
+	done
+	for section in default4 policy4 default_nat policy_nat default_dhcp_client policy_dhcp_client dns ipv6 dhcp4 dhcp6 ra redirects; do own_section "firewall.rp_init_$section"; done
+	check_rp_filter "$access_device" "$default_device" "$policy_device"
+}
+
+conflicts() {
+	local mark mask priority table rules routes foreign
+	mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
+	priority=$(rp_uci_get main rule_priority 12000); table=$(rp_uci_get main route_table 200)
+	rp_is_mark_bit "$mark" && rp_is_mark_bit "$mask" && [ "$mark" = "$mask" ] && rp_uint_between "$priority" 1 32765 && rp_uint_between "$table" 1 252 || fail 'invalid mark/table settings'
+	rules=$(ip -4 rule show) || fail 'cannot inspect routing rules'
+	[ -z "$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table")" ] || fail 'mark overlaps another routing rule'
+	if printf '%s\n' "$rules" | awk -v p="$priority:" -v t="$table" '$1==p{found=1}{for(i=1;i<NF;i++)if(($i=="lookup"||$i=="table")&&$(i+1)==t)found=1}END{exit !found}'; then
+		[ "$(rp_state_get route_table 2>/dev/null || true)" = "$table" ] && [ "$(rp_state_get mark 2>/dev/null || true)" = "$mark" ] || fail 'route table or priority already in use without ownership'
+	fi
+	if routes=$(ip -4 route show table "$table" 2>&1); then :
+	elif printf '%s\n' "$routes" | grep -Fxq 'Error: ipv4: FIB table does not exist.' &&
+		printf '%s\n' "$routes" | awk '$0!="Error: ipv4: FIB table does not exist."&&$0!="Dump terminated"&&$0!="Dump terminated."{exit 1}'; then routes=''
+	else fail "cannot inspect policy routing table: $routes"; fi
+	[ -z "$routes" ] || [ "$(rp_state_get route_table 2>/dev/null || true)" = "$table" ] || fail 'policy routing table is already occupied'
+	foreign=$(nft list ruleset) || fail 'cannot inspect nftables rules'
+	if printf '%s\n' "$foreign" | awk '/^table /{owned=($3=="routepolicy")} !owned && /mark.*set/{found=1}END{exit !found}'; then fail 'foreign nftables mark writes require manual conflict review'; fi
+	fw4 check >/dev/null 2>&1 || fail 'current fw4 configuration is invalid'
+}
+
+set_value() { printf 'set\t%s\t%s\n' "$1" "$2"; }
+rule() {
+	local suffix=$1 source=$2 destination=$3 family=$4 protocol=$5 target=$6
+	set_value "firewall.rp_init_$suffix" rule
+	set_value "firewall.rp_init_$suffix.name" "routepolicy-init-$suffix"
+	[ "$source" = - ] || set_value "firewall.rp_init_$suffix.src" "$source"
+	[ "$destination" = - ] || set_value "firewall.rp_init_$suffix.dest" "$destination"
+	set_value "firewall.rp_init_$suffix.family" "$family"
+	set_value "firewall.rp_init_$suffix.proto" "$protocol"
+	set_value "firewall.rp_init_$suffix.target" "$target"
+}
+emit_plan() {
+	local section role selected zone zone_section
+	set_value routepolicy.main.lan_interface "$access"
+	set_value routepolicy.main.default_interface "$default_if"
+	set_value routepolicy.main.policy_interface "$policy"
+	if [ "$management_ip" != - ]; then
+		set_value "network.$access.ipaddr" "$management_ip"
+		set_value "network.$access.netmask" "$(netmask "$management_prefix")"
+	fi
+	if [ "$new_role" != - ]; then
+		set_value "network.$new_if" interface
+		set_value "network.$new_if.device" "$new_device"
+		set_value "network.$new_if.proto" "$new_proto"
+		set_value "network.$new_if.peerdns" 0
+		# netifd must publish the gateway for the existing policy-route manager.
+		set_value "network.$new_if.defaultroute" 1
+		[ "$new_role" = default ] && set_value "network.$new_if.metric" 10 || set_value "network.$new_if.metric" 200
+		if [ "$new_proto" = static ]; then
+			set_value "network.$new_if.ipaddr" "$new_ip"
+			set_value "network.$new_if.netmask" "$(netmask "$new_prefix")"
+			set_value "network.$new_if.gateway" "$new_gateway"
+		fi
+	fi
+	for section in $dhcp_sections; do
+		set_value "dhcp.$section.ignore" 1
+		for role in ra dhcpv6 ndp; do set_value "dhcp.$section.$role" disabled; done
+	done
+	for role in default policy; do
+		if [ "$role" = default ]; then selected=$default_if zone=$default_zone zone_section=$default_zone_section
+		else selected=$policy zone=$policy_zone zone_section=$policy_zone_section; fi
+		if [ -z "$zone_section" ]; then
+			set_value "firewall.rp_init_$role" zone
+			set_value "firewall.rp_init_$role.name" "$zone"
+			set_value "firewall.rp_init_$role.network" "$selected"
+			set_value "firewall.rp_init_$role.input" REJECT
+			set_value "firewall.rp_init_$role.output" ACCEPT
+			set_value "firewall.rp_init_$role.forward" REJECT
+		fi
+		rule "${role}4" "$access_zone" "$zone" ipv4 all ACCEPT
+		set_value "firewall.rp_init_${role}4.src_ip" "$access_cidr"
+		set_value "firewall.rp_init_${role}_nat" nat
+		set_value "firewall.rp_init_${role}_nat.name" "routepolicy-init-${role}-nat"
+		set_value "firewall.rp_init_${role}_nat.src" "$zone"
+		set_value "firewall.rp_init_${role}_nat.src_ip" "$access_cidr"
+		set_value "firewall.rp_init_${role}_nat.family" ipv4
+		set_value "firewall.rp_init_${role}_nat.proto" all
+		set_value "firewall.rp_init_${role}_nat.target" MASQUERADE
+		if { [ "$new_role" = "$role" ] && [ "$new_proto" = dhcp ]; } || [ "$(get "network.$selected.proto")" = dhcp ]; then
+			rule "${role}_dhcp_client" "$zone" - ipv4 udp ACCEPT
+			set_value "firewall.rp_init_${role}_dhcp_client.src_port" 67
+			set_value "firewall.rp_init_${role}_dhcp_client.dest_port" 68
+		fi
+	done
+	rule dns "$access_zone" - ipv4 'tcp udp' ACCEPT
+	set_value firewall.rp_init_dns.src_ip "$access_cidr"
+	set_value firewall.rp_init_dns.dest_port 53
+	rule ipv6 "$access_zone" '*' ipv6 all REJECT
+	rule dhcp4 - "$access_zone" ipv4 udp DROP
+	set_value firewall.rp_init_dhcp4.src_port 67
+	set_value firewall.rp_init_dhcp4.dest_port 68
+	rule dhcp6 - "$access_zone" ipv6 udp DROP
+	set_value firewall.rp_init_dhcp6.src_port 547
+	set_value firewall.rp_init_dhcp6.dest_port 546
+	rule ra - "$access_zone" ipv6 icmp DROP
+	set_value firewall.rp_init_ra.icmp_type router-advertisement
+	rule redirects - "$access_zone" ipv4 icmp DROP
+	set_value firewall.rp_init_redirects.icmp_type redirect
+}
+
+live_rule() {
+	local chain=$1 suffix=$2 line token
+	shift 2
+	line=$(nft -n list chain inet fw4 "$chain") || fail "running fw4 chain unavailable: $chain"
+	line=$(printf '%s\n' "$line" | grep -F "routepolicy-init-$suffix\"") || fail "missing running fw4 rule: $suffix"
+	for token in "$@"; do printf '%s\n' "$line" | grep -Fq "$token" || fail "running fw4 rule differs from candidate: $suffix ($token)"; done
+}
+
+verify() {
+	local section service services listener setting action key expected
+	emit_plan | while IFS="$(printf '\t')" read -r action key expected; do
+		[ "$action" = set ] && [ "$(get "$key")" = "$expected" ] || fail "configuration differs from candidate: $key"
+	done
+	[ "$management_ip" = - ] || [ "$(runtime "$access" '@["ipv4-address"][0].address')" = "$management_ip" ] || fail 'new management address is not active'
+	for section in $dhcp_sections; do
+		[ "$(get "dhcp.$section.ignore")" = 1 ] || fail 'access DHCPv4 remains configured'
+		for setting in ra dhcpv6 ndp; do [ "$(get "dhcp.$section.$setting")" = disabled ] || fail "access $setting remains configured"; done
+	done
+	check_rp_filter "$access_device" "$default_device" "$policy_device"
+	[ "$(cat "$RP_ROOT/proc/sys/net/ipv4/ip_forward")" = 1 ] || fail 'IPv4 forwarding is disabled'
+	fw4 check >/dev/null 2>&1 || fail 'fw4 validation failed'
+	live_rule "forward_$access_zone" default4 "ip saddr $access_cidr" "jump accept_to_$default_zone"
+	live_rule "forward_$access_zone" policy4 "ip saddr $access_cidr" "jump accept_to_$policy_zone"
+	live_rule "srcnat_$default_zone" default-nat "ip saddr $access_cidr" masquerade
+	live_rule "srcnat_$policy_zone" policy-nat "ip saddr $access_cidr" masquerade
+	live_rule "input_$access_zone" dns "ip saddr $access_cidr" 'dport 53' accept
+	live_rule "forward_$access_zone" ipv6 'meta nfproto ipv6' 'jump handle_reject'
+	live_rule "output_$access_zone" dhcp4 'udp sport 67' 'udp dport 68' drop
+	live_rule "output_$access_zone" dhcp6 'udp sport 547' 'udp dport 546' drop
+	live_rule "output_$access_zone" ra 'icmpv6 type nd-router-advert' drop
+	live_rule "output_$access_zone" redirects 'icmp type redirect' drop
+	if [ "$(get "network.$default_if.proto")" = dhcp ]; then live_rule "input_$default_zone" default_dhcp_client 'udp sport 67' 'udp dport 68' accept; fi
+	if [ "$(get "network.$policy.proto")" = dhcp ]; then live_rule "input_$policy_zone" policy_dhcp_client 'udp sport 67' 'udp dport 68' accept; fi
+	services=$(ubus call service list) || fail 'service runtime evidence unavailable'
+	for service in dnsmasq odhcpd dropbear; do
+		[ "$service" != odhcpd ] || [ -x "$RP_ROOT/etc/init.d/odhcpd" ] || continue
+		[ "$(field "$services" "@.$service.instances.*.running" | sort -u)" = true ] || fail "service not running or evidence missing: $service"
+	done
+	listener=$(netstat -lnptu) || fail 'DNS listener evidence unavailable'
+	printf '%s\n' "$listener" | awk -v ip="$access_ip:53" '$4==ip||$4=="0.0.0.0:53"||$4==":::53"{found=1}END{exit !found}' || fail 'no DNS listener on access IPv4'
+	printf '{"ok":true,"operation":"verify","management_address":"%s","ipv6_policy":"reject-new-forwarding-connections; preserve-existing-conntrack-and-management","ipv6_external_bypass":"requires-upstream-client-configuration","packet_evidence":"EVIDENCE_MISSING"}\n' "$access_ip"
+}
+
+operation=${1:-}; [ "$#" -gt 0 ] && shift
+case "$operation" in
+	discover) [ "$#" -eq 0 ] || fail 'discover takes no arguments'; discover ;;
+	plan) parse "$@"; conflicts; emit_plan; rp_err 'IPv6 policy: reject new forwarding connections through this router; preserve existing conntrack and management. Disable upstream RA/client IPv6 separately to prevent direct L2 bypass.' ;;
+	verify) parse "$@"; verify ;;
+	management-address)
+		parse "$@"
+		actual_ip=$(runtime "$access" '@["ipv4-address"][0].address')
+		[ "$actual_ip" = "$access_ip" ] || fail 'expected management address not active'
+		printf '%s\n' "$actual_ip"
+		;;
+	*) fail 'expected discover, plan, verify or management-address' ;;
+esac

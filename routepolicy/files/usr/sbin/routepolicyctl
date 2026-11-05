@@ -10,6 +10,9 @@ Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollb
        routepolicyctl import-legacy DIRECTORY [--json]
        routepolicyctl user-list {read|write} {domain-policy|domain-default|ipv4-policy|ipv4-default} [--json]
        routepolicyctl smartdns-{status|save|validate|apply|discard|read-local-hosts|write-local-hosts} [--json]
+       routepolicyctl init-{discover|status|recover} [--json]
+       routepolicyctl init-{preview|prepare} ACCESS DEFAULT POLICY NEW_ROLE NEW_DEVICE NEW_PROTO NEW_IP NEW_PREFIX NEW_GATEWAY MANAGEMENT_IP MANAGEMENT_PREFIX
+       routepolicyctl init-{apply|confirm} TOKEN
 EOF
 	exit 2
 }
@@ -19,6 +22,21 @@ command_name=$1
 shift
 
 case "$command_name" in
+	init-discover|init-status|init-recover)
+		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then shift; elif [ "$#" -ne 0 ]; then usage; fi
+		export ROUTEPOLICY_OUTPUT=json
+		exec "$LIBEXEC/init-transaction" "${command_name#init-}" "$@"
+		;;
+	init-preview|init-prepare)
+		[ "$#" -eq 11 ] || usage
+		export ROUTEPOLICY_OUTPUT=json
+		exec "$LIBEXEC/init-transaction" "${command_name#init-}" "$@"
+		;;
+	init-apply|init-confirm)
+		[ "$#" -eq 1 ] || usage
+		export ROUTEPOLICY_OUTPUT=json
+		exec "$LIBEXEC/init-transaction" "${command_name#init-}" "$@"
+		;;
 	validate|render|apply|reload|status|diagnose|update|rollback)
 		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then
 			export ROUTEPOLICY_OUTPUT=json
