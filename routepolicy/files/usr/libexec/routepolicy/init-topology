@@ -98,6 +98,73 @@ zone_name() {
 	name=$(get "firewall.$1.name"); ident "$name" || fail "invalid firewall zone name: $1"
 	printf '%s\n' "$name"
 }
+zone_devices() {
+	local section=$1 selected=$2 logical raw up device devices="$2"
+	[ -n "$section" ] || { printf '%s\n' "$selected"; return; }
+	for logical in $(get "firewall.$section.network"); do
+		ident "$logical" || fail 'zone device set: unsupported logical interface'
+		raw=$(rp_interface_json "$logical") || fail "zone device set: missing netifd evidence for $logical"
+		up=$(field "$raw" '@.up')
+		case "$up" in false) continue ;; true) ;; *) fail 'zone device set: missing interface state' ;; esac
+		device=$(field "$raw" '@.l3_device')
+		rp_is_device "$device" || fail 'zone device set: unsupported runtime device'
+		devices="$devices $device"
+	done
+	for device in $(get "firewall.$section.device"); do
+		rp_is_device "$device" || fail 'zone device set: only literal configured devices are supported'
+		devices="$devices $device"
+	done
+	printf '%s\n' "$devices" | tr ' ' '\n' | LC_ALL=C sort -u | tr '\n' ' '
+}
+normalize_zone_sets() {
+	local snapshot=$1 defaults policies device
+	defaults=$(zone_devices "$default_zone_section" "$default_device")
+	policies=$(zone_devices "$policy_zone_section" "$policy_device")
+	for device in $defaults; do
+		case " $policies " in *" $device "*) fail 'zone device set: selected egress zones share a device' ;; esac
+		[ "$device" != "$access_device" ] || [ "$default_zone" = "$access_zone" ] || fail 'zone device set: default zone includes access device'
+		[ "$default_zone" != "$access_zone" ] || [ "$device" = "$access_device" ] || fail 'zone device set: access zone includes an unrelated device'
+	done
+	case " $policies " in *" $access_device "*) fail 'zone device set: policy zone includes access device' ;; esac
+	# Only the standard fw4 device selector at the start of a rule is folded.
+	# Exact known membership makes this equivalent for the two selected paths;
+	# arbitrary sets and later predicates remain subject to the existing guards.
+	printf '%s\n' "$snapshot" | awk -v defaults="$defaults" -v policies="$policies" -v default_dev="$default_device" -v policy_dev="$policy_device" -v dz="$default_zone" -v pz="$policy_zone" '
+		function trim(s){sub(/^[[:space:]]+/,"",s);sub(/[[:space:]]+$/,"",s);return s}
+		function same(body,known, n,a,k,m,seen,items) {
+			n=split(body,a,",");m=split(trim(known),items," ")
+			if(n!=m)return 0
+			for(k=1;k<=n;k++) {
+				a[k]=trim(a[k]);if(a[k]!~/^"[A-Za-z0-9_.:@-]+"$/)return 0
+				a[k]=substr(a[k],2,length(a[k])-2)
+				if(seen[a[k]]++||index(" " trim(known) " "," " a[k] " ")==0)return 0
+			}
+			return 1
+		}
+		{
+			if($1=="chain"&&$3=="{")chain=$2
+			if($1=="}")chain=""
+			line=trim($0);prefix=""
+			md=0;mp=0
+			if(match(line,/^meta nfproto (2|10|ipv4|ipv6) /)){prefix=substr(line,1,RLENGTH);line=substr(line,RLENGTH+1)}
+			if(match(line,/^(iifname|oifname) [[:space:]]*\{/)) {
+				selector=substr(line,1,index(line," ")-1);tail=substr(line,RLENGTH+1);end=index(tail,"}")
+				if(end) {
+					body=substr(tail,1,end-1);replacement=""
+					if(same(body,defaults)){replacement=default_dev;md=1}
+					else if(same(body,policies)){replacement=policy_dev;mp=1}
+					if(replacement!=""){$0=prefix selector " \"" replacement "\"" substr(tail,end+1)}
+				}
+			} else if(match(line,/^(iifname|oifname) "[A-Za-z0-9_.:@-]+" /)) {
+				split(line,a,"\"");md=(a[2]==trim(defaults));mp=(a[2]==trim(policies))
+			}
+			# Native helper/dispatch membership must be complete, not merely a
+			# scalar subset that happens to cover the selected current egress.
+			if((chain=="accept_to_" dz&&index(line," comment \"!fw4: accept " dz " IPv4/IPv6 traffic\"")||chain=="srcnat"&&index(line," comment \"!fw4: Handle " dz " IPv4/IPv6 srcnat traffic\""))&&!md)bad=1
+			if((chain=="accept_to_" pz&&index(line," comment \"!fw4: accept " pz " IPv4/IPv6 traffic\"")||chain=="srcnat"&&index(line," comment \"!fw4: Handle " pz " IPv4/IPv6 srcnat traffic\""))&&!mp)bad=1
+			print
+		} END{exit bad}' || fail 'zone device set: native fw4 selector does not match the selected zone members'
+}
 probe_address() {
 	local candidate=$1 device=$2 existing
 	existing=$(ip -4 -o addr show) || fail 'cannot inspect local IPv4 addresses'
@@ -818,6 +885,7 @@ verify() {
 	[ "$(cat "$RP_ROOT/proc/sys/net/ipv4/ip_forward")" = 1 ] || fail 'IPv4 forwarding is disabled'
 	fw4 check >/dev/null 2>&1 || fail 'fw4 validation failed'
 	nft_snapshot=$(nft -n list table inet fw4) || fail 'running fw4 table unavailable'
+	nft_snapshot=$(normalize_zone_sets "$nft_snapshot")
 	ipv4_forward_guard verify "$nft_snapshot"
 	ipv6_forward_guard verify "$nft_snapshot"
 	for setting in input forward output; do
@@ -858,6 +926,7 @@ case "$operation" in
 	plan)
 		parse "$@"; conflicts; default_route_guard plan
 		nft_snapshot=$(nft -n list table inet fw4) || fail 'IPv6 control flow: running fw4 table unavailable'
+		nft_snapshot=$(normalize_zone_sets "$nft_snapshot")
 		ipv4_forward_guard plan "$nft_snapshot"
 		ipv6_forward_guard plan "$nft_snapshot"
 		emit_plan

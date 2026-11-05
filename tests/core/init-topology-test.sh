@@ -22,6 +22,7 @@ cat >"$tmp/bin/ubus" <<'EOF'
 case "$*" in
 	'call network.interface.lan status') echo lan ;;
 	'call network.interface.wan status') echo wan ;;
+	'call network.interface.wan6 status') echo wan ;;
 	'call network.interface.policy status') echo policy ;;
 	'call network.interface.rp_init_policy status') echo new_policy ;;
 	'call network.interface.rp_init_default status') echo new_policy ;;
@@ -260,6 +261,11 @@ insert_rule_pair() {
 	TEST_CHAIN="$1" TEST_FIRST="$2" TEST_SECOND="$3" \
 		awk '$1=="chain"&&$2==ENVIRON["TEST_CHAIN"]{print;print ENVIRON["TEST_FIRST"];print ENVIRON["TEST_SECOND"];next}{print}' "$tmp/nft" >"$4"
 }
+multidevice_config() {
+	printf 'firewall.@zone[1].network\twan wan6\nfirewall.@zone[1].device\teth4\nfirewall.@zone[2].device\teth5\n' >>"$tmp/config"
+	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
+	mv "$tmp/config.new" "$tmp/config"
+}
 baseline
 cp "$tmp/config" "$tmp/before"
 "$tool" discover >"$tmp/discover"
@@ -268,6 +274,24 @@ grep -Fq '"devices":{"eth3"' "$tmp/discover"
 grep -Fq 'existing conntrack sessions are not forcibly cut off' "$tmp/discover"
 "$tool" plan lan wan policy >"$tmp/plan"
 cmp "$tmp/config" "$tmp/before"
+# Standard fw4 zone device sets: shared wan/wan6 is deduplicated, and
+# both selected zones retain exact literal membership in helper/dispatch rules.
+awk '{gsub(/oifname "eth1"/,"oifname { \"eth4\", \"eth1\" }");gsub(/iifname "eth1"/,"iifname { \"eth1\", \"eth4\" }");gsub(/oifname "eth2"/,"oifname { \"eth2\", \"eth5\" }");print;
+	if($1=="chain"&&$2=="accept_to_wan")print "meta nfproto 2 oifname { \"eth1\", \"eth4\" } ct state 0x1 counter packets 0 bytes 0 drop comment \"!fw4: Prevent NAT leakage\"";
+	if($1=="chain"&&$2=="forward")print "iifname { \"eth4\", \"eth1\" } jump forward_wan comment \"!fw4: Handle wan IPv4/IPv6 forward traffic\""
+}' "$tmp/nft" >"$tmp/multidevice.nft"
+sed 's/"eth4"/"eth9"/g' "$tmp/multidevice.nft" >"$tmp/multidevice-extra.nft"
+sed 's/{ "eth4", "eth1" }/"eth1"/g;s/{ "eth1", "eth4" }/"eth1"/g' "$tmp/multidevice.nft" >"$tmp/multidevice-missing.nft"
+sed 's/{ "eth4", "eth1" }/{ "eth1", "eth1" }/g;s/{ "eth1", "eth4" }/{ "eth1", "eth1" }/g' "$tmp/multidevice.nft" >"$tmp/multidevice-duplicate.nft"
+sed 's/{ "eth4", "eth1" }/@unknown/g;s/{ "eth1", "eth4" }/@unknown/g' "$tmp/multidevice.nft" >"$tmp/multidevice-unknown.nft"
+multidevice_config
+TEST_NFT_FILE="$tmp/multidevice.nft" "$tool" plan lan wan policy >"$tmp/multidevice-plan"
+cmp "$tmp/plan" "$tmp/multidevice-plan"
+for invalid in extra missing duplicate unknown; do reject env TEST_NFT_FILE="$tmp/multidevice-$invalid.nft" "$tool" plan lan wan policy; done
+printf 'firewall.@zone[1].device\teth2\n' >>"$tmp/config"
+reject env TEST_NFT_FILE="$tmp/multidevice.nft" "$tool" plan lan wan policy
+grep -Fq 'share a device' "$tmp/error"
+baseline
 awk '/chain forward_lan \{/{print;print "meta nfproto 2 counter packets 0 bytes 0 drop comment \"!fw4: existing IPv4 deny-all\"";next}{print}' "$tmp/nft" >"$tmp/early-ipv4-drop.nft"
 reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" plan lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
@@ -552,6 +576,11 @@ apply_mock_plan "$tmp/plan"
 "$tool" verify lan wan policy >"$tmp/verify"
 grep -Fq '"packet_evidence":"EVIDENCE_MISSING"' "$tmp/verify"
 grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
+multidevice_config
+TEST_NFT_FILE="$tmp/multidevice.nft" "$tool" verify lan wan policy >"$tmp/verify-multidevice"
+for invalid in extra missing duplicate unknown; do reject env TEST_NFT_FILE="$tmp/multidevice-$invalid.nft" "$tool" verify lan wan policy; done
+baseline
+apply_mock_plan "$tmp/plan"
 for blocked in "$tmp"/coverage-bad-*.nft; do
 	reject env TEST_NFT_FILE="$blocked" "$tool" verify lan wan policy
 	grep -Fq 'IPv4 forwarding' "$tmp/error"
