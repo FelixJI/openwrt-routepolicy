@@ -337,15 +337,44 @@ emit_plan() {
 }
 
 live_rule() {
-	local chain=$1 suffix=$2 line token
+	local chain=$1 comment=$2
 	shift 2
-	line=$(nft -n list chain inet fw4 "$chain") || fail "running fw4 chain unavailable: $chain"
-	line=$(printf '%s\n' "$line" | grep -F "routepolicy-init-$suffix\"") || fail "missing running fw4 rule: $suffix"
-	for token in "$@"; do printf '%s\n' "$line" | grep -Fq "$token" || fail "running fw4 rule differs from candidate: $suffix ($token)"; done
+	printf '%s\n' "$nft_snapshot" | awk -v wanted_chain="$chain" -v comment="$comment" -v wanted="$(printf '%s\n' "$@")" '
+		function normalized(s) {
+			gsub(/counter packets [0-9]+ bytes [0-9]+/, "counter", s)
+			gsub(/meta nfproto ipv4/, "meta nfproto 2", s)
+			gsub(/meta nfproto ipv6/, "meta nfproto 10", s)
+			gsub(/icmpv6 type nd-router-advert/, "icmpv6 type 134", s)
+			gsub(/icmp type redirect/, "icmp type 5", s)
+			gsub(/[[:space:]]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s)
+			return s
+		}
+		BEGIN { n=split(wanted, expected, "\n"); marker="comment \"" comment "\"" }
+		$1=="chain" && $3=="{" { chain=$2; next }
+		$1=="}" { chain=""; next }
+		chain==wanted_chain && $1=="type" && $3=="hook" {
+			if($2=="filter" && $4==wanted_chain) hook=1
+			if(wanted_chain=="srcnat" && $2=="nat" && $4=="postrouting") hook=1
+		}
+		{
+			line=$0; sub(/[[:space:]]+$/, "", line)
+			if (substr(line, length(line)-length(marker)+1) != marker) next
+			if (chain != wanted_chain) { bad=1; next }
+			line=normalized(substr(line, 1, length(line)-length(marker)))
+			found=0
+			for (i=1;i<=n;i++) if (line==normalized(expected[i])) { count[i]++; found=1 }
+			if (!found) bad=1
+		}
+		END {
+			if((wanted_chain=="input"||wanted_chain=="forward"||wanted_chain=="output"||wanted_chain=="srcnat")&&!hook)bad=1
+			for(i=1;i<=n;i++) if(count[i]!=1)bad=1
+			exit bad
+		}
+	' || fail "running fw4 rule differs from candidate: $comment (chain/family/matches/action/count)"
 }
 
 verify() {
-	local section service services listener setting action key expected
+	local section service services listener setting action key expected nft_snapshot
 	emit_plan | while IFS="$(printf '\t')" read -r action key expected; do
 		[ "$action" = set ] && [ "$(get "$key")" = "$expected" ] || fail "configuration differs from candidate: $key"
 	done
@@ -357,18 +386,26 @@ verify() {
 	check_rp_filter "$access_device" "$default_device" "$policy_device"
 	[ "$(cat "$RP_ROOT/proc/sys/net/ipv4/ip_forward")" = 1 ] || fail 'IPv4 forwarding is disabled'
 	fw4 check >/dev/null 2>&1 || fail 'fw4 validation failed'
-	live_rule "forward_$access_zone" default4 "ip saddr $access_cidr" "jump accept_to_$default_zone"
-	live_rule "forward_$access_zone" policy4 "ip saddr $access_cidr" "jump accept_to_$policy_zone"
-	live_rule "srcnat_$default_zone" default-nat "ip saddr $access_cidr" masquerade
-	live_rule "srcnat_$policy_zone" policy-nat "ip saddr $access_cidr" masquerade
-	live_rule "input_$access_zone" dns "ip saddr $access_cidr" 'dport 53' accept
-	live_rule "forward_$access_zone" ipv6 'meta nfproto ipv6' 'jump handle_reject'
-	live_rule "output_$access_zone" dhcp4 'udp sport 67' 'udp dport 68' drop
-	live_rule "output_$access_zone" dhcp6 'udp sport 547' 'udp dport 546' drop
-	live_rule "output_$access_zone" ra 'icmpv6 type nd-router-advert' drop
-	live_rule "output_$access_zone" redirects 'icmp type redirect' drop
-	if [ "$(get "network.$default_if.proto")" = dhcp ]; then live_rule "input_$default_zone" default_dhcp_client 'udp sport 67' 'udp dport 68' accept; fi
-	if [ "$(get "network.$policy.proto")" = dhcp ]; then live_rule "input_$policy_zone" policy_dhcp_client 'udp sport 67' 'udp dport 68' accept; fi
+	nft_snapshot=$(nft -n list table inet fw4) || fail 'running fw4 table unavailable'
+	for setting in input forward output; do
+		[ "$setting" = output ] && action=oifname || action=iifname
+		live_rule "$setting" "!fw4: Handle $access_zone IPv4/IPv6 $setting traffic" "$action \"$access_device\" jump ${setting}_$access_zone"
+	done
+	live_rule "forward_$access_zone" '!fw4: routepolicy-init-default4' "ip saddr $access_cidr counter jump accept_to_$default_zone"
+	live_rule "forward_$access_zone" '!fw4: routepolicy-init-policy4' "ip saddr $access_cidr counter jump accept_to_$policy_zone"
+	live_rule "srcnat_$default_zone" '!fw4: routepolicy-init-default-nat' "ip saddr $access_cidr counter masquerade"
+	live_rule "srcnat_$policy_zone" '!fw4: routepolicy-init-policy-nat' "ip saddr $access_cidr counter masquerade"
+	live_rule srcnat "!fw4: Handle $default_zone IPv4/IPv6 srcnat traffic" "oifname \"$default_device\" jump srcnat_$default_zone"
+	live_rule srcnat "!fw4: Handle $policy_zone IPv4/IPv6 srcnat traffic" "oifname \"$policy_device\" jump srcnat_$policy_zone"
+	live_rule "input_$access_zone" '!fw4: routepolicy-init-dns' "ip saddr $access_cidr tcp dport 53 counter accept" "ip saddr $access_cidr udp dport 53 counter accept"
+	live_rule "forward_$access_zone" '!fw4: routepolicy-init-ipv6' 'meta nfproto 10 counter jump handle_reject'
+	live_rule "output_$access_zone" '!fw4: routepolicy-init-dhcp4' "meta nfproto 2 udp sport 67 udp dport 68 counter jump drop_to_$access_zone"
+	live_rule "output_$access_zone" '!fw4: routepolicy-init-dhcp6' "meta nfproto 10 udp sport 547 udp dport 546 counter jump drop_to_$access_zone"
+	live_rule "output_$access_zone" '!fw4: routepolicy-init-ra' "icmpv6 type 134 counter jump drop_to_$access_zone"
+	live_rule "output_$access_zone" '!fw4: routepolicy-init-redirects' "icmp type 5 counter jump drop_to_$access_zone"
+	live_rule "drop_to_$access_zone" "!fw4: drop $access_zone IPv4/IPv6 traffic" "oifname \"$access_device\" counter drop"
+	if [ "$(get "network.$default_if.proto")" = dhcp ]; then live_rule "input_$default_zone" '!fw4: routepolicy-init-default_dhcp_client' 'meta nfproto 2 udp sport 67 udp dport 68 counter accept'; fi
+	if [ "$(get "network.$policy.proto")" = dhcp ]; then live_rule "input_$policy_zone" '!fw4: routepolicy-init-policy_dhcp_client' 'meta nfproto 2 udp sport 67 udp dport 68 counter accept'; fi
 	services=$(ubus call service list) || fail 'service runtime evidence unavailable'
 	for service in dnsmasq odhcpd dropbear; do
 		[ "$service" != odhcpd ] || [ -x "$RP_ROOT/etc/init.d/odhcpd" ] || continue

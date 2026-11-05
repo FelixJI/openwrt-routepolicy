@@ -71,22 +71,9 @@ cat >"$tmp/bin/nft" <<'EOF'
 #!/bin/sh
 case "$*" in
 	'list ruleset') [ "${TEST_NFT_MARK:-0}" = 0 ] || echo 'meta mark set 0x100' ;;
-	'-n list chain inet fw4 '*)
+	'-n list table inet fw4')
 		[ "${TEST_MISSING_RULE:-0}" = 0 ] || exit 1
-		cat <<'RULES'
-ip saddr 192.168.1.0/24 jump accept_to_wan comment "routepolicy-init-default4"
-ip saddr 192.168.1.0/24 jump accept_to_policy comment "routepolicy-init-policy4"
-ip saddr 192.168.1.0/24 masquerade comment "routepolicy-init-default-nat"
-ip saddr 192.168.1.0/24 masquerade comment "routepolicy-init-policy-nat"
-ip saddr 192.168.1.0/24 udp dport 53 accept comment "routepolicy-init-dns"
-meta nfproto ipv6 jump handle_reject comment "routepolicy-init-ipv6"
-udp sport 67 udp dport 68 drop comment "routepolicy-init-dhcp4"
-udp sport 547 udp dport 546 drop comment "routepolicy-init-dhcp6"
-icmpv6 type nd-router-advert drop comment "routepolicy-init-ra"
-icmp type redirect drop comment "routepolicy-init-redirects"
-udp sport 67 udp dport 68 accept comment "routepolicy-init-default_dhcp_client"
-udp sport 67 udp dport 68 accept comment "routepolicy-init-policy_dhcp_client"
-RULES
+		cat "${TEST_NFT_FILE:-$TEST_TOPOLOGY_DIR/nft}"
 		;;
 	*) printf 'unexpected nft write: %s\n' "$*" >>"$TEST_TOPOLOGY_DIR/writes"; exit 1 ;;
 esac
@@ -145,6 +132,58 @@ EOF
 	echo 1 >"$tmp/root/proc/sys/net/ipv4/ip_forward"
 	echo 5 >"$tmp/root/sys/class/net/eth3/ifindex"
 	echo 5 >"$tmp/root/sys/class/net/eth3/iflink"
+	# Numeric families, ICMP types and drop jumps mirror OpenWrt 25.12 / nft 1.1.6.
+	cat >"$tmp/nft" <<'RULES'
+table inet fw4 {
+	chain input {
+		type filter hook input priority 0; policy drop;
+		iifname "br-lan" jump input_lan comment "!fw4: Handle lan IPv4/IPv6 input traffic"
+	}
+	chain forward {
+		type filter hook forward priority 0; policy drop;
+		iifname "br-lan" jump forward_lan comment "!fw4: Handle lan IPv4/IPv6 forward traffic"
+	}
+	chain output {
+		type filter hook output priority 0; policy accept;
+		oifname "br-lan" jump output_lan comment "!fw4: Handle lan IPv4/IPv6 output traffic"
+	}
+	chain forward_lan {
+		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 jump accept_to_wan comment "!fw4: routepolicy-init-default4"
+		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 jump accept_to_policy comment "!fw4: routepolicy-init-policy4"
+		meta nfproto 10 counter packets 0 bytes 0 jump handle_reject comment "!fw4: routepolicy-init-ipv6"
+	}
+	chain srcnat_wan {
+		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 masquerade comment "!fw4: routepolicy-init-default-nat"
+	}
+	chain srcnat_policy {
+		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 masquerade comment "!fw4: routepolicy-init-policy-nat"
+	}
+	chain srcnat {
+		type nat hook postrouting priority 100; policy accept;
+		oifname "eth1" jump srcnat_wan comment "!fw4: Handle wan IPv4/IPv6 srcnat traffic"
+		oifname "eth2" jump srcnat_policy comment "!fw4: Handle policy IPv4/IPv6 srcnat traffic"
+	}
+	chain input_lan {
+		ip saddr 192.168.1.0/24 tcp dport 53 counter packets 0 bytes 0 accept comment "!fw4: routepolicy-init-dns"
+		ip saddr 192.168.1.0/24 udp dport 53 counter packets 0 bytes 0 accept comment "!fw4: routepolicy-init-dns"
+	}
+	chain output_lan {
+		meta nfproto 2 udp sport 67 udp dport 68 counter packets 0 bytes 0 jump drop_to_lan comment "!fw4: routepolicy-init-dhcp4"
+		meta nfproto 10 udp sport 547 udp dport 546 counter packets 0 bytes 0 jump drop_to_lan comment "!fw4: routepolicy-init-dhcp6"
+		icmpv6 type 134 counter packets 1 bytes 104 jump drop_to_lan comment "!fw4: routepolicy-init-ra"
+		icmp type 5 counter packets 0 bytes 0 jump drop_to_lan comment "!fw4: routepolicy-init-redirects"
+	}
+	chain drop_to_lan {
+		oifname "br-lan" counter packets 1 bytes 104 drop comment "!fw4: drop lan IPv4/IPv6 traffic"
+	}
+	chain input_wan {
+		meta nfproto 2 udp sport 67 udp dport 68 counter packets 0 bytes 0 accept comment "!fw4: routepolicy-init-default_dhcp_client"
+	}
+	chain input_policy {
+		meta nfproto 2 udp sport 67 udp dport 68 counter packets 0 bytes 0 accept comment "!fw4: routepolicy-init-policy_dhcp_client"
+	}
+}
+RULES
 }
 reject() {
 	if "$@" >"$tmp/rejected" 2>"$tmp/error"; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi
@@ -233,6 +272,34 @@ mv "$tmp/config.new" "$tmp/config"
 "$tool" verify lan wan policy >"$tmp/verify"
 grep -Fq '"packet_evidence":"EVIDENCE_MISSING"' "$tmp/verify"
 grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
+sed -e 's/meta nfproto 2 /meta nfproto ipv4 /g' -e 's/meta nfproto 10 /meta nfproto ipv6 /g' \
+	-e 's/icmpv6 type 134 /icmpv6 type nd-router-advert /g' -e 's/icmp type 5 /icmp type redirect /g' "$tmp/nft" >"$tmp/symbolic.nft"
+TEST_NFT_FILE="$tmp/symbolic.nft" "$tool" verify lan wan policy >"$tmp/verify-symbolic"
+sed 's/meta nfproto 10 counter/meta nfproto 2 counter/' "$tmp/nft" >"$tmp/wrong-family.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-family.nft" "$tool" verify lan wan policy
+sed 's/chain forward_lan {/chain wrong_direction {/' "$tmp/nft" >"$tmp/wrong-chain.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-chain.nft" "$tool" verify lan wan policy
+sed 's/hook forward /hook output /' "$tmp/nft" >"$tmp/wrong-hook.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-hook.nft" "$tool" verify lan wan policy
+sed 's/oifname "eth2" jump srcnat_policy/oifname "eth9" jump srcnat_policy/' "$tmp/nft" >"$tmp/wrong-egress.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-egress.nft" "$tool" verify lan wan policy
+sed 's/counter packets 1 bytes 104 drop /counter packets 1 bytes 104 accept /' "$tmp/nft" >"$tmp/wrong-action.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-action.nft" "$tool" verify lan wan policy
+sed 's/ip saddr 192.168.1.0\/24 counter/ip saddr 192.168.2.0\/24 counter/' "$tmp/nft" >"$tmp/wrong-source.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-source.nft" "$tool" verify lan wan policy
+grep -v 'tcp dport 53' "$tmp/nft" >"$tmp/missing-tcp.nft"
+reject env TEST_NFT_FILE="$tmp/missing-tcp.nft" "$tool" verify lan wan policy
+awk '{print} /routepolicy-init-ipv6"/{print}' "$tmp/nft" >"$tmp/duplicate.nft"
+reject env TEST_NFT_FILE="$tmp/duplicate.nft" "$tool" verify lan wan policy
+awk '
+	/routepolicy-init-ipv6"/ {
+		print "meta nfproto 10 counter accept comment \"!fw4: routepolicy-init-ipv6\""
+		print "meta nfproto 2 counter jump handle_reject comment \"!fw4: routepolicy-init-ipv6\""
+		next
+	}
+	{print}
+' "$tmp/nft" >"$tmp/split-rules.nft"
+reject env TEST_NFT_FILE="$tmp/split-rules.nft" "$tool" verify lan wan policy
 [ "$("$tool" management-address lan wan policy)" = 192.168.1.1 ]
 echo 1 >"$tmp/root/proc/sys/net/ipv4/conf/all/rp_filter"
 reject "$tool" verify lan wan policy
