@@ -245,7 +245,11 @@ else
 			rp_output_error apply "无法在完整事务前保存动态集合 live snapshot: $(tr '\n' ';' <"$work/live-save.log")"
 			exit 1
 		fi
-		{ printf 'delete table inet routepolicy\n'; cat "$RP_NFT_FILE"; } >"$work/nft.full"
+		# A warm DNS cache hit may not reinsert an IP. Restore captured members in the table replacement itself.
+		{ printf 'delete table inet routepolicy\n' && cat "$RP_NFT_FILE" "$live_snapshot"; } >"$work/nft.full" || {
+			rp_output_error apply '无法构建包含动态集合的 nft 事务'
+			exit 1
+		}
 		candidate="$work/nft.full"
 	else
 		: >"$work/nft.previous.absent"
@@ -316,15 +320,10 @@ if ! nft -f "$candidate" >"$work/nft-apply.log" 2>&1; then
 	failed="nft 原子事务失败: $(tr '\n' ';' <"$work/nft-apply.log")"
 fi
 
-if [ -z "$failed" ] && [ "$incremental" -eq 0 ]; then
-	if [ -n "$live_snapshot" ]; then
-		if ! "$LIBEXEC/warm-state" live-restore "$live_snapshot" >"$work/live-restore.log" 2>&1; then
-			failed="动态集合 live snapshot 恢复失败: $(tr '\n' ';' <"$work/live-restore.log")"
-		fi
-	elif [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
-		if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
-			printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
-		fi
+if [ -z "$failed" ] && [ "$incremental" -eq 0 ] && [ -z "$live_snapshot" ] && \
+	[ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
+	if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
+		printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
 	fi
 fi
 

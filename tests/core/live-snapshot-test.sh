@@ -80,16 +80,20 @@ TABLE
 	'list set inet routepolicy static_policy4'|'list set inet routepolicy static_default4'|\
 	'list chain inet routepolicy prerouting'|'list chain inet routepolicy classify') exit 0 ;;
 	'list chain inet routepolicy output') exit 1 ;;
-	'-c -f '*) exit 0 ;;
+	'-c -f '*)
+		[ -z "${TEST_NFT_CHECK:-}" ] || cp "$3" "$TEST_NFT_CHECK"
+		exit 0
+		;;
 	'-f '*)
-		if grep -Fq 'add element inet routepolicy domain_policy4' "$2"; then
-			printf '%s\n' LIVE_RESTORE >>"$TEST_NFT_LOG"
+		if grep -Fq 'add element inet routepolicy domain_policy4' "$2" && grep -Fq 'chain output {' "$2"; then
+			printf '%s\n' ATOMIC_APPLY >>"$TEST_NFT_LOG"
+			[ -z "${TEST_NFT_ATOMIC:-}" ] || cp "$2" "$TEST_NFT_ATOMIC"
 			[ "${TEST_LIVE_RESTORE_FAIL:-0}" != 1 ]
 		elif grep -Fq 'legacy-snapshot' "$2"; then
 			printf '%s\n' ROLLBACK_OLD_TABLE >>"$TEST_NFT_LOG"
 			exit 0
 		elif grep -Fq 'chain output {' "$2"; then
-			printf '%s\n' FULL_APPLY >>"$TEST_NFT_LOG"
+			printf '%s\n' EMPTY_TABLE_REBUILD >>"$TEST_NFT_LOG"
 			exit 0
 		else
 			exit 0
@@ -101,16 +105,61 @@ esac
 EOF
 chmod +x "$tmp/bin/nft"
 
-: >"$tmp/nft.log"
-if TEST_LIVE_RESTORE_FAIL=1 TEST_NFT_LOG="$tmp/nft.log" PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" \
-	ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+# Successful full apply: the captured dynamic members must be validated and
+# committed inside the very nft batch that rebuilds the table (SmartDNS never
+# rewrites entries for a cleared set, so a member-less rebuild would leave
+# snapshot policy IPs on the default route until a separate restore landed).
+: >"$tmp/nft.log"; rm -f "$tmp/nft.check" "$tmp/nft.atomic"
+if TEST_NFT_LOG="$tmp/nft.log" TEST_NFT_CHECK="$tmp/nft.check" TEST_NFT_ATOMIC="$tmp/nft.atomic" \
+	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
+	ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
 	"$ROOT/routepolicy/files/usr/libexec/routepolicy/apply" >/dev/null 2>&1; then
-	printf 'full apply ignored a live snapshot restore failure\n' >&2; exit 1
+	:
+else
+	printf 'full apply with a live snapshot failed\n' >&2; exit 1
 fi
-grep -Fxq FULL_APPLY "$tmp/nft.log" || { printf 'legacy topology did not use a full nft transaction\n' >&2; exit 1; }
-grep -Fxq LIVE_RESTORE "$tmp/nft.log" || { printf 'full nft transaction did not restore its live snapshot\n' >&2; exit 1; }
-grep -Fxq ROLLBACK_OLD_TABLE "$tmp/nft.log" || { printf 'live restore failure did not roll back the old nft table\n' >&2; exit 1; }
-[ ! -e "$tmp/etc/routepolicy/state/applied" ] || { printf 'failed live restore published applied state\n' >&2; exit 1; }
+grep -Fxq ATOMIC_APPLY "$tmp/nft.log" || { printf 'full transaction did not commit one merged nft batch\n' >&2; exit 1; }
+if grep -Fxq EMPTY_TABLE_REBUILD "$tmp/nft.log"; then
+	printf 'full transaction rebuilt the policy table without its dynamic members\n' >&2; exit 1
+fi
+if grep -Fxq ROLLBACK_OLD_TABLE "$tmp/nft.log"; then
+	printf 'successful full apply rolled the old table back\n' >&2; exit 1
+fi
+[ "$(grep -c -- '^-f ' "$tmp/nft.log")" -eq 1 ] || {
+	printf 'full apply used %s commit batches instead of one\n' "$(grep -c -- '^-f ' "$tmp/nft.log")" >&2; exit 1
+}
+[ "$(grep -c -- '^-c -f ' "$tmp/nft.log")" -eq 1 ] || {
+	printf 'full apply validated %s batches instead of one\n' "$(grep -c -- '^-c -f ' "$tmp/nft.log")" >&2; exit 1
+}
+grep -Fq 'add element inet routepolicy domain_policy4 { 1.1.1.1 timeout 42m30s }' "$tmp/nft.atomic" || {
+	printf 'merged batch omitted the policy member with its remaining TTL\n' >&2; exit 1
+}
+grep -Fq 'add element inet routepolicy domain_default4 { 9.9.9.9 timeout 995ms }' "$tmp/nft.atomic" || {
+	printf 'merged batch omitted the default member with its remaining TTL\n' >&2; exit 1
+}
+cmp -s "$tmp/nft.check" "$tmp/nft.atomic" || { printf 'validated batch differed from the committed batch\n' >&2; exit 1; }
+[ -e "$tmp/etc/routepolicy/state/applied" ] || { printf 'successful full apply published no state\n' >&2; exit 1; }
+
+# Failure regression: a kernel rejection of the merged batch must fail the
+# apply and restore the previous table, never leave a member-less rebuild.
+rm -f "$tmp/etc/routepolicy/state/applied"
+: >"$tmp/nft.log"; rm -f "$tmp/nft.check" "$tmp/nft.atomic"
+if TEST_LIVE_RESTORE_FAIL=1 TEST_NFT_LOG="$tmp/nft.log" TEST_NFT_CHECK="$tmp/nft.check" TEST_NFT_ATOMIC="$tmp/nft.atomic" \
+	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
+	ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/apply" >/dev/null 2>&1; then
+	printf 'full apply ignored the rejected atomic snapshot batch\n' >&2; exit 1
+fi
+grep -Fxq ATOMIC_APPLY "$tmp/nft.log" || { printf 'legacy topology did not attempt the merged nft batch\n' >&2; exit 1; }
+if grep -Fxq EMPTY_TABLE_REBUILD "$tmp/nft.log"; then
+	printf 'rejected apply still committed a member-less table rebuild\n' >&2; exit 1
+fi
+grep -Fxq ROLLBACK_OLD_TABLE "$tmp/nft.log" || { printf 'atomic batch failure did not roll back the old nft table\n' >&2; exit 1; }
+[ "$(grep -c -- '^-f ' "$tmp/nft.log")" -eq 2 ] || {
+	printf 'expected the rejected merged batch plus rollback only, got %s commits\n' "$(grep -c -- '^-f ' "$tmp/nft.log")" >&2; exit 1
+}
+cmp -s "$tmp/nft.check" "$tmp/nft.atomic" || { printf 'validated batch differed from the committed batch\n' >&2; exit 1; }
+[ ! -e "$tmp/etc/routepolicy/state/applied" ] || { printf 'failed atomic apply published applied state\n' >&2; exit 1; }
 
 : >"$tmp/nft.log"
 if TEST_LIVE_SAVE_FAIL=1 TEST_NFT_LOG="$tmp/nft.log" PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" \
@@ -118,7 +167,7 @@ if TEST_LIVE_SAVE_FAIL=1 TEST_NFT_LOG="$tmp/nft.log" PATH="$tmp/bin:$ROOT/tests/
 	"$ROOT/routepolicy/files/usr/libexec/routepolicy/apply" >/dev/null 2>&1; then
 	printf 'full apply ignored a live snapshot collection failure\n' >&2; exit 1
 fi
-if grep -Fxq FULL_APPLY "$tmp/nft.log"; then
+if grep -Fxq ATOMIC_APPLY "$tmp/nft.log"; then
 	printf 'full apply replaced the old table after live snapshot collection failed\n' >&2; exit 1
 fi
 printf 'live snapshot tests: passed\n'
