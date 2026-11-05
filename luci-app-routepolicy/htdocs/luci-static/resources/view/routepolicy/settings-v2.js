@@ -27,6 +27,7 @@ return view.extend({
 
 	render: function() {
 		let m = new form.Map('routepolicy', _('基础设置'), _('“保存”只把修改加入 LuCI 变更队列，不会改变当前网络；“保存并应用”会提交 UCI，并由服务触发器同步运行态。'));
+		m.description += ' ' + _('如果正在初始化旁路由，请等到确认成功或回滚完成后再在这里保存。期间从其他页面、SSH 或自动脚本修改同一项，可能覆盖刚保存的值。');
 		let s = m.section(form.NamedSection, 'main', 'main', _('策略控制面'));
 		s.addremove = false;
 

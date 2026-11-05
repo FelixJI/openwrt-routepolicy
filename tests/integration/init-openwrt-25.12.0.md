@@ -108,7 +108,7 @@ ubus call network.interface.policy renew  # 新卡换 rp_init_policy；默认出
 
 复现要点：管理变更用 `prepare lan wan policy - - - - - - 192.168.1.2 24`；只在apply返回且status真pending后加上述外部delta/zone变更。`uci get /etc/config/PACKAGE.SECTION.KEY`观察落盘，普通get观察pending；用 `cmp` 对照默认delta/changes原字节。所有confirm由client新建真实SSH执行，没有伪造连接信息。原始诊断与完整包文本仅保存在实验目录 `/tmp/routepolicy-lab-17`（`dut.commands.log`、`review-incremental-673.txt`、`review-startup-retry-673.txt`），不提交磁盘/整套控制代码。
 
-未完成门禁：外部进程在基线重验与受管字段提交之间修改同一key的原子CAS合同仍为 **BLOCKED**；本轮不宣称此窗口已解决或验证通过。alias无关字段合并和默认pending保持不能证明该原子合同。未因此扩充到真实网络/设备热插拔。
+已知并发限制：外部进程在最后一次检查与写入之间提交同一字段，apply 或回滚可能覆盖该值。原生 UCI 反例保留。按单人维护合同，预览和界面提示管理员在确认成功或回滚完成前避免其他写入；可检测的基线变化、外部暂存和逐字段回滚冲突仍须通过验收。
 
 边界：没有真实物理/USB/无线驱动、设备热拔插或生产网络验证；除上述新DHCP同名改MAC反例外，外部设备认领、改ifindex、同名替换等异常仅有边界测试，未逐项做真实硬件故障。外部RA/已有IPv6 conntrack与外部终端/主路由设置不宣称已阻断或已修改。所有地址/MAC/租约及SSH密钥仅为隔离实验数据。
 

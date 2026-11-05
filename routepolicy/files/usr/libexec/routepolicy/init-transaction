@@ -222,6 +222,7 @@ preview_json() {
 	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":120,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
 		"$operation" "$(rp_json_escape "$1")"
 	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
+	printf ',"maintenance_notice":"从现在到确认成功或回滚完成，请只在本次流程中改设置。请勿在其他页面、SSH 或自动脚本中修改同一项，否则后保存的值可能覆盖前一次修改。"'
 	printf ',"link_preparation":"%s"' "$(rp_json_escape "${link_preview:-required\t0}")"
 	printf '}\n'
 }
