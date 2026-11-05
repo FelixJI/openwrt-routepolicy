@@ -3,7 +3,14 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 REAL_LIB="$ROOT/routepolicy/files/usr/libexec/routepolicy"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-transaction.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+race_guard='' race_auto=''
+cleanup() {
+	[ ! -d "$tmp" ] || printf '%s' '' >"$tmp/auto-release"
+	[ -z "$race_auto" ] || kill "$race_auto" 2>/dev/null || true
+	[ -z "$race_guard" ] || { kill "$race_guard" 2>/dev/null || true; wait "$race_guard" 2>/dev/null || true; }
+	rm -rf "$tmp"
+}
+trap cleanup EXIT HUP INT TERM
 if [ "${1:-}" = --native-uci ]; then
 	if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
 		uci() { "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/sbin/uci" "$@"; }
@@ -43,7 +50,9 @@ chmod +x "$tmp/lib/init-transaction"
 export TEST_TX_DIR="$tmp" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
 TEST_SYNC_BIN=$(command -v sync)
-export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN
+TEST_FLOCK_BIN=$(command -v flock)
+TEST_OWNER_PID=$$
+export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_OWNER_PID
 export PATH="$tmp/bin:$PATH"
 TX="$tmp/lib/init-transaction"
 WAL="$tmp/root/etc/routepolicy/state/init-transaction/current"
@@ -218,6 +227,20 @@ if [ -f "$TEST_TX_DIR/wal-fault" ] && [ "$(cat "$wal/stage" 2>/dev/null)" = comm
 fi
 exec "$TEST_SYNC_BIN" "$@"
 EOF
+cat >"$tmp/bin/flock" <<'EOF'
+#!/bin/sh
+if [ -f "$TEST_TX_DIR/auto-arm" ] && [ "$1:${2:-}" = -n:9 ]; then
+	parent_command=$(tr '\000' ' ' <"/proc/$PPID/cmdline")
+	case "$parent_command" in *'init-transaction recover'*)
+		rm "$TEST_TX_DIR/auto-arm"
+		printf '%s\n' "$PPID" >"$TEST_TX_DIR/auto-parent"
+		: >"$TEST_TX_DIR/auto-ready"
+		while [ ! -f "$TEST_TX_DIR/auto-release" ]; do kill -0 "$TEST_OWNER_PID" 2>/dev/null || exit 1; sleep 0.02; done
+		;;
+	esac
+fi
+exec "$TEST_FLOCK_BIN" "$@"
+EOF
 for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 	cat >"$tmp/root/etc/init.d/$service" <<'EOF'
 #!/bin/sh
@@ -241,6 +264,7 @@ reset() {
 	rm -f "$tmp/"link-*
 	rm -f "$tmp/guard-delete"
 	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
+	rm -f "$tmp/"auto-*
 	mkdir -p "$tmp/root/etc/config"
 	for config_package in network dhcp firewall routepolicy; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
@@ -273,6 +297,74 @@ restored() {
 	[ ! -f "$tmp/db/firewall.rp_init_dns" ]
 }
 bad() { if "$@" >"$tmp/failure" 2>&1; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi; }
+wait_auto_ready() {
+	tries=0
+	while [ ! -f "$tmp/auto-ready" ]; do [ "$tries" -lt 500 ] || return 1; tries=$((tries + 1)); sleep 0.02; done
+	race_auto=$(cat "$tmp/auto-parent")
+}
+wait_auto_done() {
+	tries=0
+	while kill -0 "$race_auto" 2>/dev/null; do [ "$tries" -lt 500 ] || return 1; tries=$((tries + 1)); sleep 0.02; done
+	race_auto=
+}
+stop_race_guard() { kill "$race_guard"; wait "$race_guard" 2>/dev/null || true; race_guard=; }
+guard_race_tests() {
+	# Healthy pending polling does not compete with confirm for the writer lock.
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	printf 9999999999 >"$WAL/deadline"; : >"$tmp/auto-arm"
+	"$TX" guard >"$tmp/auto-guard-output" 2>&1 & race_guard=$!
+	sleep 2
+	[ ! -f "$tmp/auto-ready" ]
+	stop_race_guard; rm "$tmp/auto-arm"
+	"$TX" recover >/dev/null; phase_is rolled_back
+	# Guard saw applying; apply publishes a healthy pending state before auto recovery gets its lock.
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	printf applying >"$WAL/phase"
+	exec 6>"$tmp/root/etc/routepolicy/state/init-transaction/lock"; flock -x 6
+	: >"$tmp/auto-arm"
+	"$TX" guard 6>&- >"$tmp/auto-guard-output" 2>&1 & race_guard=$!
+	wait_auto_ready
+	printf pending >"$WAL/phase"; printf 9999999999 >"$WAL/deadline"
+	flock -u 6; exec 6>&-
+	: >"$tmp/auto-release"
+	wait_auto_done
+	printf 'guard applying-to-pending result: %s\n' "$(cat "$WAL/phase")"
+	phase_is pending
+	[ "$(cat "$tmp/db/network.lan.ipaddr")" = 192.0.2.2 ]
+	stop_race_guard
+	"$TX" recover >/dev/null; phase_is rolled_back; restored
+	# A delayed expiry observation must not roll back the next healthy prepared/applied generation.
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	old_token=$token; printf 0 >"$WAL/deadline"; : >"$tmp/auto-arm"
+	"$TX" guard >"$tmp/auto-guard-output" 2>&1 & race_guard=$!
+	wait_auto_ready
+	"$TX" recover >/dev/null; phase_is rolled_back
+	prepare; [ "$token" != "$old_token" ]; "$TX" apply "$token" >/dev/null
+	: >"$tmp/auto-release"
+	wait_auto_done
+	phase_is pending
+	[ "$(cat "$tmp/db/network.lan.ipaddr")" = 192.0.2.2 ]
+	stop_race_guard
+	"$TX" recover >/dev/null; phase_is rolled_back; restored
+}
+confirm_boot_tests() {
+	for confirm_boot_fault in changed missing; do
+		reset; prepare; "$TX" apply "$token" >/dev/null
+		printf 9999999999 >"$WAL/deadline"
+		if [ "$confirm_boot_fault" = changed ]; then
+			printf '00000000-0000-4000-8000-000000000002' >"$tmp/root/proc/sys/kernel/random/boot_id"
+		else rm "$WAL/boot-id"; fi
+		if SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >"$tmp/confirm-boot-output"; then
+			printf 'cross-boot confirm unexpectedly succeeded: %s\n' "$(cat "$WAL/phase")" >&2; return 1
+		fi
+		phase_is rolled_back; restored
+	done
+}
+
+case "${1:-}" in
+	--guard-races) guard_race_tests; exit 0 ;;
+	--confirm-boot) confirm_boot_tests; exit 0 ;;
+esac
 
 if [ "${1:-}" = --native-transaction ] || [ "${1:-}" = --native-cas-audit ]; then
 	[ -n "${TEST_UCI_SDK_ROOT:-}" ] || [ -n "$TEST_NATIVE_UCI_PATH" ]
@@ -619,6 +711,8 @@ phase_is rolled_back
 printf conflict >"$WAL/phase"
 bad "$TX" recover-startup
 phase_is conflict
+guard_race_tests
+confirm_boot_tests
 
 # Admin-DOWN static egress: review stays read-only; DAD precedes every UCI commit.
 reset; touch "$tmp/link-enabled"

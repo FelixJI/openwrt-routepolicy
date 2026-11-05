@@ -222,7 +222,7 @@ preview_json() {
 	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":120,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
 		"$operation" "$(rp_json_escape "$1")"
 	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
-	printf ',"maintenance_notice":"从现在到确认成功或回滚完成，请只在本次流程中改设置。请勿在其他页面、SSH 或自动脚本中修改同一项，否则后保存的值可能覆盖前一次修改。"'
+	printf ',"maintenance_notice":"初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙或 RoutePolicy 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。"'
 	printf ',"link_preparation":"%s"' "$(rp_json_escape "${link_preview:-required\t0}")"
 	printf '}\n'
 }
@@ -395,6 +395,28 @@ recover_locked() {
 		*) phase conflict; return 1 ;;
 	esac
 }
+transaction_same_boot() {
+	transaction_boot=$(cat "$WAL/boot-id" 2>/dev/null) || return 1
+	running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
+	[ -n "$transaction_boot" ] && [ -n "$running_boot" ] && [ "$transaction_boot" = "$running_boot" ]
+}
+pending_recovery_due() {
+	transaction_same_boot || return 0
+	pending_deadline=$(cat "$WAL/deadline" 2>/dev/null) || return 0
+	rp_uint_between "$pending_deadline" 1 9999999999 || return 0
+	pending_now=$(date +%s) || return 0
+	rp_is_uint "$pending_now" || return 0
+	[ "$pending_now" -ge "$pending_deadline" ]
+}
+recover_auto_locked() {
+	# The guard's earlier observation is advisory; only this locked state permits rollback.
+	case "$(read_phase)" in
+		applying|rolling_back) rollback_fields ;;
+		pending) if pending_recovery_due; then rollback_fields; fi ;;
+		prepared|confirmed|rolled_back|conflict|absent) return 0 ;;
+		*) phase conflict; return 1 ;;
+	esac
+}
 status_json() {
 	p=$(read_phase)
 	printf '{"ok":true,"operation":"init-status","phase":"%s"' "$(rp_json_escape "$p")"
@@ -524,8 +546,15 @@ case "$operation" in
 		lock; check_token "$@"
 		[ "$(read_phase)" != confirmed ] || { status_json; exit 0; }
 		[ "$(read_phase)" = pending ] || fail '事务不在待确认阶段'
+		if ! transaction_same_boot; then
+			rollback_fields || fail '不能确认上次启动的事务；恢复有冲突，需人工处理'
+			fail '不能确认上次启动的事务；本事务字段已恢复'
+		fi
 		load_args || fail '事务参数损坏'
-		[ "$(date +%s)" -lt "$(cat "$WAL/deadline")" ] || { rollback_fields; fail '连通性确认已超时'; }
+		if pending_recovery_due; then
+			rollback_fields || fail '连通性确认已超时；恢复有冲突，需人工处理'
+			fail '连通性确认已超时；本事务字段已恢复'
+		fi
 		set -f; set -- ${SSH_CONNECTION:-}
 		[ "$#" -eq 4 ] || fail '确认需要来自新管理入口的可信 SSH 会话'
 		management=$(topology management-address) || fail '无法确认当前管理地址'
@@ -538,21 +567,22 @@ case "$operation" in
 	guard-needed)
 		case "$(read_phase)" in prepared|applying|pending|rolling_back) exit 0 ;; *) exit 1 ;; esac
 		;;
-	recover|recover-startup)
+	recover|recover-startup|recover-auto)
 		[ "$#" -eq 0 ] || fail 'recover 不接受参数'
 		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ]; then status_json; exit 0; fi
 		lock
 		if [ "$operation" = recover-startup ] && [ "$(read_phase)" = conflict ]; then fail '启动恢复存在真实冲突；请先处理并显式recover'; fi
-		recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; status_json
+		if [ "$operation" = recover-auto ]; then
+			recover_auto_locked || fail '自动恢复有冲突；已保留未知配置与 WAL'
+		else recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; fi
+		status_json
 		;;
 	guard)
 		[ "$#" -eq 0 ] || fail 'guard 不接受参数'
 		while :; do
 			case "$(read_phase)" in
-				applying|rolling_back) "$0" recover >/dev/null 2>&1 || true ;;
-				pending) deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
-					if [ ! -s "$WAL/boot-id" ] || [ "$(cat "$WAL/boot-id" 2>/dev/null)" != "$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null)" ] ||
-						! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then "$0" recover >/dev/null 2>&1 || true; fi ;;
+				applying|rolling_back) "$0" recover-auto >/dev/null 2>&1 || true ;;
+				pending) if pending_recovery_due; then "$0" recover-auto >/dev/null 2>&1 || true; fi ;;
 				prepared)
 					deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
 					if ! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then
