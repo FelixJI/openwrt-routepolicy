@@ -954,7 +954,12 @@ verify() {
 		[ "$(field "$services" "@.$service.instances.*.running" | sort -u)" = true ] || fail "service not running or evidence missing: $service"
 	done
 	listener=$(netstat -lnptu) || fail 'DNS listener evidence unavailable'
-	printf '%s\n' "$listener" | awk -v ip="$access_ip:53" '$4==ip||$4=="0.0.0.0:53"||$4==":::53"{found=1}END{exit !found}' || fail 'no DNS listener on access IPv4'
+	printf '%s\n' "$listener" | awk -v ip="$access_ip:53" '
+		$4==ip||$4=="0.0.0.0:53" {
+			if($1=="tcp"&&$6=="LISTEN")tcp=1
+			if($1=="udp")udp=1
+		}
+		END{exit !(tcp&&udp)}' || fail 'TCP LISTEN and UDP DNS listeners must both bind access IPv4 or 0.0.0.0'
 	printf '{"ok":true,"operation":"verify","management_address":"%s","ipv6_policy":"reject-new-forwarding-connections; preserve-existing-conntrack-and-management","ipv6_external_bypass":"requires-upstream-client-configuration","packet_evidence":"EVIDENCE_MISSING"}\n' "$access_ip"
 }
 

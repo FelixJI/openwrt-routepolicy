@@ -122,7 +122,8 @@ cat >"$tmp/bin/netstat" <<'EOF'
 #!/bin/sh
 [ "$*" = -lnptu ] || exit 1
 [ "${TEST_NO_DNS:-0}" = 0 ] || exit 0
-echo 'udp 0 0 0.0.0.0:53 0.0.0.0:* 122/dnsmasq'
+if [ "${TEST_DNS_LISTENERS+x}" = x ]; then printf '%s\n' "$TEST_DNS_LISTENERS"
+else printf '%s\n' 'udp 0 0 0.0.0.0:53 0.0.0.0:* 122/dnsmasq' 'tcp 0 0 0.0.0.0:53 0.0.0.0:* LISTEN 122/dnsmasq'; fi
 EOF
 cat >"$tmp/bin/arping" <<'EOF'
 #!/bin/sh
@@ -707,6 +708,20 @@ echo 0 >"$tmp/root/proc/sys/net/ipv4/conf/all/rp_filter"
 reject env TEST_SERVICE_DOWN=1 "$tool" verify lan wan policy
 reject env TEST_MISSING_RULE=1 "$tool" verify lan wan policy
 reject env TEST_NO_DNS=1 "$tool" verify lan wan policy
+tcp4='tcp 0 0 0.0.0.0:53 0.0.0.0:* LISTEN 122/dnsmasq'
+udp4='udp 0 0 0.0.0.0:53 0.0.0.0:* 122/dnsmasq'
+for listeners in \
+	"$tcp4" \
+	"$udp4" \
+	"$(printf '%s\n' 'tcp 0 0 :::53 :::* LISTEN 122/dnsmasq' 'udp 0 0 :::53 :::* 122/dnsmasq')" \
+	"$(printf '%s\n' 'tcp 0 0 192.168.1.2:53 0.0.0.0:* LISTEN 122/dnsmasq' 'udp 0 0 192.168.1.2:53 0.0.0.0:* 122/dnsmasq')" \
+	"$(printf '%s\n' "$udp4" 'tcp 0 0 :::53 :::* LISTEN 122/dnsmasq')" \
+	"$(printf '%s\n' "$udp4" 'tcp 0 0 0.0.0.0:53 192.0.2.5:12345 ESTABLISHED 122/dnsmasq')"; do
+	reject env TEST_DNS_LISTENERS="$listeners" "$tool" verify lan wan policy
+	grep -Fq 'TCP LISTEN and UDP DNS listeners must both bind access IPv4 or 0.0.0.0' "$tmp/error"
+done
+TEST_DNS_LISTENERS="$(printf '%s\n' 'tcp 0 0 192.168.1.1:53 0.0.0.0:* LISTEN 122/dnsmasq' 'udp 0 0 192.168.1.1:53 0.0.0.0:* 122/dnsmasq')" "$tool" verify lan wan policy >"$tmp/verify-bound-dns"
+TEST_DNS_LISTENERS="$(printf '%s\n' "$tcp4" 'udp 0 0 192.168.1.1:53 0.0.0.0:* 122/dnsmasq')" "$tool" verify lan wan policy >"$tmp/verify-mixed-dns"
 baseline
 apply_mock_plan "$tmp/new-default"
 sed -e 's/wan/rp_init_default/g' -e 's/eth1/eth3/g' "$tmp/nft" >"$tmp/default-runtime.nft"
