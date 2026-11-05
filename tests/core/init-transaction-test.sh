@@ -51,8 +51,9 @@ export TEST_TX_DIR="$tmp" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp
 TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
 TEST_SYNC_BIN=$(command -v sync)
 TEST_FLOCK_BIN=$(command -v flock)
+TEST_DATE_BIN=$(command -v date)
 TEST_OWNER_PID=$$
-export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_OWNER_PID
+export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_DATE_BIN TEST_OWNER_PID
 export PATH="$tmp/bin:$PATH"
 TX="$tmp/lib/init-transaction"
 WAL="$tmp/root/etc/routepolicy/state/init-transaction/current"
@@ -162,6 +163,7 @@ case "$1" in
 				list) : >"$TEST_TX_DIR/list.network.lan.ipaddr" ;;
 				wal-stage) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/stage" ;;
 				wal-boot) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/boot-id" ;;
+				wal-uptime) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/uptime-start-cs" ;;
 				wal-link) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/link-expected-up" ;;
 			esac
 			rm "$TEST_TX_DIR/window-change"
@@ -241,6 +243,11 @@ if [ -f "$TEST_TX_DIR/auto-arm" ] && [ "$1:${2:-}" = -n:9 ]; then
 fi
 exec "$TEST_FLOCK_BIN" "$@"
 EOF
+cat >"$tmp/bin/date" <<'EOF'
+#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = +%s ] && [ -f "$TEST_TX_DIR/wall-clock" ]; then cat "$TEST_TX_DIR/wall-clock"
+else exec "$TEST_DATE_BIN" "$@"; fi
+EOF
 for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 	cat >"$tmp/root/etc/init.d/$service" <<'EOF'
 #!/bin/sh
@@ -274,6 +281,8 @@ reset() {
 	printf 9 >"$tmp/root/sys/class/net/eth9/ifindex"
 	printf '02:00:00:00:00:09' >"$tmp/root/sys/class/net/eth9/address"
 	printf '00000000-0000-4000-8000-000000000001' >"$tmp/root/proc/sys/kernel/random/boot_id"
+	printf '1000.00 0.00\n' >"$tmp/root/proc/uptime"
+	printf 1700000000 >"$tmp/wall-clock"
 	printf lan >"$tmp/db/routepolicy.main.lan_interface"
 	printf wan >"$tmp/db/routepolicy.main.default_interface"
 	printf usbwan >"$tmp/db/routepolicy.main.policy_interface"
@@ -335,7 +344,7 @@ guard_race_tests() {
 	"$TX" recover >/dev/null; phase_is rolled_back; restored
 	# A delayed expiry observation must not roll back the next healthy prepared/applied generation.
 	reset; prepare; "$TX" apply "$token" >/dev/null
-	old_token=$token; printf 0 >"$WAL/deadline"; : >"$tmp/auto-arm"
+	old_token=$token; printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"; : >"$tmp/auto-arm"
 	"$TX" guard >"$tmp/auto-guard-output" 2>&1 & race_guard=$!
 	wait_auto_ready
 	"$TX" recover >/dev/null; phase_is rolled_back
@@ -360,10 +369,59 @@ confirm_boot_tests() {
 		phase_is rolled_back; restored
 	done
 }
+backward_clock_test() {
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	[ "$(cat "$WAL/deadline")" = 1700000120 ]
+	printf 1699996400 >"$tmp/wall-clock"
+	printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"
+	"$TX" recover-auto >/dev/null
+	printf 'wall-clock backward at elapsed 120s: %s\n' "$(cat "$WAL/phase")"
+	phase_is rolled_back; restored
+}
+forward_clock_test() {
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	printf 1700003600 >"$tmp/wall-clock"
+	printf '1001.00 0.00\n' >"$tmp/root/proc/uptime"
+	"$TX" recover-auto >/dev/null
+	printf 'wall-clock forward at elapsed 1s: %s\n' "$(cat "$WAL/phase")"
+	phase_is pending
+	[ "$(cat "$WAL/deadline")" = 1700000120 ]
+	SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/null
+	phase_is confirmed
+}
+monotonic_clock_tests() {
+	backward_clock_test
+	forward_clock_test
+	# Fractional uptime must preserve a full 120-second window, including the last centisecond.
+	reset; printf '1000.25 0.00\n' >"$tmp/root/proc/uptime"; prepare; "$TX" apply "$token" >/dev/null
+	[ "$(cat "$WAL/uptime-start-cs")" = 100025 ]
+	printf '1120.24 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is pending
+	printf '1120.25 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is rolled_back; restored
+	# Old WAL and unreadable/corrupt monotonic evidence cannot extend the window via epoch time.
+	for clock_fault in legacy invalid regressed unreadable; do
+		reset; prepare; "$TX" apply "$token" >/dev/null; printf 9999999999 >"$WAL/deadline"
+		case "$clock_fault" in
+			legacy) rm "$WAL/uptime-start-cs" ;;
+			invalid) printf 000009 >"$WAL/uptime-start-cs" ;;
+			regressed) printf '999.99 0.00\n' >"$tmp/root/proc/uptime" ;;
+			unreadable) printf unavailable >"$tmp/root/proc/uptime" ;;
+		esac
+		"$TX" recover-auto >/dev/null; phase_is rolled_back; restored
+	done
+	reset; prepare; "$TX" apply "$token" >/dev/null; rm "$WAL/uptime-start-cs"
+	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"
+	phase_is rolled_back; restored
+	reset; prepare; rm "$tmp/root/proc/uptime"
+	bad "$TX" apply "$token"; phase_is prepared
+	[ ! -f "$tmp/commits" ]; [ ! -f "$tmp/link-log" ]; restored
+}
 
 case "${1:-}" in
 	--guard-races) guard_race_tests; exit 0 ;;
 	--confirm-boot) confirm_boot_tests; exit 0 ;;
+	--clock-backward) backward_clock_test; exit 0 ;;
+	--clock-forward) forward_clock_test; exit 0 ;;
+	--clock-tests) monotonic_clock_tests; confirm_boot_tests; exit 0 ;;
 esac
 
 if [ "${1:-}" = --native-transaction ] || [ "${1:-}" = --native-cas-audit ]; then
@@ -509,7 +567,7 @@ for window_kind in scalar absent list; do
 done
 
 # Reported WAL writes/flush failures must stop before a configuration or link write.
-for wal_kind in wal-stage wal-boot; do
+for wal_kind in wal-stage wal-boot wal-uptime; do
 	reset; prepare; printf '%s\n' "$wal_kind" >"$tmp/window-change"
 	bad "$TX" apply "$token"
 	[ ! -f "$tmp/commits" ]
@@ -657,7 +715,7 @@ printf '192.0.2.1\n' >"$tmp/db/network.lan.ipaddr"
 bad "$TX" prepare lan wan usbwan - - - - - - 192.0.2.2 24
 
 reset; prepare; "$TX" apply "$token" >/dev/null
-printf 0 >"$WAL/deadline"
+printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"
 "$TX" guard & guard_pid=$!
 wait "$guard_pid"
 phase_is rolled_back
@@ -713,6 +771,7 @@ bad "$TX" recover-startup
 phase_is conflict
 guard_race_tests
 confirm_boot_tests
+monotonic_clock_tests
 
 # Admin-DOWN static egress: review stays read-only; DAD precedes every UCI commit.
 reset; touch "$tmp/link-enabled"

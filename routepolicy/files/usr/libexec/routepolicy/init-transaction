@@ -308,9 +308,7 @@ guard_stop_if_inactive() (
 	flock -n 9 || exit 1
 	case "$(read_phase)" in
 		applying|rolling_back|pending) exit 1 ;;
-		prepared)
-			deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
-			if rp_uint_between "$deadline" 1 9999999999 && [ "$(date +%s)" -lt "$deadline" ]; then exit 1; fi ;;
+		prepared) pending_recovery_due || exit 1 ;;
 	esac
 	ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' 9>&- >/dev/null 2>&1
 )
@@ -400,13 +398,23 @@ transaction_same_boot() {
 	running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
 	[ -n "$transaction_boot" ] && [ -n "$running_boot" ] && [ "$transaction_boot" = "$running_boot" ]
 }
+monotonic_now() {
+	# /proc/uptime supplies boot-scoped centiseconds, unaffected by wall-clock correction.
+	LC_ALL=C awk '
+		NR!=1 || NF!=2 || $1 !~ /^[0-9]+\.[0-9][0-9]$/ || $1>=10000000000 {exit 1}
+		{printf "%.0f\n", $1*100}
+		END {if(NR!=1) exit 1}
+	' "$RP_ROOT/proc/uptime"
+}
 pending_recovery_due() {
 	transaction_same_boot || return 0
-	pending_deadline=$(cat "$WAL/deadline" 2>/dev/null) || return 0
-	rp_uint_between "$pending_deadline" 1 9999999999 || return 0
-	pending_now=$(date +%s) || return 0
-	rp_is_uint "$pending_now" || return 0
-	[ "$pending_now" -ge "$pending_deadline" ]
+	# Legacy or invalid timing evidence is due immediately; never fall back to epoch time.
+	pending_started=$(cat "$WAL/uptime-start-cs" 2>/dev/null) || return 0
+	case "$pending_started" in 0[0-9]*) return 0 ;; esac
+	rp_uint_between "$pending_started" 0 999999999999 || return 0
+	pending_now=$(monotonic_now) || return 0
+	[ "$pending_now" -ge "$pending_started" ] || return 0
+	[ "$pending_now" -ge "$((pending_started + 12000))" ]
 }
 recover_auto_locked() {
 	# The guard's earlier observation is advisory; only this locked state permits rollback.
@@ -508,7 +516,11 @@ case "$operation" in
 				*) fail '准备基线类型损坏' ;;
 			esac
 		done <"$WAL/candidate"
-		printf '%s\n' "$count" >"$WAL/count" && printf '%s\n' "$(( $(date +%s) + 120 ))" >"$WAL/deadline" || fail '不能保存WAL计数和确认期限'
+		wall_started=$(date +%s) && rp_uint_between "$wall_started" 0 9999999999 || fail '不能读取确认期限的墙钟时间'
+		uptime_started=$(monotonic_now) || fail '不能读取启动单调时钟'
+		# Keep the public epoch deadline; enforce the 120-second window using uptime only.
+		printf '%s\n' "$count" >"$WAL/count" && printf '%s\n' "$((wall_started + 120))" >"$WAL/deadline" &&
+			printf '%s\n' "$uptime_started" >"$WAL/uptime-start-cs" || fail '不能保存WAL计数和确认期限'
 		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/boot-id" || fail '无法记录事务启动身份'
 		[ -s "$WAL/boot-id" ] || fail '事务启动身份缺失'
 		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
@@ -583,11 +595,7 @@ case "$operation" in
 			case "$(read_phase)" in
 				applying|rolling_back) "$0" recover-auto >/dev/null 2>&1 || true ;;
 				pending) if pending_recovery_due; then "$0" recover-auto >/dev/null 2>&1 || true; fi ;;
-				prepared)
-					deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
-					if ! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then
-						guard_stop_if_inactive && exit 0
-					fi ;;
+				prepared) if pending_recovery_due; then guard_stop_if_inactive && exit 0; fi ;;
 				*) guard_stop_if_inactive && exit 0 ;;
 			esac
 			sleep 2
