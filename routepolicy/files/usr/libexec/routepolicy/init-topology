@@ -68,6 +68,10 @@ host4() {
 netmask() {
 	awk -v p="$1" 'BEGIN{for(i=0;i<4;i++){b=p>=8?255:p<=0?0:256-2^(8-p);printf "%s%d",i?".":"",b;p-=8}print ""}'
 }
+mask_prefix() {
+	rp_is_ipv4 "$1" || return 1
+	printf '%s\n' "$1" | awk -F. '{p=0;ended=0;for(i=1;i<=4;i++){v=$i;b=8;while(b>0&&v%2==0){v/=2;b--}if(v!=2^b-1||ended&&b)exit 1;p+=b;if(b<8)ended=1}print p}'
+}
 overlap() {
 	local left=$1 right=$2 bits=${1#*/}
 	[ "$bits" -le "${right#*/}" ] || bits=${right#*/}
@@ -119,13 +123,15 @@ new_link_state() {
 	case "$link_carrier" in 0|1|unknown) ;; *) fail 'link state: invalid carrier' ;; esac
 }
 link_plan() {
-	if [ "$new_role" = - ] || [ "$new_proto" != static ]; then printf 'required\t0\n'; return; fi
+	if [ "$new_role" = - ]; then printf 'required\t0\n'; return; fi
 	new_link_state
-	if [ "$link_up" = 0 ]; then link_dad_status=pending-link-up
+	if [ "$new_proto" = dhcp ]; then link_dad_status=not-required; link_dad_required=0
+	elif [ "$link_up" = 0 ]; then link_dad_status=pending-link-up; link_dad_required=1
 	elif [ "$link_carrier" != 1 ]; then link_dad_status=pending-carrier
 	else probe_address "$new_ip" "$new_device"; link_dad_status=clear; fi
-	printf 'required\t1\ndevice\t%s\nifindex\t%s\nmac\t%s\ndevice_path\t%s\nup\t%s\ncarrier\t%s\ntarget\t%s\ndad\t%s\n' \
-		"$new_device" "$link_index" "$link_mac" "$link_path" "$link_up" "$link_carrier" "$new_ip" "$link_dad_status"
+	[ "$new_proto" != static ] || link_dad_required=1
+	printf 'required\t1\ndad_required\t%s\ndevice\t%s\nifindex\t%s\nmac\t%s\ndevice_path\t%s\nup\t%s\ncarrier\t%s\ntarget\t%s\ndad\t%s\n' \
+		"$link_dad_required" "$new_device" "$link_index" "$link_mac" "$link_path" "$link_up" "$link_carrier" "$new_ip" "$link_dad_status"
 }
 link_dad() {
 	local remaining=10 index_before mac_before path_before
@@ -210,6 +216,7 @@ parse() {
 	access_ip=$(runtime "$access" '@["ipv4-address"][0].address')
 	access_prefix=$(runtime "$access" '@["ipv4-address"][0].mask')
 	host4 "$access_ip" "$access_prefix" || fail 'access requires a usable IPv4 address and prefix'
+	current_access_cidr=$(rp_network_cidr "$access_ip" "$access_prefix")
 	if [ "$management_ip" != - ]; then
 		host4 "$management_ip" "$management_prefix" || fail 'invalid management IPv4 address/prefix'
 		if [ "$management_ip" != "$access_ip" ] && [ "$operation" = plan ]; then probe_address "$management_ip" "$access_device"; fi
@@ -298,7 +305,7 @@ parse() {
 			if [ "$address" != - ] && overlap "$address/$prefix" "$access_cidr"; then fail 'separated egress overlaps the access subnet'; fi
 		fi
 		if [ "$address" = - ]; then egress_cidr=-; else egress_cidr=$(rp_network_cidr "$address" "$prefix"); fi
-		if [ "$role" = default ]; then default_device=$device default_zone=$zone default_zone_section=$zone_section default_cidr=$egress_cidr
+		if [ "$role" = default ]; then default_device=$device default_zone=$zone default_zone_section=$zone_section default_cidr=$egress_cidr default_gateway=$gateway
 		else policy_device=$device policy_zone=$zone policy_zone_section=$zone_section policy_cidr=$egress_cidr; fi
 	done
 	[ "$default_device" != "$policy_device" ] || fail 'default and policy egress cannot share an L3 device'
@@ -320,7 +327,63 @@ parse() {
 	done
 	for section in default4 policy4 default_nat policy_nat default_dhcp_client policy_dhcp_client dns ipv6 dhcp4 dhcp6 ra redirects; do own_section "firewall.rp_init_$section"; done
 	check_rp_filter "$access_device" "$default_device" "$policy_device"
+	address_overlap_guard
 	if [ "$new_role" != - ] && [ "$pre_apply" = 1 ] && [ "$operation" != link-unclaimed ]; then link_unclaimed >/dev/null; fi
+}
+
+address_overlap_guard() {
+	local candidates='' candidate section configured address prefix addresses dev cidr routes destination protocol scope
+	if [ "$new_role" != - ]; then
+		if [ "$new_proto" = static ]; then candidates="$new_ip/$new_prefix"
+		elif [ "$pre_apply" = 0 ]; then
+			[ "$new_role" = default ] && candidates=$default_cidr || candidates=$policy_cidr
+		fi
+	fi
+	[ "$management_ip" = - ] || candidates="$candidates $access_cidr"
+	[ -n "$candidates" ] || return 0
+	for section in $(sections network interface); do
+		case "$section" in "$access"|"$default_if"|"$policy") continue ;; esac
+		configured=$(get "network.$section.ipaddr")
+		for address in $configured; do
+			case "$address" in
+				*/*) prefix=${address#*/}; address=${address%/*} ;;
+				*) prefix=$(mask_prefix "$(get "network.$section.netmask")") || fail "address overlap: cannot establish prefix of unselected interface $section" ;;
+			esac
+			rp_is_ipv4 "$address" && rp_uint_between "$prefix" 0 32 || fail "address overlap: unsupported address on unselected interface $section"
+			for candidate in $candidates; do ! overlap "$candidate" "$address/$prefix" || fail "address overlap: candidate $candidate intersects unselected interface $section ($address/$prefix)"; done
+		done
+	done
+	addresses=$(ip -4 -o addr show) || fail 'address overlap: kernel addresses unavailable'
+	while IFS="$(printf '\t')" read -r dev cidr; do
+		[ -n "$dev" ] || continue
+		case "$dev" in "$access_device"|"$default_device"|"$policy_device") continue ;; esac
+		for candidate in $candidates; do ! overlap "$candidate" "$cidr" || fail "address overlap: candidate $candidate intersects address $cidr on unselected device $dev"; done
+	done <<EOF
+$(printf '%s\n' "$addresses" | awk 'NF{d=$2;sub(/@.*/,"",d);print d "\t" $4}')
+EOF
+	routes=$(ip -4 route show table all) || fail 'address overlap: effective routes unavailable'
+	while IFS="$(printf '\t')" read -r destination dev protocol scope; do
+		[ -n "$destination" ] || continue
+		case "$destination" in */*) ;; *) destination="$destination/32" ;; esac
+		address=${destination%/*}; prefix=${destination#*/}
+		rp_is_ipv4 "$address" && rp_uint_between "$prefix" 0 32 || fail 'address overlap: unsupported effective route'
+		if [ "$protocol:$scope" = kernel:link ]; then
+			[ "$dev:$destination" != "$access_device:$access_cidr" ] || continue
+			[ "$dev:$destination" != "$access_device:$current_access_cidr" ] || continue
+			[ "$dev:$destination" != "$default_device:$default_cidr" ] || continue
+			[ "$dev:$destination" != "$policy_device:$policy_cidr" ] || continue
+		fi
+		for candidate in $candidates; do ! overlap "$candidate" "$destination" || fail "address overlap: candidate $candidate intersects an existing non-default route $destination"; done
+	done <<EOF
+$(printf '%s\n' "$routes" | awk '
+		NF{
+			target=$1;start=2;if(target=="local"||target=="broadcast"||target=="multicast")next
+			if(target=="blackhole"||target=="unreachable"||target=="prohibit"||target=="throw"){target=$2;start=3}
+			if(target=="default"||target=="0.0.0.0/0")next
+			dev="-";proto="-";scope="-";for(i=start;i<=NF;i++){if($i=="dev")dev=$(i+1);if($i=="proto")proto=$(i+1);if($i=="scope")scope=$(i+1)}
+			print target "\t" dev "\t" proto "\t" scope
+		}')
+EOF
 }
 
 conflicts() {
@@ -341,6 +404,119 @@ conflicts() {
 	foreign=$(nft list ruleset) || fail 'cannot inspect nftables rules'
 	if printf '%s\n' "$foreign" | awk '/^table /{owned=($3=="routepolicy")} !owned && /mark.*set/{found=1}END{exit !found}'; then fail 'foreign nftables mark writes require manual conflict review'; fi
 	fw4 check >/dev/null 2>&1 || fail 'current fw4 configuration is invalid'
+}
+
+default_route_guard() {
+	local mode=$1 rules marks token mark mask routes summary lowest best_count best_device best_gateway dev gateway metric probe source result cidr candidate route_mode
+	rules=$(ip -4 rule show) || fail 'default route: RPDB evidence unavailable'
+	marks=$(printf '%s\n' "$rules" | awk '
+		{gsub(/[[:space:]]+/," ");sub(/^ /,"")}
+		$0=="0: from all lookup local"||$0=="32766: from all lookup main"||$0=="32767: from all lookup default"{next}
+		NF==7&&$2=="from"&&$3=="all"&&$4=="fwmark"&&$6=="lookup"{print $5;next}
+		NF{bad=1} END{exit bad}') || fail 'default route: unsupported rules can redirect unmarked traffic'
+	for token in $marks; do
+		mark=${token%%/*}; mask=${token#*/}; [ "$mask" != "$token" ] || mask=0xffffffff
+		rp_is_hex32 "$mark" && rp_is_hex32 "$mask" && [ $((mark & mask)) -ne 0 ] || fail 'default route: a mark rule can match unmarked traffic'
+	done
+	routes=$(ip -4 route show table main default) || fail 'default route: main table unavailable'
+	summary=$(printf '%s\n' "$routes" | awk '
+		NF {
+			if($1!="default") {bad=1;next}
+			dev="";gw="";metric=0;d=0;g=0
+			for(i=2;i<=NF;i++) {
+				if($i=="dev"){dev=$(++i);d++}
+				else if($i=="via"){gw=$(++i);g++}
+				else if($i=="metric")metric=$(++i)
+				else if($i=="nexthop"||$i=="linkdown"||$i=="nhid")bad=1
+			}
+			if(d!=1||g!=1||metric!~/^[0-9]+$/||metric>2147483647)bad=1
+			print dev "\t" gw "\t" metric
+		} END{exit bad}') || fail 'default route: multipath, down or unsupported main-table default'
+	lowest=2147483648 best_count=0 best_device='' best_gateway=''
+	while IFS="$(printf '\t')" read -r dev gateway metric; do
+		[ -n "$dev" ] || continue
+		rp_is_device "$dev" && rp_is_ipv4 "$gateway" || fail 'default route: invalid main-table evidence'
+		if [ "$mode" = plan ] && [ "$new_role" = default ]; then
+			[ "$dev" = "$policy_device" ] && continue
+			[ "$metric" -gt 10 ] || fail 'default route: an unselected default would outrank or tie the new default metric 10'
+			continue
+		fi
+		if [ "$metric" -lt "$lowest" ]; then lowest=$metric best_count=1 best_device=$dev best_gateway=$gateway
+		elif [ "$metric" -eq "$lowest" ]; then best_count=$((best_count + 1)); fi
+	done <<EOF
+$summary
+EOF
+	if [ "$mode" = plan ] && [ "$new_role" = default ]; then return; fi
+	[ "$best_count" = 1 ] && [ "$best_device:$best_gateway" = "$default_device:$default_gateway" ] || fail 'default route: main table does not uniquely select the requested default egress'
+	if [ "$mode" = plan ] && [ "$new_role" = policy ]; then
+		[ "$lowest" -lt 200 ] || fail 'default route: new policy metric 200 would outrank or tie the requested default; configure metrics first'
+	fi
+	probe=''
+	for candidate in 198.18.0.1 100.64.0.1; do
+		for cidr in "$access_cidr" "$default_cidr" "$policy_cidr"; do
+			[ "$cidr" = - ] || ! overlap "$candidate/32" "$cidr" || continue 2
+		done
+		probe=$candidate; break
+	done
+	[ -n "$probe" ] || fail 'default route: no non-connected FIB probe target is available'
+	source=$(awk -v net="${access_cidr%/*}" -v own="$access_ip" 'BEGIN{split(net,a,".");a[4]++;v=a[1]"."a[2]"."a[3]"."a[4];if(v==own)a[4]++;print a[1]"."a[2]"."a[3]"."a[4]}')
+	for route_mode in local forwarded; do
+		if [ "$route_mode" = local ]; then result=$(ip -4 route get fibmatch "$probe" mark 0)
+		else result=$(ip -4 route get fibmatch "$probe" from "$source" iif "$access_device" mark 0); fi || fail "default route: $route_mode FIB lookup failed"
+		printf '%s\n' "$result" | awk -v dev="$default_device" -v gw="$default_gateway" '
+			NF {
+				n++;if($1!="default")bad=1;d="";g=""
+				for(i=2;i<=NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1);if($i=="table"&&$(i+1)!="main"&&$(i+1)!="254")bad=1;if($i=="nexthop"||$i=="linkdown")bad=1}
+				if(d!=dev||g!=gw)bad=1
+			}END{exit bad||n!=1}' || fail "default route: $route_mode kernel lookup does not use the selected main-table default"
+	done
+}
+
+forward_include_guard() {
+	local section chain file
+	for section in $(sections firewall include); do
+		[ "$(get "firewall.$section.enabled")" != 0 ] || continue
+		[ "$(get "firewall.$section.type")" = nftables ] || fail 'IPv6 control flow: an active script include cannot be proven safe'
+		chain=$(get "firewall.$section.chain")
+		case "$chain" in ''|forward|"forward_$access_zone"|handle_reject) fail 'IPv6 control flow: an active firewall include prevents proof of rejection order' ;; esac
+	done
+	for file in "$RP_ROOT/etc/nftables.d/"*.nft \
+		"$RP_ROOT/usr/share/nftables.d/chain-pre/forward/"*.nft \
+		"$RP_ROOT/usr/share/nftables.d/chain-pre/forward_$access_zone/"*.nft \
+		"$RP_ROOT/usr/share/nftables.d/chain-pre/handle_reject/"*.nft \
+		"$RP_ROOT/usr/share/nftables.d/table-pre/"*.nft "$RP_ROOT/usr/share/nftables.d/table-post/"*.nft \
+		"$RP_ROOT/usr/share/nftables.d/ruleset-pre/"*.nft "$RP_ROOT/usr/share/nftables.d/ruleset-post/"*.nft; do
+		[ ! -e "$file" ] || fail 'IPv6 control flow: an automatic nftables include requires manual review'
+	done
+}
+
+ipv6_forward_guard() {
+	local mode=$1 snapshot=$2
+	forward_include_guard
+	printf '%s\n' "$snapshot" | awk -v mode="$mode" -v access="$access_device" -v zone="$access_zone" '
+		function norm(s){sub(/ comment ".*"$/,"",s);gsub(/counter packets [0-9]+ bytes [0-9]+/,"counter",s);gsub(/meta nfproto ipv6/,"meta nfproto 10",s);gsub(/meta nfproto ipv4/,"meta nfproto 2",s);gsub(/[[:space:]]+/," ",s);sub(/^ /,"",s);sub(/ $/,"",s);return s}
+		$1=="chain"&&$3=="{"{chain=$2;next}
+		$1=="}"{chain="";next}
+		{
+			line=norm($0);if(line==""||line~/^type /)next
+			if(chain=="forward"&&!entered){
+				if(line=="ct state vmap { 0x2 : accept, 0x4 : accept }"||line=="ct state established,related accept"||line=="ct state invalid drop")next
+				if(line=="iifname \"" access "\" jump forward_" zone){entered=1;next}
+				if(line~/^iifname "[A-Za-z0-9_.:@-]+" jump forward_[A-Za-z0-9_]+$/){split(line,a,"\"");if(a[2]!=access)next}
+				bad=1
+			}
+			if(chain=="forward_" zone&&!reached){
+				if(line~/^ip /||line~/^meta nfproto 2 /)next
+				if(line=="meta nfproto 10 counter jump handle_reject"){reached=1;next}
+				if(mode=="plan"&&line~/^jump accept_to_[A-Za-z0-9_]+$/)next
+				bad=1
+			}
+			if(chain=="handle_reject"&&!terminal){
+				if(line=="meta l4proto 6 reject with tcp reset"||line=="meta l4proto tcp reject with tcp reset")next
+				if(line=="reject"){terminal=1;next}
+				bad=1
+			}
+		}END{exit bad||!entered||!terminal||(mode!="plan"&&!reached)}' || fail 'IPv6 control flow: new traffic can bypass rejection or preceding rules cannot be proven safe'
 }
 
 set_value() { printf 'set\t%s\t%s\n' "$1" "$2"; }
@@ -377,6 +553,7 @@ emit_plan() {
 			set_value "network.$new_if.gateway" "$new_gateway"
 		fi
 	fi
+	if [ "$new_role" = default ]; then set_value "network.$policy.metric" 200; fi
 	for section in $dhcp_sections; do
 		set_value "dhcp.$section.ignore" 1
 		for role in ra dhcpv6 ndp; do set_value "dhcp.$section.$role" disabled; done
@@ -474,9 +651,11 @@ verify() {
 		for setting in ra dhcpv6 ndp; do [ "$(get "dhcp.$section.$setting")" = disabled ] || fail "access $setting remains configured"; done
 	done
 	check_rp_filter "$access_device" "$default_device" "$policy_device"
+	default_route_guard verify
 	[ "$(cat "$RP_ROOT/proc/sys/net/ipv4/ip_forward")" = 1 ] || fail 'IPv4 forwarding is disabled'
 	fw4 check >/dev/null 2>&1 || fail 'fw4 validation failed'
 	nft_snapshot=$(nft -n list table inet fw4) || fail 'running fw4 table unavailable'
+	ipv6_forward_guard verify "$nft_snapshot"
 	for setting in input forward output; do
 		[ "$setting" = output ] && action=oifname || action=iifname
 		live_rule "$setting" "!fw4: Handle $access_zone IPv4/IPv6 $setting traffic" "$action \"$access_device\" jump ${setting}_$access_zone"
@@ -512,7 +691,13 @@ verify() {
 operation=${1:-}; [ "$#" -gt 0 ] && shift
 case "$operation" in
 	discover) [ "$#" -eq 0 ] || fail 'discover takes no arguments'; discover ;;
-	plan) parse "$@"; conflicts; emit_plan; rp_err 'IPv6 policy: reject new forwarding connections through this router; preserve existing conntrack and management. Disable upstream RA/client IPv6 separately to prevent direct L2 bypass.' ;;
+	plan)
+		parse "$@"; conflicts; default_route_guard plan
+		nft_snapshot=$(nft -n list table inet fw4) || fail 'IPv6 control flow: running fw4 table unavailable'
+		ipv6_forward_guard plan "$nft_snapshot"
+		emit_plan
+		rp_err 'IPv6 policy: reject new forwarding connections through this router; preserve existing conntrack and management. Disable upstream RA/client IPv6 separately to prevent direct L2 bypass.'
+		;;
 	verify) parse "$@"; verify ;;
 	link-plan) parse "$@"; link_plan ;;
 	link-dad) parse "$@"; link_dad ;;

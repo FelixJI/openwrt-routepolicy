@@ -24,6 +24,7 @@ case "$*" in
 	'call network.interface.wan status') echo wan ;;
 	'call network.interface.policy status') echo policy ;;
 	'call network.interface.rp_init_policy status') echo new_policy ;;
+	'call network.interface.rp_init_default status') echo new_policy ;;
 	'call network.interface dump') echo '{"interface":[{"interface":"lan","proto":"static"}]}' ;;
 	'call network.device status') echo '{"eth3":{"present":true}}' ;;
 	'call service list') echo services ;;
@@ -57,15 +58,30 @@ EOF
 cat >"$tmp/bin/ip" <<'EOF'
 #!/bin/sh
 case "$*" in
-	'-4 rule show') printf '%s\n' '0: from all lookup local' '32766: from all lookup main'; [ "${TEST_RULE_CONFLICT:-0}" = 0 ] || echo '12000: from all lookup 250' ;;
+	'-4 rule show')
+		printf '%s\n' '0: from all lookup local' '32766: from all lookup main'
+		[ "${TEST_RULE_CONFLICT:-0}" = 0 ] || echo '12000: from all lookup 250'
+		[ "${TEST_UNMARKED_RULE:-0}" = 0 ] || echo '1000: from all lookup 123' ;;
 	'-4 route show table 200')
 		case "${TEST_TABLE_ERROR:-none}" in
 			absent) printf '%s\n' 'Error: ipv4: FIB table does not exist.' 'Dump terminated' >&2; exit 2 ;;
 			permission) echo 'RTNETLINK answers: Operation not permitted' >&2; exit 2 ;;
 		esac
 		[ "${TEST_TABLE_CONFLICT:-0}" = 0 ] || echo 'default via 10.9.0.1 dev eth9' ;;
-	'-4 -o addr show'|'-o addr show') printf '%s\n' '2: br-lan inet 192.168.1.1/24 brd 192.168.1.255' '3: eth1 inet 10.1.0.2/24 brd 10.1.0.255' ;;
-	'-4 route show table all'|'-6 rule show') : ;;
+	'-4 -o addr show'|'-o addr show')
+		printf '%s\n' '2: br-lan inet 192.168.1.1/24 brd 192.168.1.255' '3: eth1 inet 10.1.0.2/24 brd 10.1.0.255'
+		[ -z "${TEST_OTHER_ADDRESS:-}" ] || echo "$TEST_OTHER_ADDRESS" ;;
+	'-4 route show table main default')
+		echo "default via ${TEST_DEFAULT_GATEWAY:-10.1.0.1} dev ${TEST_DEFAULT_DEVICE:-eth1} proto static metric ${TEST_DEFAULT_METRIC:-0}"
+		echo "default via 10.2.0.1 dev eth2 proto static metric ${TEST_POLICY_METRIC:-200}"
+		[ -z "${TEST_THIRD_DEFAULT:-}" ] || echo "$TEST_THIRD_DEFAULT" ;;
+	'-4 route get fibmatch '*)
+		if [ "${TEST_FIB_CONNECTED:-0}" = 1 ]; then echo '198.18.0.0/15 dev eth9 proto kernel'; exit 0; fi
+		device=${TEST_FIB_DEVICE:-${TEST_DEFAULT_DEVICE:-eth1}}
+		case "$*" in *' from '*) device=${TEST_FORWARDED_DEVICE:-$device} ;; esac
+		echo "default via ${TEST_DEFAULT_GATEWAY:-10.1.0.1} dev $device proto static ${TEST_FIB_TABLE:-}" ;;
+	'-4 route show table all') [ -z "${TEST_EXTRA_ROUTE:-}" ] || echo "$TEST_EXTRA_ROUTE" ;;
+	'-6 rule show') : ;;
 	'-4 -o addr show dev eth3') [ -z "${TEST_LINK_IPV4:-}" ] || echo "$TEST_LINK_IPV4" ;;
 	'-6 -o addr show dev eth3') echo "${TEST_LINK_IPV6:-5: eth3 inet6 fe80::1/64 scope link proto kernel_ll}" ;;
 	'-4 route show table all dev eth3') [ -z "${TEST_LINK_ROUTE4:-}" ] || echo "$TEST_LINK_ROUTE4" ;;
@@ -173,6 +189,8 @@ table inet fw4 {
 		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 jump accept_to_wan comment "!fw4: routepolicy-init-default4"
 		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 jump accept_to_policy comment "!fw4: routepolicy-init-policy4"
 		meta nfproto 10 counter packets 0 bytes 0 jump handle_reject comment "!fw4: routepolicy-init-ipv6"
+		jump accept_to_wan comment "!fw4: Accept lan to wan forwarding"
+		jump accept_to_lan
 	}
 	chain accept_to_wan {
 		oifname "eth1" counter packets 0 bytes 0 accept comment "!fw4: accept wan IPv4/IPv6 traffic"
@@ -222,6 +240,11 @@ RULES
 reject() {
 	if "$@" >"$tmp/rejected" 2>"$tmp/error"; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi
 }
+apply_mock_plan() {
+	awk -F '\t' '$1=="set"{print $2 "\t" $3}' "$1" >>"$tmp/config"
+	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
+	mv "$tmp/config.new" "$tmp/config"
+}
 baseline
 cp "$tmp/config" "$tmp/before"
 "$tool" discover >"$tmp/discover"
@@ -266,7 +289,7 @@ TEST_TABLE_ERROR=absent "$tool" plan lan wan policy >"$tmp/empty-table"
 cmp "$tmp/plan" "$tmp/empty-table"
 reject env TEST_NFT_MARK=1 "$tool" plan lan wan policy
 reject env TEST_FW4_INVALID=1 "$tool" plan lan wan policy
-"$tool" plan lan lan policy >"$tmp/one-arm"
+TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 "$tool" plan lan lan policy >"$tmp/one-arm"
 grep -Fq 'set	firewall.rp_init_default4.dest	lan' "$tmp/one-arm"
 grep -Fq 'set	firewall.rp_init_redirects.icmp_type	redirect' "$tmp/one-arm"
 "$tool" plan lan wan policy - - - - - - 192.168.1.2 24 >"$tmp/management"
@@ -340,13 +363,72 @@ firewall.custom.target	ACCEPT
 EOF
 reject "$tool" plan lan wan policy
 baseline
+# A clean official chain is safe before the managed IPv6 rule exists.
+grep -v 'routepolicy-init-' "$tmp/nft" >"$tmp/official-before.nft"
+TEST_NFT_FILE="$tmp/official-before.nft" "$tool" plan lan wan policy >"$tmp/official-before-plan"
+cmp "$tmp/plan" "$tmp/official-before-plan"
+awk '/chain forward_lan \{/{print;print "meta nfproto ipv6 accept";next}{print}' "$tmp/nft" >"$tmp/early-access-accept.nft"
+awk '/chain forward \{/{print;print "meta nfproto 10 accept";next}{print}' "$tmp/nft" >"$tmp/early-root-accept.nft"
+awk '/chain handle_reject \{/{print;print "meta nfproto 10 accept";next}{print}' "$tmp/nft" >"$tmp/early-reject-accept.nft"
+for poisoned in early-access-accept early-root-accept early-reject-accept; do
+	reject env TEST_NFT_FILE="$tmp/$poisoned.nft" "$tool" plan lan wan policy
+	grep -Fq 'IPv6 control flow' "$tmp/error"
+done
+printf 'firewall.early\tinclude\nfirewall.early.type\tnftables\nfirewall.early.chain\tforward_lan\n' >>"$tmp/config"
+reject "$tool" plan lan wan policy
+baseline
+reject env TEST_POLICY_METRIC=0 "$tool" plan lan wan policy
+reject env TEST_UNMARKED_RULE=1 "$tool" plan lan wan policy
+reject env TEST_FIB_DEVICE=eth2 "$tool" plan lan wan policy
+reject env TEST_FORWARDED_DEVICE=eth2 "$tool" plan lan wan policy
+reject env TEST_FIB_CONNECTED=1 "$tool" plan lan wan policy
+reject env TEST_FIB_TABLE='table 123' "$tool" plan lan wan policy
+reject env TEST_DEFAULT_METRIC=300 TEST_POLICY_METRIC=400 "$tool" plan lan wan rp_init_policy policy eth3 dhcp - - - - -
+TEST_DEFAULT_DEVICE=eth2 TEST_DEFAULT_GATEWAY=10.2.0.1 TEST_POLICY_METRIC=0 "$tool" plan lan rp_init_default policy default eth3 dhcp - - - - - >"$tmp/new-default"
+grep -Fxq 'set	network.policy.metric	200' "$tmp/new-default"
+grep -Fxq 'set	network.rp_init_default.metric	10' "$tmp/new-default"
+reject env TEST_DEFAULT_DEVICE=eth2 TEST_DEFAULT_GATEWAY=10.2.0.1 TEST_POLICY_METRIC=0 TEST_THIRD_DEFAULT='default via 10.9.0.1 dev eth9 metric 0' "$tool" plan lan rp_init_default policy default eth3 dhcp - - - - -
+"$tool" link-plan lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/dhcp-identity"
+grep -Fxq 'required	1' "$tmp/dhcp-identity"
+grep -Fxq 'dad_required	0' "$tmp/dhcp-identity"
+grep -Fxq 'target	-' "$tmp/dhcp-identity"
+grep -Fxq 'dad	not-required' "$tmp/dhcp-identity"
+echo '02:00:00:00:00:04' >"$tmp/root/sys/class/net/eth3/address"
+"$tool" link-plan lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/dhcp-identity-new-mac"
+if cmp -s "$tmp/dhcp-identity" "$tmp/dhcp-identity-new-mac"; then echo 'DHCP physical identity was not captured' >&2; exit 1; fi
+baseline
+printf 'network.other\tinterface\nnetwork.other.ipaddr\t10.3.0.1/24\n' >>"$tmp/config"
+reject "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.200 25 10.3.0.129 - -
+baseline
+printf 'network.other\tinterface\nnetwork.other.ipaddr\t10.3.0.129/25\n' >>"$tmp/config"
+reject "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+baseline
+printf 'network.other\tinterface\nnetwork.other.ipaddr\t10.3.0.1\nnetwork.other.netmask\t255.255.255.0\n' >>"$tmp/config"
+reject "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.200 25 10.3.0.129 - -
+baseline
+printf 'network.other\tinterface\nnetwork.other.ipaddr\t10.3.0.1/25\n' >>"$tmp/config"
+"$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.200 25 10.3.0.129 - - >"$tmp/adjacent"
+baseline
+reject env TEST_OTHER_ADDRESS='9: eth9 inet 10.3.0.1/24 brd 10.3.0.255' "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.200 25 10.3.0.129 - -
+reject env TEST_EXTRA_ROUTE='10.3.0.0/24 via 10.1.0.1 dev eth1 proto static' "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.200 25 10.3.0.129 - -
+reject env TEST_EXTRA_ROUTE='10.3.0.128/25 dev eth9 proto kernel scope link' "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+TEST_EXTRA_ROUTE='10.3.0.0/25 dev eth9 proto kernel scope link' "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.200 25 10.3.0.129 - - >"$tmp/adjacent-route"
+# DHCP overlap becomes knowable after obtaining the lease and must block verify.
+printf 'network.rp_init_policy\tinterface\nnetwork.rp_init_policy.device\teth3\nnetwork.rp_init_policy.proto\tdhcp\nnetwork.other\tinterface\nnetwork.other.ipaddr\t10.3.0.1/24\n' >>"$tmp/config"
+reject "$tool" verify lan wan rp_init_policy policy eth3 dhcp - - - - -
+grep -Fq 'address overlap' "$tmp/error"
+baseline
 # Simulate the coordinator's allowed writes without any runtime network changes.
-awk -F '\t' '$1=="set"{print $2 "\t" $3}' "$tmp/plan" >>"$tmp/config"
-awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
-mv "$tmp/config.new" "$tmp/config"
+apply_mock_plan "$tmp/plan"
 "$tool" verify lan wan policy >"$tmp/verify"
 grep -Fq '"packet_evidence":"EVIDENCE_MISSING"' "$tmp/verify"
 grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
+for poisoned in early-access-accept early-root-accept early-reject-accept; do
+	reject env TEST_NFT_FILE="$tmp/$poisoned.nft" "$tool" verify lan wan policy
+	grep -Fq 'IPv6 control flow' "$tmp/error"
+done
+reject env TEST_FIB_DEVICE=eth2 "$tool" verify lan wan policy
+reject env TEST_FORWARDED_DEVICE=eth2 "$tool" verify lan wan policy
 sed -e 's/meta nfproto 2 /meta nfproto ipv4 /g' -e 's/meta nfproto 10 /meta nfproto ipv6 /g' \
 	-e 's/icmpv6 type 134 /icmpv6 type nd-router-advert /g' -e 's/icmp type 5 /icmp type redirect /g' "$tmp/nft" >"$tmp/symbolic.nft"
 TEST_NFT_FILE="$tmp/symbolic.nft" "$tool" verify lan wan policy >"$tmp/verify-symbolic"
@@ -394,5 +476,21 @@ echo 0 >"$tmp/root/proc/sys/net/ipv4/conf/all/rp_filter"
 reject env TEST_SERVICE_DOWN=1 "$tool" verify lan wan policy
 reject env TEST_MISSING_RULE=1 "$tool" verify lan wan policy
 reject env TEST_NO_DNS=1 "$tool" verify lan wan policy
+baseline
+apply_mock_plan "$tmp/new-default"
+sed -e 's/wan/rp_init_default/g' -e 's/eth1/eth3/g' "$tmp/nft" >"$tmp/default-runtime.nft"
+TEST_NFT_FILE="$tmp/default-runtime.nft" TEST_DEFAULT_DEVICE=eth3 TEST_DEFAULT_GATEWAY=10.3.0.1 TEST_DEFAULT_METRIC=10 "$tool" verify lan rp_init_default policy default eth3 dhcp - - - - - >"$tmp/verify-new-default"
+reject env TEST_NFT_FILE="$tmp/default-runtime.nft" TEST_DEFAULT_DEVICE=eth3 TEST_DEFAULT_GATEWAY=10.3.0.1 TEST_DEFAULT_METRIC=10 TEST_FIB_DEVICE=eth2 "$tool" verify lan rp_init_default policy default eth3 dhcp - - - - -
+baseline
+"$tool" plan lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/new-policy-final"
+apply_mock_plan "$tmp/new-policy-final"
+sed -e 's/_policy/_rp_init_policy/g' -e 's/Handle policy /Handle rp_init_policy /g' -e 's/accept policy /accept rp_init_policy /g' -e 's/eth2/eth3/g' "$tmp/nft" >"$tmp/policy-runtime.nft"
+TEST_NFT_FILE="$tmp/policy-runtime.nft" "$tool" verify lan wan rp_init_policy policy eth3 dhcp - - - - - >"$tmp/verify-new-policy"
+baseline
+TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 "$tool" plan lan lan policy >"$tmp/single-arm-final"
+apply_mock_plan "$tmp/single-arm-final"
+sed -e 's/wan/lan/g' -e 's/eth1/br-lan/g' "$tmp/nft" >"$tmp/single-arm-runtime.nft"
+TEST_NFT_FILE="$tmp/single-arm-runtime.nft" TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 "$tool" verify lan lan policy >"$tmp/verify-single-arm"
+reject env TEST_NFT_FILE="$tmp/single-arm-runtime.nft" TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 TEST_FIB_DEVICE=eth2 "$tool" verify lan lan policy
 [ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
 printf '%s\n' 'init topology tests: passed'

@@ -16,7 +16,7 @@ ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routep
 start_service() {
 	# Startup is the reboot boundary; restore unfinished mutations before normal policy apply.
 	if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
-		"$ROUTEPOLICY_INIT_TRANSACTION" recover >/dev/null || return 1
+		"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || return 1
 	fi
 	config_load routepolicy
 	enabled=0

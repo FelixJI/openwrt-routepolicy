@@ -5,26 +5,44 @@ REAL_LIB="$ROOT/routepolicy/files/usr/libexec/routepolicy"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-transaction.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 if [ "${1:-}" = --native-uci ]; then
-	mkdir -p "$tmp/config" "$tmp/private"
-	printf "config interface 'lan'\n\tlist ipaddr '192.0.2.1/24'\n" >"$tmp/config/rp_init_contract"
-	uci -c "$tmp/config" -t "$tmp/private" set rp_init_contract.lan.ipaddr=192.0.2.2
-	[ "$(uci -c "$tmp/config" get rp_init_contract.lan.ipaddr)" = 192.0.2.1/24 ]
-	[ -z "$(uci -c "$tmp/config" changes rp_init_contract)" ]
-	[ "$(uci -c "$tmp/config" -t "$tmp/private" get rp_init_contract.lan.ipaddr)" = 192.0.2.2 ]
-	uci -c "$tmp/config" -t "$tmp/private" commit rp_init_contract
-	uci -c "$tmp/config" export rp_init_contract | grep -Fq "option ipaddr '192.0.2.2'"
-	uci -c "$tmp/config" -t "$tmp/private" delete rp_init_contract.lan.ipaddr
-	uci -c "$tmp/config" -t "$tmp/private" add_list rp_init_contract.lan.ipaddr=192.0.2.1/24
-	uci -c "$tmp/config" -t "$tmp/private" commit rp_init_contract
-	uci -c "$tmp/config" export rp_init_contract | grep -Fq "list ipaddr '192.0.2.1/24'"
-	[ -z "$(uci -c "$tmp/config" changes rp_init_contract)" ]
-	printf '%s\n' 'native UCI private delta/list restoration contract: passed'
+	if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+		uci() { "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/sbin/uci" "$@"; }
+	fi
+	native_id=$(sed 's/-//g' /proc/sys/kernel/random/uuid)
+	native_package="rp_test_$native_id"; native_alias="rp_alias_$native_id"
+	[ ! -e "/tmp/.uci/$native_package" ]
+	trap 'rm -f "/tmp/.uci/$native_package"; rm -rf "$tmp"' EXIT HUP INT TERM
+	mkdir -p "$tmp/config" "$tmp/private" "$tmp/aliases"
+	printf "config interface 'lan'\n\tlist ipaddr '192.0.2.1/24'\nconfig dhcp 'other'\n\toption leasetime '12h'\n" >"$tmp/config/$native_package"
+	uci -c "$tmp/config" set "$native_package.other.leasetime=2h"
+	cp "/tmp/.uci/$native_package" "$tmp/external-pending"
+	# -t alone still reads the default delta; the token-named package alias does not.
+	[ "$(uci -c "$tmp/config" -t "$tmp/private" get "$native_package.other.leasetime")" = 2h ]
+	ln -s "$tmp/config/$native_package" "$tmp/aliases/$native_alias"
+	[ "$(uci -c "$tmp/aliases" -t "$tmp/private" get "$native_alias.other.leasetime")" = 12h ]
+	uci -c "$tmp/aliases" -t "$tmp/private" set "$native_alias.lan.ipaddr=192.0.2.2"
+	# A field committed after staging must survive the libuci locked reload/merge.
+	printf "\toption concurrent 'kept'\n" >>"$tmp/config/$native_package"
+	uci -c "$tmp/aliases" -t "$tmp/private" commit "$native_alias"
+	[ "$(uci -c "$tmp/aliases" -t "$tmp/private" get "$native_alias.lan.ipaddr")" = 192.0.2.2 ]
+	[ "$(uci -c "$tmp/aliases" -t "$tmp/private" get "$native_alias.other.concurrent")" = kept ]
+	[ "$(uci -c "$tmp/aliases" -t "$tmp/private" get "$native_alias.other.leasetime")" = 12h ]
+	cmp "$tmp/external-pending" "/tmp/.uci/$native_package"
+	[ "$(uci -c "$tmp/config" get "$native_package.other.leasetime")" = 2h ]
+	uci -c "$tmp/aliases" -t "$tmp/private" delete "$native_alias.lan.ipaddr"
+	uci -c "$tmp/aliases" -t "$tmp/private" add_list "$native_alias.lan.ipaddr=192.0.2.1/24"
+	uci -c "$tmp/aliases" -t "$tmp/private" commit "$native_alias"
+	uci -c "$tmp/aliases" -t "$tmp/private" export "$native_alias" | grep -Fq "list ipaddr '192.0.2.1/24'"
+	cmp "$tmp/external-pending" "/tmp/.uci/$native_package"
+	printf '%s\n' 'native UCI alias isolation, concurrent-field merge and list restoration: passed'
 	exit 0
 fi
 mkdir -p "$tmp/bin" "$tmp/lib" "$tmp/root/etc/init.d" "$tmp/db"
 cp "$REAL_LIB/common" "$REAL_LIB/init-transaction" "$tmp/lib/"
 chmod +x "$tmp/lib/init-transaction"
 export TEST_TX_DIR="$tmp" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
+TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
+export TEST_NATIVE_UCI_PATH
 export PATH="$tmp/bin:$PATH"
 TX="$tmp/lib/init-transaction"
 WAL="$tmp/root/etc/routepolicy/state/init-transaction/current"
@@ -34,11 +52,14 @@ cat >"$tmp/bin/uci" <<'EOF'
 set -eu
 delta=
 while [ "$#" -gt 0 ]; do
-	case "$1" in -q) shift ;; -t) delta=$2; shift 2 ;; -P) exit 1 ;; *) break ;; esac
+	case "$1" in -q) shift ;; -c) shift 2 ;; -t) delta=$2; shift 2 ;; -P) exit 1 ;; *) break ;; esac
 done
 op=$1; key=${2:-}; db="$TEST_TX_DIR/db"
+case "$key" in rp_*) key=${key#rp_}; key=${key#*_} ;; esac
 case "$op" in
-	changes) [ ! -f "$TEST_TX_DIR/pending" ] || printf '%s\n' external-change ;;
+	changes)
+		[ ! -f "$TEST_TX_DIR/pending" ] || printf '%s\n' external-change
+		[ ! -f "$TEST_TX_DIR/pending-$key" ] || cat "$TEST_TX_DIR/pending-$key" ;;
 	get)
 		if [ -n "$delta" ] && [ -f "$delta/$key" ]; then cat "$delta/$key"
 		elif [ -f "$db/$key" ]; then cat "$db/$key"; else exit 1; fi
@@ -111,19 +132,35 @@ case "$1" in
 		printf 'set\tdhcp.lan.ignore\t1\n'
 		printf 'set\tfirewall.rp_init_dns\trule\n'
 		printf 'set\tfirewall.rp_init_dns.name\tinit-dns\n'
-		printf 'set\tfirewall.rp_init_dns.target\tACCEPT\n' ;;
+		printf 'set\tfirewall.rp_init_dns.target\tACCEPT\n'
+		[ ! -f "$TEST_TX_DIR/extra-dhcp" ] || printf 'set\tdhcp.lan.ra\tdisabled\n' ;;
 	verify)
 		if [ -f "$TEST_TX_DIR/verify-fail" ]; then printf '%s\n' 'fixture runtime evidence unavailable' >&2; exit 1; fi ;;
 	management-address) cat "$TEST_TX_DIR/db/network.lan.ipaddr" ;;
 	link-plan)
+		if [ -f "$TEST_TX_DIR/window-change" ] && [ -f "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/baseline-now" ]; then
+			case "$(cat "$TEST_TX_DIR/window-change")" in
+				scalar)
+					if [ "${TEST_NATIVE_TRANSACTION:-0}" = 1 ]; then
+						uci -t "$TEST_TX_DIR/concurrent" set routepolicy.main.lan_interface=foreign
+						uci -t "$TEST_TX_DIR/concurrent" commit routepolicy
+					else printf foreign >"$TEST_TX_DIR/db/routepolicy.main.lan_interface"; fi ;;
+				absent) printf rule >"$TEST_TX_DIR/db/firewall.rp_init_dns" ;;
+				list) : >"$TEST_TX_DIR/list.network.lan.ipaddr" ;;
+			esac
+			rm "$TEST_TX_DIR/window-change"
+		fi
 		if [ ! -f "$TEST_TX_DIR/link-enabled" ]; then printf 'required\t0\n'; exit 0; fi
 		link="$ROUTEPOLICY_ROOT/sys/class/net/eth9"
 		up=0; [ "$(cat "$link/flags")" != 0x1 ] || up=1
 		dad=pending-link-up; [ "$up" = 0 ] || dad=clear
-		printf 'required\t1\ndevice\teth9\nifindex\t%s\nmac\t%s\ndevice_path\t%s\nup\t%s\ncarrier\t1\ntarget\t198.51.100.2\ndad\t%s\n' \
-			"$(cat "$link/ifindex")" "$(cat "$link/address")" "$(readlink -f "$link/device")" "$up" "$dad" ;;
+		dad_required=1; target=198.51.100.2
+		if [ -f "$TEST_TX_DIR/link-dhcp" ]; then dad_required=0; target=-; dad=not-required; fi
+		printf 'required\t1\ndad_required\t%s\ndevice\teth9\nifindex\t%s\nmac\t%s\ndevice_path\t%s\nup\t%s\ncarrier\t1\ntarget\t%s\ndad\t%s\n' \
+			"$dad_required" "$(cat "$link/ifindex")" "$(cat "$link/address")" "$(readlink -f "$link/device")" "$up" "$target" "$dad" ;;
 	link-unclaimed) [ ! -f "$TEST_TX_DIR/link-claimed" ] ;;
 	link-dad)
+		[ ! -f "$TEST_TX_DIR/link-dhcp" ] || { printf '%s\n' 'DHCP creation must not invoke static DAD' >&2; exit 1; }
 		[ "$(cat "$ROUTEPOLICY_ROOT/sys/class/net/eth9/flags")" = 0x1 ]
 		[ ! -f "$TEST_TX_DIR/commits" ] || { printf '%s\n' 'DAD occurred after UCI commit' >&2; exit 1; }
 		if [ -f "$TEST_TX_DIR/link-kill" ]; then
@@ -170,7 +207,12 @@ for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 #!/bin/sh
 name=${0##*/}
 printf '%s %s\n' "$name" "$1" >>"$TEST_TX_DIR/services"
-[ ! -f "$TEST_TX_DIR/service-fail" ] || [ "$name" != firewall ]
+[ ! -f "$TEST_TX_DIR/service-fail" ] || [ "$name" != firewall ] || exit 1
+[ ! -f "$TEST_TX_DIR/service-fail-odhcpd" ] || [ "$name" != odhcpd ] || exit 1
+case "$name" in
+	network) cat "$TEST_TX_DIR/db/network.lan.ipaddr" >"$TEST_TX_DIR/runtime-management" ;;
+	dnsmasq) cat "$TEST_TX_DIR/db/dhcp.lan.ignore" >"$TEST_TX_DIR/runtime-ignore" ;;
+esac
 EOF
 done
 chmod +x "$tmp/bin/"* "$tmp/lib/init-topology" "$tmp/root/etc/init.d/"*
@@ -178,10 +220,13 @@ chmod +x "$tmp/bin/"* "$tmp/lib/init-topology" "$tmp/root/etc/init.d/"*
 reset() {
 	rm -rf "$tmp/root/etc/routepolicy" "$tmp/db"
 	mkdir "$tmp/db"
-	rm -f "$tmp/fail-at" "$tmp/kill-at" "$tmp/fw4-fail" "$tmp/verify-fail" "$tmp/service-fail" "$tmp/pending" "$tmp/commits" "$tmp/bad-plan" "$tmp/guard-down" "$tmp/services"
+	rm -f "$tmp/fail-at" "$tmp/kill-at" "$tmp/fw4-fail" "$tmp/verify-fail" "$tmp/service-fail" "$tmp/service-fail-odhcpd" "$tmp/pending" "$tmp/commits" "$tmp/bad-plan" "$tmp/guard-down" "$tmp/services"
 	rm -f "$tmp/"list.*
 	rm -f "$tmp/"link-*
 	rm -f "$tmp/guard-delete"
+	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp"
+	mkdir -p "$tmp/root/etc/config"
+	for config_package in network dhcp firewall routepolicy; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
 	rm -f "$tmp/root/sys/class/net/eth9/device"
 	ln -s "$tmp/physical/eth9" "$tmp/root/sys/class/net/eth9/device"
@@ -195,6 +240,9 @@ reset() {
 	printf 192.0.2.1 >"$tmp/db/network.lan.ipaddr"
 	printf 0 >"$tmp/db/dhcp.lan.ignore"
 	printf untouched >"$tmp/db/dhcp.other.ignore"
+	printf server >"$tmp/db/dhcp.lan.ra"
+	printf 192.0.2.1 >"$tmp/runtime-management"
+	printf 0 >"$tmp/runtime-ignore"
 }
 prepare() {
 	out=$("$TX" prepare lan wan usbwan - - - - - - 192.0.2.2 24)
@@ -209,6 +257,61 @@ restored() {
 	[ ! -f "$tmp/db/firewall.rp_init_dns" ]
 }
 bad() { if "$@" >"$tmp/failure" 2>&1; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi; }
+
+if [ "${1:-}" = --native-transaction ]; then
+	[ -n "${TEST_UCI_SDK_ROOT:-}" ] || [ -n "$TEST_NATIVE_UCI_PATH" ]
+	export TEST_NATIVE_TRANSACTION=1
+	cat >"$tmp/bin/uci" <<'EOF'
+#!/bin/sh
+if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+	exec "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/sbin/uci" -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_TX_DIR/external" "$@"
+fi
+exec "$TEST_NATIVE_UCI_PATH" -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_TX_DIR/external" "$@"
+EOF
+	native_reset() {
+		reset
+		rm -rf "$tmp/external" "$tmp/concurrent"
+		mkdir "$tmp/external" "$tmp/concurrent"
+		printf "config interface 'lan'\n\toption ipaddr '192.0.2.1'\n" >"$tmp/root/etc/config/network"
+		printf "config main 'main'\n\toption lan_interface 'lan'\n\toption default_interface 'wan'\n\toption policy_interface 'usbwan'\n" >"$tmp/root/etc/config/routepolicy"
+		printf "config dhcp 'lan'\n\toption ignore '0'\n\toption ra 'server'\nconfig dhcp 'other'\n\toption leasetime '12h'\n" >"$tmp/root/etc/config/dhcp"
+	}
+	native_get() {
+		native_pkg=${1%%.*}
+		uci -c "$WAL/config" -t "$WAL/read-delta" get "rp_${token}_${native_pkg}${1#"$native_pkg"}"
+	}
+	native_reset; prepare; "$TX" apply "$token" >/dev/null
+	uci set dhcp.other.leasetime=2h
+	cp "$tmp/external/dhcp" "$tmp/external-original"
+	: >"$tmp/services"
+	bad "$TX" recover; phase_is conflict
+	[ "$(native_get network.lan.ipaddr)" = 192.0.2.1 ]
+	[ "$(native_get dhcp.lan.ignore)" = 0 ]
+	[ "$(native_get dhcp.other.leasetime)" = 12h ]
+	[ "$(uci get dhcp.other.leasetime)" = 2h ]
+	cmp "$tmp/external-original" "$tmp/external/dhcp"
+	grep -Fxq 'network reload' "$tmp/services"
+	if grep -Eq '^(dnsmasq|odhcpd) ' "$tmp/services"; then exit 1; fi
+	uci revert dhcp.other.leasetime
+	"$TX" recover >/dev/null; phase_is rolled_back
+	native_reset; touch "$tmp/extra-dhcp"; prepare; "$TX" apply "$token" >/dev/null
+	uci set dhcp.lan.ignore=0
+	cp "$tmp/external/dhcp" "$tmp/external-original"
+	bad "$TX" recover; phase_is conflict
+	[ "$(native_get dhcp.lan.ignore)" = 1 ]
+	[ "$(native_get dhcp.lan.ra)" = server ]
+	[ "$(native_get network.lan.ipaddr)" = 192.0.2.1 ]
+	cmp "$tmp/external-original" "$tmp/external/dhcp"
+	uci revert dhcp.lan.ignore
+	"$TX" recover >/dev/null; phase_is rolled_back
+	native_reset; prepare; printf scalar >"$tmp/window-change"
+	bad "$TX" apply "$token"; phase_is rolled_back
+	[ "$(native_get routepolicy.main.lan_interface)" = foreign ]
+	[ "$(cat "$WAL/fields/1/old")" = lan ]
+	"$TX" status | grep -Fq '"failed_stage":"concurrent-write"'
+	printf '%s\n' 'native UCI transaction: unrelated/owned pending isolated, sibling recovery continues, prepare baseline frozen (services mocked)'
+	exit 0
+fi
 
 reset
 "$TX" recover >/dev/null
@@ -246,6 +349,19 @@ bad "$TX" apply "$token"
 phase_is prepared
 [ "$(cat "$tmp/db/dhcp.lan.ignore")" = external ]
 
+# WAL old values/existence/list type remain the prepare baseline across the last-read window.
+for window_kind in scalar absent list; do
+	reset; prepare; printf '%s\n' "$window_kind" >"$tmp/window-change"
+	bad "$TX" apply "$token"
+	phase_is rolled_back
+	"$TX" status | grep -Fq '"failed_stage":"concurrent-write"'
+	case "$window_kind" in
+		scalar) [ "$(cat "$tmp/db/routepolicy.main.lan_interface")" = foreign ]; [ "$(cat "$WAL/fields/1/old")" = lan ] ;;
+		absent) [ "$(cat "$tmp/db/firewall.rp_init_dns")" = rule ]; [ "$(cat "$WAL/fields/6/existed")" = 0 ] ;;
+		list) [ -f "$tmp/list.network.lan.ipaddr" ]; [ "$(cat "$WAL/fields/4/type")" = scalar ] ;;
+	esac
+done
+
 reset; prepare
 touch "$tmp/guard-down"
 bad "$TX" apply "$token"
@@ -262,6 +378,66 @@ cmp "$tmp/expected-stages" "$WAL/smartdns-stages"
 "$TX" apply "$token" >/dev/null
 "$TX" recover >/dev/null
 phase_is confirmed
+
+# Unrelated same-package pending is neither committed nor discarded; runtime reload is deferred.
+reset; prepare; "$TX" apply "$token" >/dev/null
+printf "dhcp.other.leasetime='2h'\n" >"$tmp/pending-dhcp"
+cp "$tmp/pending-dhcp" "$tmp/pending-original"
+: >"$tmp/services"
+bad "$TX" recover
+phase_is conflict
+restored
+cmp "$tmp/pending-original" "$tmp/pending-dhcp"
+[ ! -f "$tmp/db/dhcp.other.leasetime" ]
+[ "$(cat "$tmp/runtime-management")" = 192.0.2.1 ]
+[ "$(cat "$tmp/runtime-ignore")" = 1 ]
+grep -Fxq 'network reload' "$tmp/services"
+grep -Fxq 'firewall reload' "$tmp/services"
+if grep -Eq '^(dnsmasq|odhcpd) ' "$tmp/services"; then exit 1; fi
+"$TX" status | grep -Fq 'dnsmasq:dhcp'
+rm "$tmp/pending-dhcp"
+"$TX" recover >/dev/null
+phase_is rolled_back
+[ "$(cat "$tmp/runtime-ignore")" = 0 ]
+
+# Pending on one owned key preserves that committed key but does not block sibling restoration.
+reset; touch "$tmp/extra-dhcp"; prepare; "$TX" apply "$token" >/dev/null
+printf "dhcp.lan.ignore='0'\n" >"$tmp/pending-dhcp"
+cp "$tmp/pending-dhcp" "$tmp/pending-original"
+bad "$TX" recover
+phase_is conflict
+[ "$(cat "$tmp/db/dhcp.lan.ignore")" = 1 ]
+[ "$(cat "$tmp/db/dhcp.lan.ra")" = server ]
+[ "$(cat "$tmp/db/network.lan.ipaddr")" = 192.0.2.1 ]
+cmp "$tmp/pending-original" "$tmp/pending-dhcp"
+"$TX" status | grep -Fq pending:dhcp.lan.ignore
+rm "$tmp/pending-dhcp"; "$TX" recover >/dev/null; phase_is rolled_back
+
+# Network pending keeps the currently reachable management path until it can be reconciled.
+reset; prepare; "$TX" apply "$token" >/dev/null
+printf "network.lan.ipaddr='192.0.2.99'\n" >"$tmp/pending-network"
+cp "$tmp/pending-network" "$tmp/pending-original"
+: >"$tmp/services"
+bad "$TX" recover
+phase_is conflict
+[ "$(cat "$tmp/runtime-management")" = 192.0.2.2 ]
+[ "$(cat "$tmp/db/network.lan.ipaddr")" = 192.0.2.2 ]
+[ "$(cat "$tmp/db/dhcp.lan.ignore")" = 0 ]
+[ ! -s "$tmp/services" ]
+cmp "$tmp/pending-original" "$tmp/pending-network"
+"$TX" status | grep -Fq network:network
+rm "$tmp/pending-network"; "$TX" recover >/dev/null; phase_is rolled_back
+[ "$(cat "$tmp/runtime-management")" = 192.0.2.1 ]
+
+# An absent optional IPv6 daemon is skipped; an installed failing daemon is a real failure.
+reset; mv "$tmp/root/etc/init.d/odhcpd" "$tmp/odhcpd-installed"
+prepare; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null; phase_is rolled_back
+mv "$tmp/odhcpd-installed" "$tmp/root/etc/init.d/odhcpd"
+reset; touch "$tmp/service-fail-odhcpd"; prepare
+bad "$TX" apply "$token"
+phase_is conflict
+"$TX" status | grep -Fq '"failed_stage":"reload:odhcpd"'
+rm "$tmp/service-fail-odhcpd"; "$TX" recover >/dev/null; phase_is rolled_back
 
 # Every field commit can fail, including after staging private UCI changes.
 for fail_at in 1 2 3 4 5 6 7 8; do
@@ -343,6 +519,21 @@ bad "$TX" apply "$token"
 wait "$lock_pid"
 phase_is prepared
 
+# Startup waits for the boot guard's in-flight recovery, then permits the normal service.
+reset; prepare; "$TX" apply "$token" >/dev/null
+exec 6>"$tmp/root/etc/routepolicy/state/init-transaction/lock"
+flock -x 6
+"$TX" recover-startup 6>&- >"$tmp/startup-recover-output" & startup_recover=$!
+sleep 1
+kill -0 "$startup_recover"
+printf rolled_back >"$WAL/phase"
+flock -u 6; exec 6>&-
+wait "$startup_recover"
+phase_is rolled_back
+printf conflict >"$WAL/phase"
+bad "$TX" recover-startup
+phase_is conflict
+
 # Admin-DOWN static egress: review stays read-only; DAD precedes every UCI commit.
 reset; touch "$tmp/link-enabled"
 "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >"$tmp/link-preview"
@@ -411,6 +602,25 @@ SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/nul
 "$TX" recover >/dev/null
 phase_is confirmed
 [ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x1 ]
+
+# DHCP freezes the same physical identity, without static link-UP or ARP-DAD actions.
+reset; touch "$tmp/link-enabled" "$tmp/link-dhcp"; prepare
+printf '02:00:00:00:00:19' >"$tmp/root/sys/class/net/eth9/address"
+bad "$TX" apply "$token"
+phase_is prepared
+[ ! -f "$tmp/commits" ]
+[ ! -f "$tmp/link-log" ]
+reset; touch "$tmp/link-enabled" "$tmp/link-dhcp"; prepare
+"$TX" apply "$token" >/dev/null
+phase_is pending
+[ ! -f "$tmp/link-log" ]
+printf '02:00:00:00:00:19' >"$tmp/root/sys/class/net/eth9/address"
+bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"
+phase_is pending
+"$TX" status | grep -Fq 'physical identity differs'
+printf '02:00:00:00:00:09' >"$tmp/root/sys/class/net/eth9/address"
+"$TX" recover >/dev/null
+phase_is rolled_back
 
 # An old terminal guard cannot unregister a fresh apply while the writer owns its lock.
 rm -f "$tmp/guard-delete"

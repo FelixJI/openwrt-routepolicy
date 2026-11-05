@@ -25,15 +25,56 @@ lock() {
 	safe_dir "$TX"
 	[ ! -L "$TX/lock" ] || fail '事务锁不是安全文件'
 	exec 9>"$TX/lock"
-	flock -n 9 || fail '另一个初始化事务正在写入'
+	if [ "${operation:-}" = recover-startup ]; then
+		flock -w 180 9 || fail '启动恢复等待写锁超时'
+	else flock -n 9 || fail '另一个初始化事务正在写入'; fi
 	[ ! -L "$WAL" ] && [ ! -L "$TX/previous" ] || fail '事务记录路径不安全'
 	# Restore the previous terminal/prepared generation if power failed during promotion.
 	if [ ! -e "$WAL" ] && [ -d "$TX/previous" ]; then
 		mv "$TX/previous" "$WAL" && sync || fail '不能恢复准备事务记录'
 	fi
 }
-# Finite writers retain the lock until they finish, even if their parent is killed.
-uci_private() { uci -t "$WAL/delta" "$@"; }
+uci_layout() {
+	namespace_token=$(cat "$WAL/token") || return 1
+	[ "${#namespace_token}" -eq 32 ] || return 1
+	case "$namespace_token" in *[!0-9a-f]*) return 1 ;; esac
+	safe_dir "$WAL/config"; safe_dir "$WAL/delta"; safe_dir "$WAL/read-delta"
+	for namespace_package in $PACKAGES; do
+		namespace_target="$RP_ROOT/etc/config/$namespace_package"
+		[ -f "$namespace_target" ] && [ ! -L "$namespace_target" ] || return 1
+		namespace_link="$WAL/config/rp_${namespace_token}_$namespace_package"
+		if [ -e "$namespace_link" ] || [ -L "$namespace_link" ]; then
+			[ -L "$namespace_link" ] && [ "$(readlink "$namespace_link")" = "$namespace_target" ] || return 1
+		else ln -s "$namespace_target" "$namespace_link" || return 1; fi
+	done
+}
+uci_alias() {
+	namespace_package=${1%%.*}
+	case "$namespace_package" in network|dhcp|firewall|routepolicy) ;; *) return 1 ;; esac
+	namespace_token=$(cat "$WAL/token") || return 1
+	namespace_argument="rp_${namespace_token}_${namespace_package}${1#"$namespace_package"}"
+}
+# -t still searches /tmp/.uci. Token-named package aliases isolate the delta lookup,
+# while libuci commits through the symlink target after its locked fresh-file merge.
+uci_private() {
+	uci_alias "$2" || return 1
+	uci -c "$WAL/config" -t "$WAL/delta" "$1" "$namespace_argument"
+}
+uci_committed() {
+	uci_alias "$2" || return 1
+	uci -q -c "$WAL/config" -t "$WAL/read-delta" "$1" "$namespace_argument"
+}
+field_pending() {
+	pending_field=$1
+	pending_package=${pending_field%%.*}
+	pending_changes=$(uci -q changes "$pending_package") || return 2
+	printf '%s\n' "$pending_changes" | awk -F= -v wanted="$pending_field" -v package="$pending_package" '
+		NF {
+			key=$1; sub(/^[+-]/,"",key); sub(/[+-]$/,"",key)
+			if(key !~ ("^" package "\\.[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)?$")) {unknown=1;next}
+			if(key==wanted || index(wanted,key ".")==1 || index(key,wanted ".")==1) found=1
+		} END {exit !(found||unknown)}'
+}
 no_pending() {
 	for pkg in $PACKAGES; do
 		pending=$(uci -q changes "$pkg") || return 1
@@ -57,6 +98,7 @@ plan_valid() {
 			key=$2
 			if(key ~ /^routepolicy\.main\.(lan_interface|default_interface|policy_interface)$/) next
 			if(key ~ /^network\.[A-Za-z0-9_]+\.(ipaddr|netmask)$/) next
+			if(key ~ /^network\.[A-Za-z0-9_]+\.metric$/ && $3=="200") next
 			if(key ~ /^network\.rp_init_(default|policy)(\.(device|proto|gateway|defaultroute|peerdns|metric))?$/) next
 			if(key ~ /^dhcp\.[A-Za-z0-9_]+\.(ignore|ra|dhcpv6|ndp)$/) next
 			if(key ~ /^firewall\.rp_init_(default|policy|default4|policy4|default_nat|policy_nat|default_dhcp_client|policy_dhcp_client|dns|ipv6|dhcp4|dhcp6|ra|redirects)(\.(name|network|input|output|forward|src|dest|src_ip|family|proto|target|src_port|dest_port|icmp_type))?$/) next
@@ -69,18 +111,21 @@ make_plan() { "$LIBEXEC/init-topology" plan "$@" 9>&-; }
 link_value() { awk -F '\t' -v wanted="$1" '$1==wanted {print $2}' "$2"; }
 link_plan_valid() {
 	awk -F '\t' 'NF!=2 || length($2)>256 || $2~/[^ -~]/ || seen[$1]++ {exit 1}
-		$1!~/^(required|device|ifindex|mac|device_path|up|carrier|target|dad)$/ {exit 1}
+		$1!~/^(required|dad_required|device|ifindex|mac|device_path|up|carrier|target|dad)$/ {exit 1}
 		{value[$1]=$2}
 		END {
-			if(NR<1 || NR>9 || value["required"] !~ /^[01]$/) exit 1
+			if(NR<1 || NR>10 || value["required"] !~ /^[01]$/) exit 1
 			if(value["required"]==1) {
 				if(value["device"] !~ /^[A-Za-z0-9_-]+$/ || value["device"]=="lo" || length(value["device"])>32) exit 1
 				if(value["ifindex"] !~ /^[0-9]+$/ || value["ifindex"]<1 || value["ifindex"]>2147483647) exit 1
 				if(value["device_path"] !~ /^\// || value["up"] !~ /^[01]$/) exit 1
+				if(value["dad_required"] !~ /^[01]$/) exit 1
 				if(split(value["mac"],mac,":")!=6) exit 1
 				for(i=1;i<=6;i++) if(length(mac[i])!=2 || mac[i] !~ /^[0-9a-fA-F]+$/) exit 1
-				if(split(value["target"],ip,".")!=4) exit 1
-				for(i=1;i<=4;i++) if(ip[i] !~ /^[0-9]+$/ || ip[i]>255) exit 1
+				if(value["dad_required"]==1) {
+					if(split(value["target"],ip,".")!=4) exit 1
+					for(i=1;i<=4;i++) if(ip[i] !~ /^[0-9]+$/ || ip[i]>255) exit 1
+				} else if(value["target"]!="-" || value["dad"]!="not-required") exit 1
 			}
 		}' "$1"
 }
@@ -106,6 +151,7 @@ link_apply() {
 	link_identity_matches && link_live_up || return 1
 	[ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ] || return 1
 	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-error" || return 1
+	[ "$(link_value dad_required "$WAL/link-plan")" = 1 ] || return 0
 	if [ "$LINK_UP" = 0 ]; then
 		printf '%s\n' link-up >"$WAL/stage"
 		printf '%s\n' 1 >"$WAL/link-expected-up"
@@ -130,7 +176,7 @@ link_restore() {
 }
 read_current() {
 	# Sentinel retains trailing newlines, which shell command substitution otherwise loses.
-	raw=$(uci -q get "$1" 2>/dev/null && printf '.') || return 1
+	raw=$(uci_committed get "$1" 2>/dev/null && printf '.') || return 1
 	FIELD_VALUE=${raw%.}
 	newline='
 '
@@ -142,7 +188,7 @@ read_current() {
 	case "$1" in
 		*.*.*)
 			field_package=${1%%.*}; field_rest=${1#*.}; field_section=${field_rest%%.*}; field_option=${field_rest#*.}
-			exported=$(uci -q export "$field_package") || return 2
+			exported=$(uci_committed export "$field_package") || return 2
 			FIELD_TYPE=$(printf '%s\n' "$exported" | awk -v section="$field_section" -v option="$field_option" '
 				$1=="config" {name=$3; gsub(/\047/,"",name); selected=(name==section)}
 				selected && ($1=="option" || $1=="list") {name=$2; gsub(/\047/,"",name); if(name==option){n++;type=$1}}
@@ -199,14 +245,42 @@ load_args() {
 topology() { "$LIBEXEC/init-topology" "$1" "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&-; }
 verify_runtime() {
 	# Only the fixed topology verifier writes this private diagnostic; no UCI export is exposed.
+	if [ "$(link_value required "$WAL/link-plan")" = 1 ] && ! link_identity_matches; then
+		printf '%s\n' 'new egress physical identity differs from the prepared candidate' >"$WAL/verify-error"
+		return 1
+	fi
 	topology verify >"$WAL/verify-result" 2>"$WAL/verify-error"
 }
 services_reload() {
+	reload_mode=${1:-apply}
+	reload_errors=0
+	: >"$WAL/deferred-services"
 	for service in network firewall dnsmasq odhcpd; do
-		[ -x "$RP_ROOT/etc/init.d/$service" ] || return 1
+		if [ "$service" = odhcpd ] && [ ! -e "$RP_ROOT/etc/init.d/$service" ] && [ ! -L "$RP_ROOT/etc/init.d/$service" ]; then continue; fi
+		case "$service" in network) service_packages=network ;; firewall) service_packages='network firewall' ;; *) service_packages='network dhcp' ;; esac
+		service_deferred=0
+		for service_package in $service_packages; do
+			if ! service_pending=$(uci -q changes "$service_package") || [ -n "$service_pending" ]; then
+				printf '%s:%s\n' "$service" "$service_package" >>"$WAL/deferred-services"
+				printf 'pending-service:%s:%s\n' "$service" "$service_package" >>"$WAL/conflicts"
+				service_deferred=1
+			fi
+		done
+		if [ "$service_deferred" = 1 ]; then
+			[ "$reload_mode" = restore ] || return 1
+			reload_errors=1; continue
+		fi
+		if [ ! -x "$RP_ROOT/etc/init.d/$service" ]; then
+			[ "$reload_mode" = restore ] || return 1
+			printf 'service-unavailable:%s\n' "$service" >>"$WAL/conflicts"; reload_errors=1; continue
+		fi
 		printf 'reload:%s\n' "$service" >"$WAL/stage" && sync || return 1
-		timeout 15 "$RP_ROOT/etc/init.d/$service" reload 9>&- >/dev/null 2>&1 || return 1
+		if ! timeout 15 "$RP_ROOT/etc/init.d/$service" reload 9>&- >/dev/null 2>&1; then
+			[ "$reload_mode" = restore ] || return 1
+			printf 'reload:%s\n' "$service" >>"$WAL/conflicts"; reload_errors=1
+		fi
 	done
+	[ "$reload_errors" = 0 ]
 }
 guard_start() {
 	[ -x "$RP_ROOT/etc/init.d/routepolicy-initguard" ] || return 1
@@ -235,7 +309,8 @@ guard_stop_if_inactive() (
 )
 rollback_fields() {
 	phase rolling_back || return 1
-	no_pending || { phase conflict; return 1; }
+	uci_layout || { phase conflict; return 1; }
+	: >"$WAL/conflicts"
 	# A failed commit may leave unapplied private changes; never commit those during restore.
 	[ -d "$WAL/delta" ] && [ ! -L "$WAL/delta" ] || { phase conflict; return 1; }
 	find "$WAL/delta" -type f -exec rm -f '{}' ';' || { phase conflict; return 1; }
@@ -253,6 +328,11 @@ rollback_fields() {
 		existed=$(cat "$entry/existed") || return 1
 		old=$(cat "$entry/old") || return 1
 		oldtype=$(cat "$entry/type") || return 1
+		if field_pending "$key"; then
+			printf 'pending:%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+		elif [ "$?" -ne 1 ]; then
+			printf 'pending-package:%s\n' "${key%%.*}" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+		fi
 		present=0; current=; currenttype=
 		if read_current "$key"; then
 			present=1; current=$FIELD_VALUE; currenttype=$FIELD_TYPE
@@ -266,28 +346,37 @@ rollback_fields() {
 				*.*.*) ;;
 				*)
 					# Unknown children make a newly created section user-owned; preserve it.
-					if [ "$(uci -q show "$key" | wc -l)" -ne 1 ]; then
+					if [ "$(uci_committed show "$key" | wc -l)" -ne 1 ]; then
 						printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
 					fi
 					;;
 			esac
 			if [ "$existed" = 1 ]; then
+				restore_ok=1
 				if [ "$oldtype" = list ]; then
-					uci_private delete "$key" && uci_private add_list "$key=$old" || { phase conflict; return 1; }
+					uci_private delete "$key" && uci_private add_list "$key=$old" || restore_ok=0
 				else
-					uci_private set "$key=$old" || { phase conflict; return 1; }
+					uci_private set "$key=$old" || restore_ok=0
 				fi
 			else
-				uci_private delete "$key" || { phase conflict; return 1; }
+				restore_ok=1; uci_private delete "$key" || restore_ok=0
+			fi
+			if [ "$restore_ok" = 0 ]; then
+				printf 'write:%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
+				find "$WAL/delta" -type f -exec rm -f '{}' ';' || return 1
+				count=$((count - 1)); continue
 			fi
 			# Commit a single owned field, never import or overwrite a package.
-			no_pending && uci_private commit "${key%%.*}" || { phase conflict; return 1; }
+			if ! uci_private commit "${key%%.*}"; then
+				printf 'commit:%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
+				find "$WAL/delta" -type f -exec rm -f '{}' ';' || return 1
+			fi
 		else
 			printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
 		fi
 		count=$((count - 1))
 	done
-	if [ "$field_attempted" = 1 ]; then services_reload || conflicts=1; fi
+	if [ "$field_attempted" = 1 ]; then services_reload restore || conflicts=1; fi
 	if ! link_restore; then printf '%s\n' link-ownership >>"$WAL/conflicts"; conflicts=1; fi
 	if [ "$conflicts" -eq 0 ]; then phase rolled_back; else phase conflict; return 1; fi
 }
@@ -306,6 +395,7 @@ status_json() {
 	if [ -f "$WAL/stage" ]; then printf ',"stage":"%s"' "$(rp_json_escape "$(cat "$WAL/stage")")"; fi
 	if [ -f "$WAL/failed-stage" ]; then printf ',"failed_stage":"%s"' "$(rp_json_escape "$(cat "$WAL/failed-stage")")"; fi
 	if [ -f "$WAL/conflicts" ]; then printf ',"conflicts":"%s"' "$(rp_json_escape "$(cat "$WAL/conflicts")")"; fi
+	if [ -s "$WAL/deferred-services" ]; then printf ',"deferred_services":"%s"' "$(rp_json_escape "$(cat "$WAL/deferred-services")")"; fi
 	if [ -s "$WAL/verify-error" ]; then printf ',"verification_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/verify-error")")"; fi
 	if [ -s "$WAL/link-error" ]; then printf ',"link_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-error")")"; fi
 	if [ -s "$WAL/link-restore-error" ]; then printf ',"link_restore_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-restore-error")")"; fi
@@ -343,11 +433,12 @@ case "$operation" in
 		link_plan_valid "$WAL/link-plan" || fail '新出口链路候选非法'
 		plan_valid "$WAL/candidate" || fail '候选字段超出初始化白名单'
 		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >"$WAL/parameters"
-		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
 		token=$(sed 's/-//g' /proc/sys/kernel/random/uuid) || fail '无法读取内核随机 token'
 		[ "${#token}" -eq 32 ] || fail '无法生成事务 token'
 		case "$token" in *[!0-9a-f]*) fail '内核随机 token 格式非法' ;; esac
 		printf '%s\n' "$token" >"$WAL/token"
+		uci_layout || fail '不能建立隔离 UCI 包命名空间'
+		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
 		smartdns_coordinate prepare || fail 'SmartDNS 协调准备阶段失败'
 		phase prepared || fail '持久化准备状态失败'
 		[ ! -L "$TX/previous" ] || fail '事务旧代目录不安全'
@@ -362,11 +453,12 @@ case "$operation" in
 		lock; check_token "$@"
 		case "$(read_phase)" in pending|confirmed) status_json; exit 0 ;; prepared) ;; *) fail '事务阶段不能应用' ;; esac
 		load_args || fail '事务参数损坏'
+		uci_layout || fail '隔离 UCI 包命名空间不可用'
 		no_pending || fail '存在外部 UCI pending changes'
 		topology plan >"$WAL/recheck" && cmp -s "$WAL/candidate" "$WAL/recheck" || fail '候选已陈旧；请重新准备'
 		snapshot "$WAL/candidate" >"$WAL/baseline-now" && cmp -s "$WAL/baseline" "$WAL/baseline-now" || fail '配置基线已变化；拒绝陈旧提交'
 		topology link-plan >"$WAL/link-now" && link_plan_valid "$WAL/link-now" || fail '新出口链路候选不能重验'
-		for identity_field in required device ifindex mac device_path up target; do
+		for identity_field in required dad_required device ifindex mac device_path up target; do
 			[ "$(link_value "$identity_field" "$WAL/link-plan")" = "$(link_value "$identity_field" "$WAL/link-now")" ] || fail '新出口链路身份或管理状态已变化；请重新准备'
 		done
 		if [ "$(link_value required "$WAL/link-plan")" = 1 ]; then
@@ -379,12 +471,13 @@ case "$operation" in
 		while IFS="$TAB" read -r _action key value; do
 			count=$((count + 1)); entry="$WAL/fields/$count"; mkdir "$entry" || fail '无法准备 WAL'
 			printf '%s\n' "$key" >"$entry/key"; printf '%s' "$value" >"$entry/expected"
-			if read_current "$key"; then
-				printf 1 >"$entry/existed"; printf '%s' "$FIELD_VALUE" >"$entry/old"; printf '%s' "$FIELD_TYPE" >"$entry/type"
-			else
-				[ "$?" -eq 1 ] || fail 'WAL 基线字段不能保真'
-				printf 0 >"$entry/existed"; : >"$entry/old"; printf scalar >"$entry/type"
-			fi
+			baseline_type=$(awk -F '\t' -v wanted="$key" '$1==wanted {n++;type=$2} END{if(n!=1)exit 1;print type}' "$WAL/baseline") || fail '准备基线字段损坏'
+			baseline_value=$(awk -F '\t' -v wanted="$key" '$1==wanted {print $3}' "$WAL/baseline") || fail '准备基线值损坏'
+			case "$baseline_type" in
+				0) printf 0 >"$entry/existed"; : >"$entry/old"; printf scalar >"$entry/type" ;;
+				scalar|list) printf 1 >"$entry/existed"; printf '%s' "$baseline_value" >"$entry/old"; printf '%s' "$baseline_type" >"$entry/type" ;;
+				*) fail '准备基线类型损坏' ;;
+			esac
 		done <"$WAL/candidate"
 		printf '%s\n' "$count" >"$WAL/count"
 		printf '%s\n' "$(( $(date +%s) + 120 ))" >"$WAL/deadline"
@@ -438,10 +531,12 @@ case "$operation" in
 	guard-needed)
 		case "$(read_phase)" in prepared|applying|pending|rolling_back) exit 0 ;; *) exit 1 ;; esac
 		;;
-	recover)
+	recover|recover-startup)
 		[ "$#" -eq 0 ] || fail 'recover 不接受参数'
 		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ]; then status_json; exit 0; fi
-		lock; recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; status_json
+		lock
+		if [ "$operation" = recover-startup ] && [ "$(read_phase)" = conflict ]; then fail '启动恢复存在真实冲突；请先处理并显式recover'; fi
+		recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; status_json
 		;;
 	guard)
 		[ "$#" -eq 0 ] || fail 'guard 不接受参数'
