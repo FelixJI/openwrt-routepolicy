@@ -103,6 +103,77 @@ probe_address() {
 	rp_have arping || fail 'arping is required to check a new static/management address'
 	arping -D -c 2 -w 3 -I "$device" "$candidate" >/dev/null 2>&1 || fail "address conflict or inconclusive ARP probe: $candidate"
 }
+new_link_state() {
+	local flags
+	link_index=$(cat "$RP_ROOT/sys/class/net/$new_device/ifindex") || fail 'link identity: missing ifindex'
+	rp_uint_between "$link_index" 1 2147483647 || fail 'link identity: invalid ifindex'
+	link_mac=$(cat "$RP_ROOT/sys/class/net/$new_device/address" | tr 'A-F' 'a-f') || fail 'link identity: missing MAC'
+	printf '%s\n' "$link_mac" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || fail 'link identity: invalid MAC'
+	link_path=$(readlink -f "$RP_ROOT/sys/class/net/$new_device/device") || fail 'link identity: missing physical device path'
+	[ -n "$link_path" ] || fail 'link identity: empty physical device path'
+	case "$link_path" in *[[:cntrl:]]*) fail 'link identity: invalid physical device path' ;; esac
+	flags=$(cat "$RP_ROOT/sys/class/net/$new_device/flags") || fail 'link state: missing flags'
+	rp_is_hex32 "$flags" || fail 'link state: invalid flags'
+	link_up=$((flags & 1))
+	link_carrier=$(cat "$RP_ROOT/sys/class/net/$new_device/carrier" 2>/dev/null) || link_carrier=unknown
+	case "$link_carrier" in 0|1|unknown) ;; *) fail 'link state: invalid carrier' ;; esac
+}
+link_plan() {
+	if [ "$new_role" = - ] || [ "$new_proto" != static ]; then printf 'required\t0\n'; return; fi
+	new_link_state
+	if [ "$link_up" = 0 ]; then link_dad_status=pending-link-up
+	elif [ "$link_carrier" != 1 ]; then link_dad_status=pending-carrier
+	else probe_address "$new_ip" "$new_device"; link_dad_status=clear; fi
+	printf 'required\t1\ndevice\t%s\nifindex\t%s\nmac\t%s\ndevice_path\t%s\nup\t%s\ncarrier\t%s\ntarget\t%s\ndad\t%s\n' \
+		"$new_device" "$link_index" "$link_mac" "$link_path" "$link_up" "$link_carrier" "$new_ip" "$link_dad_status"
+}
+link_dad() {
+	local remaining=10 index_before mac_before path_before
+	[ "$new_role" != - ] && [ "$new_proto" = static ] || fail 'link-dad requires a new static egress'
+	new_link_state
+	[ "$link_up" = 1 ] || fail 'link-dad: interface is admin-DOWN; explicit apply must prepare the owned link first'
+	index_before=$link_index mac_before=$link_mac path_before=$link_path
+	while [ "$link_carrier" != 1 ] && [ "$remaining" -gt 0 ]; do
+		sleep 1; remaining=$((remaining - 1)); new_link_state
+		[ "$link_index:$link_mac:$link_path" = "$index_before:$mac_before:$path_before" ] && [ "$link_up" = 1 ] || fail 'link-dad: device identity/state changed while waiting for carrier'
+	done
+	[ "$link_carrier" = 1 ] || fail 'link-dad: carrier unavailable after 10 seconds; ARP-DAD is inconclusive'
+	probe_address "$new_ip" "$new_device"
+	new_link_state
+	[ "$link_index:$link_mac:$link_path" = "$index_before:$mac_before:$path_before" ] && [ "$link_up:$link_carrier" = 1:1 ] || fail 'link-dad: device identity/state changed during ARP-DAD'
+	printf 'dad\tclear\n'
+}
+link_unclaimed() {
+	local refs dump addresses routes
+	[ "$new_role" != - ] || fail 'link-unclaimed requires a new egress'
+	refs=$(uci -q show network) || fail 'link-unclaimed: UCI evidence unavailable'
+	if printf '%s\n' "$refs" | awk -F= -v dev="$new_device" '
+		$1~/\.(device|ifname|ports|slaves|name)$/ {
+			v=substr($0,index($0,"=")+1); gsub(/\047/,"",v); n=split(v,a,/[[:space:]]+/)
+			for(i=1;i<=n;i++) if(a[i]==dev||index(a[i],dev ".")==1||index(a[i],dev ":")==1)found=1
+		} END{exit !found}'; then fail 'link-unclaimed: device is referenced by network configuration'; fi
+	dump=$(ubus call network.interface dump) || fail 'link-unclaimed: netifd evidence unavailable'
+	field "$dump" '@.interface' >/dev/null || fail 'link-unclaimed: malformed netifd evidence'
+	refs=$(field "$dump" '@.interface[*].l3_device' || true; field "$dump" '@.interface[*].device' || true)
+	if printf '%s\n' "$refs" | awk -v dev="$new_device" '$0==dev||index($0,dev ".")==1{found=1}END{exit !found}'; then fail 'link-unclaimed: device is still claimed by netifd'; fi
+	addresses=$(ip -4 -o addr show dev "$new_device") || fail 'link-unclaimed: IPv4 evidence unavailable'
+	[ -z "$addresses" ] || fail 'link-unclaimed: device has IPv4 addresses'
+	addresses=$(ip -6 -o addr show dev "$new_device") || fail 'link-unclaimed: IPv6 evidence unavailable'
+	if printf '%s\n' "$addresses" | awk 'NF&&($4!~/^fe[89abAB][0-9a-fA-F]:/||$0!~/ scope link( |$)/){found=1}END{exit !found}'; then fail 'link-unclaimed: device has non-link-local IPv6 addresses'; fi
+	routes=$(ip -4 route show table all dev "$new_device") || fail 'link-unclaimed: IPv4 route evidence unavailable'
+	[ -z "$routes" ] || fail 'link-unclaimed: device has IPv4 routes'
+	routes=$(ip -6 route show table all dev "$new_device") || fail 'link-unclaimed: IPv6 route evidence unavailable'
+	if printf '%s\n' "$routes" | awk -v dev="$new_device" '
+		NF {
+			line=$0; gsub(" dev " dev "( |$)"," ",line); sub(/ pref medium$/,"",line); sub(/ metric [0-9]+$/,"",line)
+			if(line=="fe80::/64 proto kernel")next
+			if(line~/^(local|anycast) fe[89abAB][0-9a-fA-F]:[0-9a-fA-F:]+ table local proto kernel$/)next
+			# The kernel adds this exact local multicast route when bringing a card up.
+			if(line=="multicast ff00::/8 table local proto kernel")next
+			found=1
+		} END{exit !found}'; then fail 'link-unclaimed: device has non-automatic IPv6 routes'; fi
+	printf 'unclaimed\t1\n'
+}
 own_section() {
 	local existing
 	existing=$(get "$1")
@@ -127,6 +198,8 @@ parse() {
 	access=$1 default_if=$2 policy=$3
 	shift 3
 	new_role=${1:--} new_device=${2:--} new_proto=${3:--} new_ip=${4:--} new_prefix=${5:--} new_gateway=${6:--} management_ip=${7:--} management_prefix=${8:--}
+	pre_apply=0
+	case "$operation" in plan|link-plan|link-dad|link-unclaimed) pre_apply=1 ;; esac
 	for argument in "$access" "$default_if" "$policy"; do ident "$argument" || fail 'invalid logical interface name'; done
 	[ "$policy" != "$access" ] && [ "$policy" != "$default_if" ] || fail 'policy egress must be independent'
 	for command_name in $required; do rp_have "$command_name" || fail "missing dependency: $command_name"; done
@@ -154,19 +227,25 @@ parse() {
 			case "$new_device" in *[!A-Za-z0-9_-]*|lo) fail 'only ordinary independent network cards are supported' ;; esac
 			[ -d "$RP_ROOT/sys/class/net/$new_device/device" ] && [ ! -e "$RP_ROOT/sys/class/net/$new_device/master" ] && [ ! -d "$RP_ROOT/sys/class/net/$new_device/bridge" ] && [ ! -d "$RP_ROOT/sys/class/net/$new_device/wireless" ] || fail 'device is not an identified standalone physical card'
 			[ "$(cat "$RP_ROOT/sys/class/net/$new_device/ifindex")" = "$(cat "$RP_ROOT/sys/class/net/$new_device/iflink")" ] || fail 'stacked devices are not supported for creation'
-			if [ "$operation" = plan ]; then
+			if [ "$pre_apply" = 1 ]; then
 				[ -z "$(get "network.$new_if")" ] || fail 'new logical interface already exists'
-				for section in $(sections network interface); do
-					[ "$(get "network.$section.device")" != "$new_device" ] || fail 'new device already belongs to an interface'
-					if [ "$(get "network.$section.ifname")" = "$new_device" ]; then fail 'new device already belongs to an interface'; fi
-				done
 			fi
+			for section in $(sections network interface); do
+				[ "$pre_apply" = 0 ] && [ "$section" = "$new_if" ] && continue
+				[ "$(get "network.$section.device")" != "$new_device" ] || fail 'new device already belongs to another interface'
+				if [ "$(get "network.$section.ifname")" = "$new_device" ]; then fail 'new device already belongs to another interface'; fi
+			done
 			case "$new_proto" in
 				dhcp) [ "$new_ip:$new_prefix:$new_gateway" = '-:-:-' ] || fail 'DHCP client does not take static parameters' ;;
 				static)
 					host4 "$new_ip" "$new_prefix" && host4 "$new_gateway" "$new_prefix" || fail 'invalid static egress address/gateway'
 					[ "$new_ip" != "$new_gateway" ] && [ "$(rp_network_cidr "$new_ip" "$new_prefix")" = "$(rp_network_cidr "$new_gateway" "$new_prefix")" ] || fail 'static gateway must be a different host in the egress subnet'
-					[ "$operation" != plan ] || probe_address "$new_ip" "$new_device"
+					rp_have arping || fail 'arping is required for a new static egress'
+					if [ "$operation" = plan ]; then
+						new_link_state
+						if [ "$link_up" = 1 ] && [ "$link_carrier" = 1 ]; then probe_address "$new_ip" "$new_device"
+						else rp_err "ARP-DAD pending for $new_device: explicit apply must record ownership, prepare link UP and verify carrier before assigning $new_ip"; fi
+					fi
 					;;
 				*) fail 'only DHCP-client or static creation is supported' ;;
 			esac
@@ -179,7 +258,7 @@ parse() {
 	[ "$(get "firewall.$access_zone_section.input")" = ACCEPT ] || fail 'existing access management input must be ACCEPT; automatic management-port changes are not supported'
 	for role in default policy; do
 		[ "$role" = default ] && selected=$default_if || selected=$policy
-		if [ "$new_role" = "$role" ] && [ "$operation" = plan ]; then
+		if [ "$new_role" = "$role" ] && [ "$pre_apply" = 1 ]; then
 			device=$new_device address=$new_ip prefix=$new_prefix gateway=$new_gateway
 		else
 			[ "$(get "network.$selected")" = interface ] || fail "egress is not a named logical interface: $selected"
@@ -188,6 +267,13 @@ parse() {
 			prefix=$(runtime "$selected" '@["ipv4-address"][0].mask')
 			gateway=$(runtime "$selected" '@.route[@.target="0.0.0.0"].nexthop')
 			host4 "$address" "$prefix" && rp_is_ipv4 "$gateway" || fail "egress lacks an IPv4 address/default gateway: $selected"
+			if [ "$new_role" = "$role" ]; then
+				[ "$(get "network.$selected.device")" = "$new_device" ] && [ "$device" = "$new_device" ] || fail 'new interface is not bound to the selected physical card'
+				[ "$(get "network.$selected.proto")" = "$new_proto" ] || fail 'new interface protocol differs from candidate'
+				if [ "$new_proto" = static ]; then
+					[ "$address/$prefix/$gateway" = "$new_ip/$new_prefix/$new_gateway" ] || fail 'new static egress runtime address/prefix/gateway differs from candidate'
+				fi
+			fi
 		fi
 		if [ "$gateway" != - ]; then
 			[ "$gateway" != "$access_ip" ] && [ "$gateway" != "$address" ] || fail 'gateway loops back to this router'
@@ -234,6 +320,7 @@ parse() {
 	done
 	for section in default4 policy4 default_nat policy_nat default_dhcp_client policy_dhcp_client dns ipv6 dhcp4 dhcp6 ra redirects; do own_section "firewall.rp_init_$section"; done
 	check_rp_filter "$access_device" "$default_device" "$policy_device"
+	if [ "$new_role" != - ] && [ "$pre_apply" = 1 ] && [ "$operation" != link-unclaimed ]; then link_unclaimed >/dev/null; fi
 }
 
 conflicts() {
@@ -427,11 +514,14 @@ case "$operation" in
 	discover) [ "$#" -eq 0 ] || fail 'discover takes no arguments'; discover ;;
 	plan) parse "$@"; conflicts; emit_plan; rp_err 'IPv6 policy: reject new forwarding connections through this router; preserve existing conntrack and management. Disable upstream RA/client IPv6 separately to prevent direct L2 bypass.' ;;
 	verify) parse "$@"; verify ;;
+	link-plan) parse "$@"; link_plan ;;
+	link-dad) parse "$@"; link_dad ;;
+	link-unclaimed) parse "$@"; link_unclaimed ;;
 	management-address)
 		parse "$@"
 		actual_ip=$(runtime "$access" '@["ipv4-address"][0].address')
 		[ "$actual_ip" = "$access_ip" ] || fail 'expected management address not active'
 		printf '%s\n' "$actual_ip"
 		;;
-	*) fail 'expected discover, plan, verify or management-address' ;;
+	*) fail 'expected discover, plan, verify, management-address, link-plan, link-dad or link-unclaimed' ;;
 esac

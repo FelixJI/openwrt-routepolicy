@@ -115,6 +115,22 @@ case "$1" in
 	verify)
 		if [ -f "$TEST_TX_DIR/verify-fail" ]; then printf '%s\n' 'fixture runtime evidence unavailable' >&2; exit 1; fi ;;
 	management-address) cat "$TEST_TX_DIR/db/network.lan.ipaddr" ;;
+	link-plan)
+		if [ ! -f "$TEST_TX_DIR/link-enabled" ]; then printf 'required\t0\n'; exit 0; fi
+		link="$ROUTEPOLICY_ROOT/sys/class/net/eth9"
+		up=0; [ "$(cat "$link/flags")" != 0x1 ] || up=1
+		dad=pending-link-up; [ "$up" = 0 ] || dad=clear
+		printf 'required\t1\ndevice\teth9\nifindex\t%s\nmac\t%s\ndevice_path\t%s\nup\t%s\ncarrier\t1\ntarget\t198.51.100.2\ndad\t%s\n' \
+			"$(cat "$link/ifindex")" "$(cat "$link/address")" "$(readlink -f "$link/device")" "$up" "$dad" ;;
+	link-unclaimed) [ ! -f "$TEST_TX_DIR/link-claimed" ] ;;
+	link-dad)
+		[ "$(cat "$ROUTEPOLICY_ROOT/sys/class/net/eth9/flags")" = 0x1 ]
+		[ ! -f "$TEST_TX_DIR/commits" ] || { printf '%s\n' 'DAD occurred after UCI commit' >&2; exit 1; }
+		if [ -f "$TEST_TX_DIR/link-kill" ]; then
+			owner_pid=$(awk '$1=="PPid:" {print $2}' "/proc/$PPID/status")
+			kill -KILL "$owner_pid"
+		fi
+		if [ -f "$TEST_TX_DIR/link-dad-fail" ]; then printf '%s\n' 'ARP-DAD conflict or missing carrier' >&2; exit 1; fi ;;
 	*) exit 1 ;;
 esac
 EOF
@@ -132,6 +148,22 @@ cat >"$tmp/bin/jsonfilter" <<'EOF'
 cat >/dev/null
 printf '%s\n' true
 EOF
+cat >"$tmp/bin/ip" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1:$2:$3:$4" = link:set:dev:eth9 ] || exit 1
+wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+[ -f "$wal/link-attempted" ] && [ -f "$wal/link-boot" ] && [ "$(cat "$wal/phase")" != prepared ] || exit 1
+printf '%s\n' "$*" >>"$TEST_TX_DIR/link-log"
+if [ "$5" = up ] && [ -f "$TEST_TX_DIR/link-up-fail" ]; then printf '%s\n' 'link UP failed' >&2; exit 1; fi
+if [ "$5" = up ] && [ -f "$TEST_TX_DIR/link-delay-kill" ]; then
+	owner_pid=$(awk '$1=="PPid:" {print $2}' "/proc/$PPID/status")
+	kill -KILL "$owner_pid"
+	: >"$TEST_TX_DIR/link-writer-active"
+	sleep 2
+fi
+case "$5" in up) printf 0x1 >"$ROUTEPOLICY_ROOT/sys/class/net/eth9/flags" ;; down) printf 0x0 >"$ROUTEPOLICY_ROOT/sys/class/net/eth9/flags" ;; *) exit 1 ;; esac
+EOF
 for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 	cat >"$tmp/root/etc/init.d/$service" <<'EOF'
 #!/bin/sh
@@ -147,6 +179,14 @@ reset() {
 	mkdir "$tmp/db"
 	rm -f "$tmp/fail-at" "$tmp/kill-at" "$tmp/fw4-fail" "$tmp/verify-fail" "$tmp/service-fail" "$tmp/pending" "$tmp/commits" "$tmp/bad-plan" "$tmp/guard-down" "$tmp/services"
 	rm -f "$tmp/"list.*
+	rm -f "$tmp/"link-*
+	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
+	rm -f "$tmp/root/sys/class/net/eth9/device"
+	ln -s "$tmp/physical/eth9" "$tmp/root/sys/class/net/eth9/device"
+	printf 0x0 >"$tmp/root/sys/class/net/eth9/flags"
+	printf 9 >"$tmp/root/sys/class/net/eth9/ifindex"
+	printf '02:00:00:00:00:09' >"$tmp/root/sys/class/net/eth9/address"
+	printf '00000000-0000-4000-8000-000000000001' >"$tmp/root/proc/sys/kernel/random/boot_id"
 	printf lan >"$tmp/db/routepolicy.main.lan_interface"
 	printf wan >"$tmp/db/routepolicy.main.default_interface"
 	printf usbwan >"$tmp/db/routepolicy.main.policy_interface"
@@ -235,7 +275,10 @@ for fault in fw4-fail service-fail verify-fail; do
 	if [ "$fault" = service-fail ]; then phase_is conflict; else phase_is rolled_back; fi
 	restored
 	if [ "$fault" = verify-fail ]; then "$TX" status | grep -Fq 'fixture runtime evidence unavailable'; fi
-	if [ "$fault" = service-fail ]; then rm "$tmp/service-fail"; "$TX" recover >/dev/null; phase_is rolled_back; fi
+	if [ "$fault" = service-fail ]; then
+		"$TX" status | grep -Fq '"failed_stage":"reload:firewall"'
+		rm "$tmp/service-fail"; "$TX" recover >/dev/null; phase_is rolled_back
+	fi
 done
 
 reset; prepare; printf 5 >"$tmp/kill-at"
@@ -285,4 +328,69 @@ while [ ! -f "$tmp/locked" ]; do sleep 0.1; done
 bad "$TX" apply "$token"
 wait "$lock_pid"
 phase_is prepared
+
+# Admin-DOWN static egress: review stays read-only; DAD precedes every UCI commit.
+reset; touch "$tmp/link-enabled"
+"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >"$tmp/link-preview"
+grep -Fq pending-link-up "$tmp/link-preview"
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+prepare
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+"$TX" apply "$token" >/dev/null
+phase_is pending
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x1 ]
+"$TX" recover >/dev/null
+phase_is rolled_back
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+restored
+for link_fault in link-up-fail link-dad-fail link-kill; do
+	reset; touch "$tmp/link-enabled" "$tmp/$link_fault"; prepare
+	bad "$TX" apply "$token"
+	[ ! -f "$tmp/commits" ]
+	if [ "$link_fault" = link-kill ]; then phase_is applying; "$TX" recover >/dev/null; fi
+	phase_is rolled_back
+	[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+	restored
+done
+
+reset; touch "$tmp/link-enabled"; printf 0x1 >"$tmp/root/sys/class/net/eth9/flags"; prepare
+"$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null
+phase_is rolled_back
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x1 ]
+[ ! -f "$tmp/link-log" ]
+
+# A surviving finite writer must finish before crash recovery can acquire the lock.
+reset; touch "$tmp/link-enabled" "$tmp/link-delay-kill"; prepare
+bad "$TX" apply "$token"
+phase_is applying
+while [ ! -f "$tmp/link-writer-active" ]; do sleep 0.1; done
+bad "$TX" recover
+sleep 3
+"$TX" recover >/dev/null
+phase_is rolled_back
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+[ ! -f "$tmp/commits" ]
+
+# Reboot recovery uses physical identity; same-boot ifindex reuse/foreign ownership is preserved.
+reset; touch "$tmp/link-enabled"; prepare; "$TX" apply "$token" >/dev/null
+printf '00000000-0000-4000-8000-000000000002' >"$tmp/root/proc/sys/kernel/random/boot_id"
+printf 19 >"$tmp/root/sys/class/net/eth9/ifindex"
+"$TX" recover >/dev/null
+phase_is rolled_back
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+for takeover in link-claimed ifindex; do
+	reset; touch "$tmp/link-enabled"; prepare; "$TX" apply "$token" >/dev/null
+	if [ "$takeover" = ifindex ]; then printf 19 >"$tmp/root/sys/class/net/eth9/ifindex"; else touch "$tmp/link-claimed"; fi
+	bad "$TX" recover
+	phase_is conflict
+	[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x1 ]
+	restored
+done
+
+# A confirmed new path belongs to netifd; recovery must not lower it.
+reset; touch "$tmp/link-enabled"; prepare; "$TX" apply "$token" >/dev/null
+SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/null
+"$TX" recover >/dev/null
+phase_is confirmed
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x1 ]
 printf '%s\n' 'init transaction tests: passed (mock UCI/services; packet evidence remains EVIDENCE_MISSING)'

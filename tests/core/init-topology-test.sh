@@ -38,17 +38,20 @@ case "$data:$2" in
 	'lan:@.l3_device') echo br-lan ;;
 	'wan:@.l3_device') echo eth1 ;;
 	'policy:@.l3_device') echo eth2 ;;
-	'new_policy:@.l3_device') echo eth3 ;;
+	'new_policy:@.l3_device') echo "${TEST_NEW_DEVICE:-eth3}" ;;
 	'lan:@["ipv4-address"][0].address') echo "${TEST_MANAGEMENT_IP:-192.168.1.1}" ;;
 	'wan:@["ipv4-address"][0].address') echo 10.1.0.2 ;;
 	'policy:@["ipv4-address"][0].address') echo 10.2.0.2 ;;
-	'new_policy:@["ipv4-address"][0].address') echo 10.3.0.2 ;;
+	'new_policy:@["ipv4-address"][0].address') echo "${TEST_NEW_ADDRESS:-10.3.0.2}" ;;
 	*:'@["ipv4-address"][0].mask') echo 24 ;;
 	'lan:@.route[@.target="0.0.0.0"].nexthop') echo 192.168.1.254 ;;
 	'wan:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_GATEWAY:-10.1.0.1}" ;;
 	'policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.2.0.1 ;;
 	'new_policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.3.0.1 ;;
 	'services:@dnsmasq.instances.*.running'|'services:@.dnsmasq.instances.*.running'|'services:@.dropbear.instances.*.running'|'services:@.odhcpd.instances.*.running') [ "${TEST_SERVICE_DOWN:-0}" != 1 ] && echo true || echo false ;;
+	*:'@.interface[*].l3_device') [ -z "${TEST_DYNAMIC_CLAIM:-}" ] || echo "$TEST_DYNAMIC_CLAIM" ;;
+	*:'@.interface[*].device') : ;;
+	*:'@.interface') echo '[]' ;;
 esac
 EOF
 cat >"$tmp/bin/ip" <<'EOF'
@@ -63,6 +66,12 @@ case "$*" in
 		[ "${TEST_TABLE_CONFLICT:-0}" = 0 ] || echo 'default via 10.9.0.1 dev eth9' ;;
 	'-4 -o addr show'|'-o addr show') printf '%s\n' '2: br-lan inet 192.168.1.1/24 brd 192.168.1.255' '3: eth1 inet 10.1.0.2/24 brd 10.1.0.255' ;;
 	'-4 route show table all'|'-6 rule show') : ;;
+	'-4 -o addr show dev eth3') [ -z "${TEST_LINK_IPV4:-}" ] || echo "$TEST_LINK_IPV4" ;;
+	'-6 -o addr show dev eth3') echo "${TEST_LINK_IPV6:-5: eth3 inet6 fe80::1/64 scope link proto kernel_ll}" ;;
+	'-4 route show table all dev eth3') [ -z "${TEST_LINK_ROUTE4:-}" ] || echo "$TEST_LINK_ROUTE4" ;;
+	'-6 route show table all dev eth3')
+		printf '%s\n' 'fe80::/64 proto kernel metric 256 pref medium' 'anycast fe80:: table local proto kernel metric 0 pref medium' 'local fe80::1 table local proto kernel metric 0 pref medium' 'multicast ff00::/8 table local proto kernel metric 256 pref medium'
+		[ -z "${TEST_LINK_ROUTE6:-}" ] || echo "$TEST_LINK_ROUTE6" ;;
 	*) printf 'unexpected ip command: %s\n' "$*" >>"$TEST_TOPOLOGY_DIR/writes"; exit 1 ;;
 esac
 exit 0
@@ -92,7 +101,17 @@ echo 'udp 0 0 0.0.0.0:53 0.0.0.0:* 122/dnsmasq'
 EOF
 cat >"$tmp/bin/arping" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>"$TEST_TOPOLOGY_DIR/arping.log"
+[ "${TEST_ARPING_FORBIDDEN:-0}" = 0 ] || exit 99
+[ "${TEST_IDENTITY_DURING_ARP:-0}" = 0 ] || echo '02:00:00:00:00:04' >"$ROUTEPOLICY_ROOT/sys/class/net/eth3/address"
 [ "${TEST_ADDRESS_CONFLICT:-0}" = 0 ]
+EOF
+cat >"$tmp/bin/sleep" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_TOPOLOGY_DIR/sleep.log"
+[ "${TEST_CARRIER_AFTER_SLEEP:-0}" = 0 ] || echo 1 >"$ROUTEPOLICY_ROOT/sys/class/net/eth3/carrier"
+[ "${TEST_IDENTITY_AFTER_SLEEP:-0}" = 0 ] || echo 6 >"$ROUTEPOLICY_ROOT/sys/class/net/eth3/ifindex"
+exit 0
 EOF
 chmod +x "$tmp/bin/"*
 baseline() {
@@ -132,6 +151,9 @@ EOF
 	echo 1 >"$tmp/root/proc/sys/net/ipv4/ip_forward"
 	echo 5 >"$tmp/root/sys/class/net/eth3/ifindex"
 	echo 5 >"$tmp/root/sys/class/net/eth3/iflink"
+	echo '02:00:00:00:00:03' >"$tmp/root/sys/class/net/eth3/address"
+	echo 0x1003 >"$tmp/root/sys/class/net/eth3/flags"
+	echo 1 >"$tmp/root/sys/class/net/eth3/carrier"
 	# Numeric families, ICMP types and drop jumps mirror OpenWrt 25.12 / nft 1.1.6.
 	cat >"$tmp/nft" <<'RULES'
 table inet fw4 {
@@ -258,6 +280,47 @@ grep -Fq 'set	network.rp_init_policy.proto	dhcp' "$tmp/new-dhcp"
 grep -Fq 'set	firewall.rp_init_policy.input	REJECT' "$tmp/new-dhcp"
 "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - - >"$tmp/new-static"
 grep -Fq 'set	network.rp_init_policy.gateway	10.3.0.1' "$tmp/new-static"
+"$tool" link-plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - - >"$tmp/link-up"
+grep -Fxq 'dad	clear' "$tmp/link-up"
+echo 0x1002 >"$tmp/root/sys/class/net/eth3/flags"
+echo 0 >"$tmp/root/sys/class/net/eth3/carrier"
+TEST_ARPING_FORBIDDEN=1 "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - - >"$tmp/new-static-down" 2>"$tmp/link-warning"
+cmp "$tmp/new-static" "$tmp/new-static-down"
+grep -Fq 'ARP-DAD pending' "$tmp/link-warning"
+[ "$(cat "$tmp/root/sys/class/net/eth3/flags")" = 0x1002 ]
+TEST_ARPING_FORBIDDEN=1 "$tool" link-plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - - >"$tmp/link-down"
+grep -Fxq 'up	0' "$tmp/link-down"
+grep -Fxq 'dad	pending-link-up' "$tmp/link-down"
+grep -Fxq 'mac	02:00:00:00:00:03' "$tmp/link-down"
+reject "$tool" link-dad lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+echo 0x1003 >"$tmp/root/sys/class/net/eth3/flags"
+reject "$tool" link-dad lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+[ "$(wc -l <"$tmp/sleep.log" | tr -d ' ')" = 10 ]
+TEST_CARRIER_AFTER_SLEEP=1 "$tool" link-dad lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - - >"$tmp/link-dad"
+grep -Fxq 'dad	clear' "$tmp/link-dad"
+reject env TEST_ADDRESS_CONFLICT=1 "$tool" link-dad lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_IDENTITY_DURING_ARP=1 "$tool" link-dad lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+echo '02:00:00:00:00:03' >"$tmp/root/sys/class/net/eth3/address"
+echo 0 >"$tmp/root/sys/class/net/eth3/carrier"
+reject env TEST_IDENTITY_AFTER_SLEEP=1 "$tool" link-dad lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+echo 5 >"$tmp/root/sys/class/net/eth3/ifindex"
+echo 1 >"$tmp/root/sys/class/net/eth3/carrier"
+"$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - - >"$tmp/unclaimed"
+grep -Fxq 'unclaimed	1' "$tmp/unclaimed"
+reject env TEST_DYNAMIC_CLAIM=eth3 "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_LINK_IPV4='5: eth3 inet 10.3.0.5/24 scope global' "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_LINK_IPV6='5: eth3 inet6 2001:db8::1/64 scope global' "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_LINK_ROUTE4='default via 10.3.0.1' "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_LINK_ROUTE6='2001:db8::/64 proto static metric 10' "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_LINK_ROUTE6='multicast ff00::/8 table local proto static metric 256' "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+printf 'network.rp_init_policy\tinterface\nnetwork.rp_init_policy.device\teth3\nnetwork.rp_init_policy.proto\tstatic\n' >>"$tmp/config"
+[ "$("$tool" management-address lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -)" = 192.168.1.1 ]
+reject env TEST_NEW_DEVICE=eth9 "$tool" management-address lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+reject env TEST_NEW_ADDRESS=10.3.0.3 "$tool" management-address lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+baseline
+printf 'network.other\tdevice\nnetwork.other.ports\teth3\n' >>"$tmp/config"
+reject "$tool" link-unclaimed lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 - -
+baseline
 reject "$tool" plan lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.4.0.1 - -
 mkdir "$tmp/root/sys/class/net/eth3/bridge"
 reject "$tool" plan lan wan rp_init_policy policy eth3 dhcp - - - - -

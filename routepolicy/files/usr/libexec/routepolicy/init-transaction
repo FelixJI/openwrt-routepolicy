@@ -32,7 +32,8 @@ lock() {
 		mv "$TX/previous" "$WAL" && sync || fail '不能恢复准备事务记录'
 	fi
 }
-uci_private() { uci -t "$WAL/delta" "$@" 9>&-; }
+# Finite writers retain the lock until they finish, even if their parent is killed.
+uci_private() { uci -t "$WAL/delta" "$@"; }
 no_pending() {
 	for pkg in $PACKAGES; do
 		pending=$(uci -q changes "$pkg") || return 1
@@ -65,6 +66,67 @@ plan_valid() {
 	' "$1"
 }
 make_plan() { "$LIBEXEC/init-topology" plan "$@" 9>&-; }
+link_value() { awk -F '\t' -v wanted="$1" '$1==wanted {print $2}' "$2"; }
+link_plan_valid() {
+	awk -F '\t' 'NF!=2 || length($2)>256 || $2~/[^ -~]/ || seen[$1]++ {exit 1}
+		$1!~/^(required|device|ifindex|mac|device_path|up|carrier|target|dad)$/ {exit 1}
+		{value[$1]=$2}
+		END {
+			if(NR<1 || NR>9 || value["required"] !~ /^[01]$/) exit 1
+			if(value["required"]==1) {
+				if(value["device"] !~ /^[A-Za-z0-9_-]+$/ || value["device"]=="lo" || length(value["device"])>32) exit 1
+				if(value["ifindex"] !~ /^[0-9]+$/ || value["ifindex"]<1 || value["ifindex"]>2147483647) exit 1
+				if(value["device_path"] !~ /^\// || value["up"] !~ /^[01]$/) exit 1
+				if(split(value["mac"],mac,":")!=6) exit 1
+				for(i=1;i<=6;i++) if(length(mac[i])!=2 || mac[i] !~ /^[0-9a-fA-F]+$/) exit 1
+				if(split(value["target"],ip,".")!=4) exit 1
+				for(i=1;i<=4;i++) if(ip[i] !~ /^[0-9]+$/ || ip[i]>255) exit 1
+			}
+		}' "$1"
+}
+link_live_up() {
+	link_flags=$(cat "$RP_ROOT/sys/class/net/$LINK_DEVICE/flags" 2>/dev/null) || return 1
+	rp_is_hex32 "$link_flags" || return 1
+	LINK_UP=$((link_flags & 1))
+}
+link_identity_matches() {
+	LINK_DEVICE=$(link_value device "$WAL/link-plan")
+	rp_is_device "$LINK_DEVICE" || return 1
+	[ "$(cat "$RP_ROOT/sys/class/net/$LINK_DEVICE/address" 2>/dev/null)" = "$(link_value mac "$WAL/link-plan")" ] || return 1
+	[ "$(readlink -f "$RP_ROOT/sys/class/net/$LINK_DEVICE/device")" = "$(link_value device_path "$WAL/link-plan")" ] || return 1
+	current_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
+	old_boot=$(cat "$WAL/link-boot") || return 1
+	if [ "$current_boot" = "$old_boot" ]; then
+		[ "$(cat "$RP_ROOT/sys/class/net/$LINK_DEVICE/ifindex" 2>/dev/null)" = "$(link_value ifindex "$WAL/link-plan")" ] || return 1
+	fi
+}
+link_apply() {
+	[ "$(link_value required "$WAL/link-plan")" = 1 ] || return 0
+	link_identity_matches && link_live_up || return 1
+	[ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ] || return 1
+	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-error" || return 1
+	if [ "$LINK_UP" = 0 ]; then
+		printf '%s\n' link-up >"$WAL/stage"
+		printf '%s\n' 1 >"$WAL/link-expected-up"
+		: >"$WAL/link-attempted"; sync || return 1
+		timeout 5 ip link set dev "$LINK_DEVICE" up >"$WAL/link-result" 2>"$WAL/link-error" || return 1
+		link_live_up && [ "$LINK_UP" = 1 ] || return 1
+	fi
+	printf '%s\n' link-dad >"$WAL/stage"; sync || return 1
+	timeout 20 "$LIBEXEC/init-topology" link-dad "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&- >"$WAL/link-result" 2>"$WAL/link-error"
+}
+link_restore() {
+	[ -f "$WAL/link-attempted" ] || return 0
+	load_args || return 1
+	# A different physical card or external owner always wins over our old admin state.
+	link_identity_matches && link_live_up || return 1
+	[ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ] && return 0
+	[ "$LINK_UP" = "$(cat "$WAL/link-expected-up")" ] || return 1
+	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-error" || return 1
+	printf '%s\n' link-restore >"$WAL/stage"; sync || return 1
+	timeout 5 ip link set dev "$LINK_DEVICE" down >"$WAL/link-result" 2>"$WAL/link-error" || return 1
+	link_live_up && [ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ]
+}
 read_current() {
 	# Sentinel retains trailing newlines, which shell command substitution otherwise loses.
 	raw=$(uci -q get "$1" 2>/dev/null && printf '.') || return 1
@@ -113,6 +175,7 @@ preview_json() {
 	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":120,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
 		"$operation" "$(rp_json_escape "$1")"
 	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
+	printf ',"link_preparation":"%s"' "$(rp_json_escape "${link_preview:-required\t0}")"
 	printf '}\n'
 }
 smartdns_coordinate() {
@@ -164,12 +227,14 @@ rollback_fields() {
 	[ -d "$WAL/delta" ] && [ ! -L "$WAL/delta" ] || { phase conflict; return 1; }
 	find "$WAL/delta" -type f -exec rm -f '{}' ';' || { phase conflict; return 1; }
 	conflicts=0
+	field_attempted=0
 	smartdns_coordinate rollback || conflicts=1
 	count=$(cat "$WAL/count" 2>/dev/null) || { phase conflict; return 1; }
 	rp_uint_between "$count" 1 128 || { phase conflict; return 1; }
 	while [ "$count" -gt 0 ]; do
 		entry="$WAL/fields/$count"
 		if [ ! -f "$entry/attempted" ]; then count=$((count - 1)); continue; fi
+		field_attempted=1
 		key=$(cat "$entry/key") || return 1
 		expected=$(cat "$entry/expected") || return 1
 		existed=$(cat "$entry/existed") || return 1
@@ -209,7 +274,8 @@ rollback_fields() {
 		fi
 		count=$((count - 1))
 	done
-	services_reload || conflicts=1
+	if [ "$field_attempted" = 1 ]; then services_reload || conflicts=1; fi
+	if ! link_restore; then printf '%s\n' link-ownership >>"$WAL/conflicts"; conflicts=1; fi
 	if [ "$conflicts" -eq 0 ]; then phase rolled_back; else phase conflict; return 1; fi
 }
 recover_locked() {
@@ -228,6 +294,7 @@ status_json() {
 	if [ -f "$WAL/failed-stage" ]; then printf ',"failed_stage":"%s"' "$(rp_json_escape "$(cat "$WAL/failed-stage")")"; fi
 	if [ -f "$WAL/conflicts" ]; then printf ',"conflicts":"%s"' "$(rp_json_escape "$(cat "$WAL/conflicts")")"; fi
 	if [ -s "$WAL/verify-error" ]; then printf ',"verification_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/verify-error")")"; fi
+	if [ -s "$WAL/link-error" ]; then printf ',"link_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-error")")"; fi
 	printf '}\n'
 }
 
@@ -240,6 +307,8 @@ case "$operation" in
 		candidate=$(make_plan "$@") || fail '拓扑预检失败'
 		# Read-only preview validates the same plan without creating any files.
 		printf '%s\n' "$candidate" | plan_valid /dev/stdin || fail '候选格式非法'
+		link_preview=$("$LIBEXEC/init-topology" link-plan "$@") || fail '新出口链路预检失败'
+		printf '%s\n' "$link_preview" | link_plan_valid /dev/stdin || fail '新出口链路候选非法'
 		preview_json "$candidate"
 		;;
 	prepare)
@@ -248,6 +317,7 @@ case "$operation" in
 		case "$(read_phase)" in absent|prepared|confirmed|rolled_back) ;; *) fail '存在未完成事务；请先恢复' ;; esac
 		no_pending || fail '存在外部 UCI pending changes'
 		candidate=$(make_plan "$@") || fail '拓扑预检失败'
+		link_preview=$("$LIBEXEC/init-topology" link-plan "$@" 9>&-) || fail '新出口链路预检失败'
 		# Build a complete replacement before discarding the previous reviewable candidate.
 		original_wal=$WAL
 		WAL="$TX/preparing"
@@ -255,6 +325,8 @@ case "$operation" in
 		rm -rf "$WAL"
 		safe_dir "$WAL"; safe_dir "$WAL/delta"; safe_dir "$WAL/fields"
 		printf '%s\n' "$candidate" >"$WAL/candidate"
+		printf '%s\n' "$link_preview" >"$WAL/link-plan"
+		link_plan_valid "$WAL/link-plan" || fail '新出口链路候选非法'
 		plan_valid "$WAL/candidate" || fail '候选字段超出初始化白名单'
 		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >"$WAL/parameters"
 		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
@@ -279,6 +351,13 @@ case "$operation" in
 		no_pending || fail '存在外部 UCI pending changes'
 		topology plan >"$WAL/recheck" && cmp -s "$WAL/candidate" "$WAL/recheck" || fail '候选已陈旧；请重新准备'
 		snapshot "$WAL/candidate" >"$WAL/baseline-now" && cmp -s "$WAL/baseline" "$WAL/baseline-now" || fail '配置基线已变化；拒绝陈旧提交'
+		topology link-plan >"$WAL/link-now" && link_plan_valid "$WAL/link-now" || fail '新出口链路候选不能重验'
+		for identity_field in required device ifindex mac device_path up target; do
+			[ "$(link_value "$identity_field" "$WAL/link-plan")" = "$(link_value "$identity_field" "$WAL/link-now")" ] || fail '新出口链路身份或管理状态已变化；请重新准备'
+		done
+		if [ "$(link_value required "$WAL/link-plan")" = 1 ]; then
+			cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/link-boot" || fail '无法记录链路启动身份'
+		fi
 		# A failed pre-apply guard readiness check leaves a prepared, safely retryable candidate.
 		rm -rf "$WAL/fields"
 		safe_dir "$WAL/fields"
@@ -298,7 +377,8 @@ case "$operation" in
 		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
 		phase applying || fail '持久化 WAL 失败'
 		failed_stage=
-		smartdns_coordinate apply || failed_stage='smartdns-apply'
+		link_apply || failed_stage='link-preparation'
+		[ -n "$failed_stage" ] || { smartdns_coordinate apply || failed_stage='smartdns-apply'; }
 		index=0
 		while IFS="$TAB" read -r _action key value; do
 			[ -z "$failed_stage" ] || break
@@ -313,7 +393,7 @@ case "$operation" in
 			no_pending && uci_private set "$key=$value" && uci_private commit "${key%%.*}" || { failed_stage=commit; break; }
 		done <"$WAL/candidate"
 		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage"; timeout 15 fw4 check 9>&- >/dev/null 2>&1 || failed_stage='firewall-check'; }
-		[ -n "$failed_stage" ] || { services_reload || failed_stage='service-reload'; }
+		[ -n "$failed_stage" ] || { services_reload || failed_stage="reload:$service"; }
 		[ -n "$failed_stage" ] || { printf '%s\n' runtime-verify >"$WAL/stage"; verify_runtime || failed_stage='runtime-verify'; }
 		[ -n "$failed_stage" ] || { smartdns_coordinate verify || failed_stage='smartdns-verify'; }
 		if [ -n "$failed_stage" ]; then
