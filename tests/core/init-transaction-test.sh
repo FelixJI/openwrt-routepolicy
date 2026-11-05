@@ -52,8 +52,9 @@ TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
 TEST_SYNC_BIN=$(command -v sync)
 TEST_FLOCK_BIN=$(command -v flock)
 TEST_DATE_BIN=$(command -v date)
+TEST_SLEEP_BIN=$(command -v sleep)
 TEST_OWNER_PID=$$
-export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_DATE_BIN TEST_OWNER_PID
+export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_DATE_BIN TEST_SLEEP_BIN TEST_OWNER_PID
 export PATH="$tmp/bin:$PATH"
 TX="$tmp/lib/init-transaction"
 WAL="$tmp/root/etc/routepolicy/state/init-transaction/current"
@@ -144,11 +145,19 @@ case "$1" in
 		printf 'set\tfirewall.rp_init_dns\trule\n'
 		printf 'set\tfirewall.rp_init_dns.name\tinit-dns\n'
 		printf 'set\tfirewall.rp_init_dns.target\tACCEPT\n'
+		if [ "${5:--}" != - ]; then
+			printf 'set\tnetwork.rp_init_%s\tinterface\nset\tnetwork.rp_init_%s.device\t%s\nset\tnetwork.rp_init_%s.proto\t%s\n' "$5" "$5" "$6" "$5" "$7"
+		fi
 		[ ! -f "$TEST_TX_DIR/extra-dhcp" ] || printf 'set\tdhcp.lan.ra\tdisabled\n'
 		if [ -f "$TEST_TX_DIR/extra-zone" ]; then
 			printf 'set\tfirewall.rp_init_policy\tzone\nset\tfirewall.rp_init_policy.name\trp_init_policy\nset\tfirewall.rp_init_policy.network\tusbwan\nset\tfirewall.rp_init_policy.input\tREJECT\nset\tfirewall.rp_init_policy.output\tACCEPT\nset\tfirewall.rp_init_policy.forward\tDROP\n'
 		fi ;;
 	verify)
+		if [ -f "$TEST_TX_DIR/dhcp-test" ]; then
+			printf '%s\n' verify >>"$TEST_TX_DIR/dhcp-verify-calls"
+			current=$(ubus call network.interface dump)
+			printf '%s\n' "$current" | grep -Fq '"up":true' || { printf '%s\n' 'new DHCP egress lacks lease/default gateway' >&2; exit 1; }
+		fi
 		if [ -f "$TEST_TX_DIR/verify-fail" ]; then printf '%s\n' 'fixture runtime evidence unavailable' >&2; exit 1; fi ;;
 	management-address) cat "$TEST_TX_DIR/db/network.lan.ipaddr" ;;
 	link-plan)
@@ -195,18 +204,93 @@ cat >"$tmp/bin/fw4" <<'EOF'
 EOF
 cat >"$tmp/bin/ubus" <<'EOF'
 #!/bin/sh
+if [ "$1:$2:${3:-}" = call:network.interface:dump ]; then
+	n=$(cat "$TEST_TX_DIR/dhcp-polls" 2>/dev/null || printf 0); n=$((n + 1)); printf '%s\n' "$n" >"$TEST_TX_DIR/dhcp-polls"
+	mode=$(cat "$TEST_TX_DIR/dhcp-mode" 2>/dev/null || printf ready)
+	[ "$mode" != rpc-error ] || exit 1
+	: >"$TEST_TX_DIR/dhcp-clock-active"
+	if [ "$mode" = publish ] && [ "$n" -lt 3 ]; then printf '%s\n' '{"interface":[]}'; exit 0; fi
+	after=$(cat "$TEST_TX_DIR/dhcp-ready-after" 2>/dev/null || printf 3)
+	if [ "$mode" = warmup ] && [ "$n" -lt "$after" ]; then mode=pending; fi
+	interface=$(cat "$TEST_TX_DIR/dhcp-interface" 2>/dev/null || printf rp_init_policy)
+	if [ "$mode" = pending ]; then
+		printf '{"interface":[{"interface":"%s","up":false,"pending":true,"proto":"dhcp","device":"eth9","l3_device":"eth9","ipv4-address":[],"route":[],"errors":[]}]}\n' "$interface"
+	else
+		device=eth9; [ "$mode" != wrong-device ] || device=eth99
+		proto=dhcp; [ "$mode" != wrong-proto ] || proto=static
+		gateway=198.51.100.1; [ "$mode" != bad-gateway ] || gateway=invalid
+		routes="[{\"target\":\"0.0.0.0\",\"mask\":0,\"nexthop\":\"$gateway\"}]"
+		if [ "$mode" = lease-pending ] && [ "$n" -lt 3 ]; then routes='[]'; fi
+		errors='[]'; [ "$mode" != error ] || errors='[{"code":"NO_DEVICE"}]'
+		printf '{"interface":[{"interface":"%s","up":true,"pending":false,"proto":"%s","device":"%s","l3_device":"%s","ipv4-address":[{"address":"198.51.100.2","mask":24}],"route":%s,"errors":%s}]}\n' "$interface" "$proto" "$device" "$device" "$routes" "$errors"
+	fi
+	exit 0
+fi
+case "$2" in network.interface.*)
+	policy=${2#network.interface.}
+	device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
+	printf '{"l3_device":"%s","route":[{"target":"0.0.0.0","nexthop":"198.51.100.1"}]}\n' "$device"
+	exit 0 ;;
+esac
 [ ! -f "$TEST_TX_DIR/guard-down" ] || exit 1
 [ "${3:-}" != delete ] || { printf '%s\n' delete >>"$TEST_TX_DIR/guard-delete"; exit 0; }
 printf '%s\n' '{"routepolicy-initguard":{"instances":{"guard":{"running":true}}}}'
 EOF
 cat >"$tmp/bin/jsonfilter" <<'EOF'
 #!/bin/sh
-cat >/dev/null
-printf '%s\n' true
+data=$(cat); expression=$2; result=
+case "$expression" in
+	*routepolicy-initguard*) result=true ;;
+	@.interface) result=$(printf '%s\n' "$data" | sed -n 's/^{"interface":\(\[.*\]\)}$/\1/p') ;;
+	@.interface\[*) result=$(printf '%s\n' "$data" | sed -n 's/^{"interface":\[\(.*\)\]}$/\1/p') ;;
+	@.up|@.pending) field=${expression#@.}; result=$(printf '%s\n' "$data" | sed -n "s/.*\"$field\":\(true\|false\).*/\1/p") ;;
+	@.proto|@.device|@.l3_device) field=${expression#@.}; result=$(printf '%s\n' "$data" | sed -n "s/.*\"$field\":\"\([^\"]*\)\".*/\1/p") ;;
+	*ipv4-address*address) result=$(printf '%s\n' "$data" | sed -n 's/.*"address":"\([^"]*\)".*/\1/p') ;;
+	*ipv4-address*mask) result=$(printf '%s\n' "$data" | sed -n 's/.*"address":"[^"]*","mask":\([0-9]*\).*/\1/p') ;;
+	@.route*) result=$(printf '%s\n' "$data" | sed -n 's/.*"nexthop":"\([^"]*\)".*/\1/p') ;;
+	@.errors*) case "$data" in *NO_DEVICE*) result='{"code":"NO_DEVICE"}' ;; esac ;;
+esac
+[ -n "$result" ] || exit 1
+printf '%s\n' "$result"
 EOF
+if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+	cat >"$tmp/bin/jsonfilter" <<'EOF'
+#!/bin/sh
+exec "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/usr/bin/jsonfilter" "$@"
+EOF
+fi
+cat >"$tmp/bin/nft" <<'EOF'
+#!/bin/sh
+[ -f "$TEST_TX_DIR/policy-running" ]
+EOF
+cat >"$tmp/lib/apply" <<'EOF'
+#!/bin/sh
+set -eu
+[ ! -e /proc/self/fd/9 ] || { printf '%s\n' 'policy child inherited initialization lock' >&2; exit 1; }
+mkdir -p "$ROUTEPOLICY_ROOT/tmp/routepolicy"
+mkdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock" || exit 1
+trap 'rmdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock"' EXIT
+policy=$(cat "$TEST_TX_DIR/db/routepolicy.main.policy_interface")
+printf '%s\n' "$policy" >>"$TEST_TX_DIR/policy-apply-calls"
+if { [ "$policy" = wan2 ] && [ -f "$TEST_TX_DIR/policy-apply-fail" ]; } || { [ "$policy" = usbwan ] && [ -f "$TEST_TX_DIR/policy-restore-fail" ]; }; then printf '%s\n' 'fixture policy apply failed' >&2; exit 1; fi
+[ -f "$TEST_TX_DIR/policy-route-stale" ] || printf '%s' "$policy" >"$TEST_TX_DIR/runtime-policy"
+device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
+printf 'schema=1\nroute_table=200\npolicy_interface=%s\npolicy_device=%s\n' "$policy" "$device" >"$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied"
+EOF
+chmod +x "$tmp/lib/apply"
 cat >"$tmp/bin/ip" <<'EOF'
 #!/bin/sh
 set -eu
+if [ "$1:$2:${3:-}:${4:-}" = -4:route:show:table ]; then
+	if [ "$5" = main ]; then
+		if [ "$(cat "$TEST_TX_DIR/dhcp-mode" 2>/dev/null)" = kernel-pending ] && [ "$(cat "$TEST_TX_DIR/dhcp-polls")" -lt 3 ]; then exit 0; fi
+		printf '%s\n' 'default via 198.51.100.1 dev eth9 metric 200'; exit 0
+	fi
+	policy=$(cat "$TEST_TX_DIR/runtime-policy")
+	device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
+	printf 'default via 198.51.100.1 dev %s metric 10\n' "$device"
+	exit 0
+fi
 [ "$1:$2:$3:$4" = link:set:dev:eth9 ] || exit 1
 wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
 [ -f "$wal/link-attempted" ] && [ -f "$wal/link-boot" ] && [ "$(cat "$wal/phase")" != prepared ] || exit 1
@@ -248,6 +332,14 @@ cat >"$tmp/bin/date" <<'EOF'
 if [ "$#" = 1 ] && [ "$1" = +%s ] && [ -f "$TEST_TX_DIR/wall-clock" ]; then cat "$TEST_TX_DIR/wall-clock"
 else exec "$TEST_DATE_BIN" "$@"; fi
 EOF
+cat >"$tmp/bin/sleep" <<'EOF'
+#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = 1 ] && { [ -f "$TEST_TX_DIR/dhcp-clock-active" ] || [ -f "$TEST_TX_DIR/policy-clock-active" ]; }; then
+	if [ -f "$TEST_TX_DIR/policy-owner-release" ]; then rmdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock"; rm "$TEST_TX_DIR/policy-owner-release"; fi
+	awk '{printf "%.2f 0.00\n",$1+1}' "$ROUTEPOLICY_ROOT/proc/uptime" >"$TEST_TX_DIR/uptime-next"
+	mv "$TEST_TX_DIR/uptime-next" "$ROUTEPOLICY_ROOT/proc/uptime"
+else exec "$TEST_SLEEP_BIN" "$@"; fi
+EOF
 for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 	cat >"$tmp/root/etc/init.d/$service" <<'EOF'
 #!/bin/sh
@@ -259,6 +351,7 @@ case "$name" in
 	network) cat "$TEST_TX_DIR/db/network.lan.ipaddr" >"$TEST_TX_DIR/runtime-management" ;;
 	dnsmasq) cat "$TEST_TX_DIR/db/dhcp.lan.ignore" >"$TEST_TX_DIR/runtime-ignore" ;;
 esac
+[ "$name" != dnsmasq ] || [ ! -f "$TEST_TX_DIR/dhcp-short-window" ] || printf '1119.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"
 EOF
 done
 chmod +x "$tmp/bin/"* "$tmp/lib/init-topology" "$tmp/root/etc/init.d/"*
@@ -272,6 +365,7 @@ reset() {
 	rm -f "$tmp/guard-delete"
 	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
 	rm -f "$tmp/"auto-*
+	rm -f "$tmp/"dhcp-* "$tmp/"policy-* "$tmp/runtime-policy"
 	mkdir -p "$tmp/root/etc/config"
 	for config_package in network dhcp firewall routepolicy; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
@@ -286,6 +380,7 @@ reset() {
 	printf lan >"$tmp/db/routepolicy.main.lan_interface"
 	printf wan >"$tmp/db/routepolicy.main.default_interface"
 	printf usbwan >"$tmp/db/routepolicy.main.policy_interface"
+	printf 0 >"$tmp/db/routepolicy.main.enabled"
 	printf 192.0.2.1 >"$tmp/db/network.lan.ipaddr"
 	printf 0 >"$tmp/db/dhcp.lan.ignore"
 	printf untouched >"$tmp/db/dhcp.other.ignore"
@@ -297,6 +392,128 @@ prepare() {
 	out=$("$TX" prepare lan wan usbwan - - - - - - 192.0.2.2 24)
 	token=$(printf '%s\n' "$out" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
 	[ "${#token}" -eq 32 ]
+}
+prepare_policy() {
+	out=$("$TX" prepare lan wan wan2 - - - - - - 192.0.2.2 24)
+	token=$(printf '%s\n' "$out" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+	[ "${#token}" = 32 ]
+}
+prepare_dhcp() {
+	if [ "${1:-policy}" = default ]; then
+		printf rp_init_default >"$tmp/dhcp-interface"
+		out=$("$TX" prepare lan rp_init_default usbwan default eth9 dhcp - - - - -)
+	else
+		printf rp_init_policy >"$tmp/dhcp-interface"
+		out=$("$TX" prepare lan wan rp_init_policy policy eth9 dhcp - - - - -)
+	fi
+	token=$(printf '%s\n' "$out" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+	[ "${#token}" = 32 ]
+}
+enable_policy_fixture() {
+	printf 1 >"$tmp/db/routepolicy.main.enabled"
+	mkdir -p "$tmp/root/etc/routepolicy/state"
+	printf 'schema=1\nroute_table=200\npolicy_interface=usbwan\npolicy_device=usbwan-dev\n' >"$tmp/root/etc/routepolicy/state/applied"
+	printf usbwan >"$tmp/runtime-policy"; : >"$tmp/policy-running"
+}
+policy_apply_test() {
+	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
+	printf 'policy after apply: configured=%s runtime=%s\n' "$(cat "$tmp/db/routepolicy.main.policy_interface")" "$(cat "$tmp/runtime-policy")"
+	[ "$(cat "$tmp/runtime-policy")" = wan2 ]
+}
+policy_rollback_test() {
+	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
+	printf wan2 >"$tmp/runtime-policy"
+	"$TX" recover >/dev/null
+	printf 'policy after rollback: configured=%s runtime=%s\n' "$(cat "$tmp/db/routepolicy.main.policy_interface")" "$(cat "$tmp/runtime-policy")"
+	[ "$(cat "$tmp/runtime-policy")" = usbwan ]
+}
+dhcp_readiness_test() {
+	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf warmup >"$tmp/dhcp-mode"
+	printf 17 >"$tmp/dhcp-ready-after"
+	prepare_dhcp
+	if ! "$TX" apply "$token" >"$tmp/dhcp-apply-output"; then
+		printf 'new DHCP after first incomplete lease: phase=%s\n' "$(cat "$WAL/phase")" >&2; return 1
+	fi
+	phase_is pending
+	[ "$(cat "$tmp/dhcp-polls")" -ge 17 ]
+	[ "$(wc -l <"$tmp/dhcp-verify-calls")" = 1 ]
+	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]
+	[ "$(cat "$WAL/deadline")" = 1700000120 ]
+}
+policy_runtime_tests() {
+	policy_apply_test
+	policy_rollback_test
+	# Disabled stays disabled; enabled-but-missing runtime must fail before any network write.
+	reset; prepare_policy; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null
+	[ ! -f "$tmp/policy-apply-calls" ]
+	for missing in state table; do
+		reset; enable_policy_fixture
+		if [ "$missing" = state ]; then rm "$tmp/root/etc/routepolicy/state/applied"; else rm "$tmp/policy-running"; fi
+		prepare_policy; bad "$TX" apply "$token"; phase_is prepared
+		[ ! -f "$tmp/commits" ]; [ ! -f "$tmp/policy-apply-calls" ]
+	done
+	for policy_fault in policy-apply-fail policy-route-stale; do
+		reset; enable_policy_fixture; touch "$tmp/$policy_fault"; prepare_policy
+		bad "$TX" apply "$token"; phase_is rolled_back
+		[ "$(cat "$tmp/runtime-policy")" = usbwan ]
+		[ "$(cat "$tmp/db/routepolicy.main.policy_interface")" = usbwan ]
+		"$TX" status | grep -Fq '"failed_stage":"policy-runtime"'
+	done
+	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
+	printf usbwan >"$tmp/runtime-policy"
+	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"; phase_is pending
+	[ "$(wc -l <"$tmp/policy-apply-calls")" = 1 ]
+	"$TX" recover >/dev/null; phase_is rolled_back
+	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
+	touch "$tmp/policy-restore-fail"; bad "$TX" recover; phase_is conflict
+	[ "$(cat "$tmp/runtime-policy")" = wan2 ]
+	[ "$(cat "$tmp/db/routepolicy.main.policy_interface")" = usbwan ]
+	rm "$tmp/policy-restore-fail"; "$TX" recover >/dev/null; phase_is rolled_back
+	[ "$(cat "$tmp/runtime-policy")" = usbwan ]
+	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
+	rm "$WAL/policy-active"; "$TX" recover >/dev/null; phase_is rolled_back
+	[ "$(cat "$tmp/runtime-policy")" = usbwan ]
+	reset; enable_policy_fixture; prepare_policy
+	mkdir -p "$tmp/root/tmp/routepolicy/apply.lock"
+	touch "$tmp/policy-clock-active"
+	bad "$TX" apply "$token"; phase_is conflict
+	[ -d "$tmp/root/tmp/routepolicy/apply.lock" ]
+	rmdir "$tmp/root/tmp/routepolicy/apply.lock"; "$TX" recover >/dev/null; phase_is rolled_back
+	reset; enable_policy_fixture; prepare_policy
+	mkdir -p "$tmp/root/tmp/routepolicy/apply.lock"; touch "$tmp/policy-clock-active" "$tmp/policy-owner-release"
+	"$TX" apply "$token" >/dev/null; phase_is pending
+	[ "$(cat "$tmp/runtime-policy")" = wan2 ]; [ ! -f "$tmp/policy-owner-release" ]
+}
+dhcp_readiness_tests() {
+	dhcp_readiness_test
+	for transient in publish lease-pending kernel-pending; do
+		reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf '%s' "$transient" >"$tmp/dhcp-mode"
+		prepare_dhcp; "$TX" apply "$token" >/dev/null; phase_is pending
+		[ "$(cat "$tmp/dhcp-polls")" -ge 3 ]
+		[ "$(wc -l <"$tmp/dhcp-verify-calls")" = 1 ]
+	done
+	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf warmup >"$tmp/dhcp-mode"
+	prepare_dhcp default; "$TX" apply "$token" >/dev/null; phase_is pending
+	[ "$(cat "$tmp/db/routepolicy.main.default_interface")" = rp_init_default ]
+	for dhcp_fault in wrong-device wrong-proto bad-gateway error rpc-error; do
+		reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf '%s' "$dhcp_fault" >"$tmp/dhcp-mode"
+		prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
+		[ "$(cat "$tmp/dhcp-polls")" = 1 ]
+		[ ! -f "$tmp/dhcp-verify-calls" ]
+		[ "$(cat "$tmp/root/proc/uptime")" = '1000.00 0.00' ]
+	done
+	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test" "$tmp/verify-fail"
+	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
+	[ "$(wc -l <"$tmp/dhcp-verify-calls")" = 1 ]
+	"$TX" status | grep -Fq '"failed_stage":"runtime-verify"'
+	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf pending >"$tmp/dhcp-mode"
+	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
+	[ "$(cat "$tmp/root/proc/uptime")" = '1100.00 0.00' ]
+	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000120 ]
+	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test" "$tmp/dhcp-short-window"
+	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
+	[ ! -f "$tmp/dhcp-polls" ]
+	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000120 ]
 }
 phase_is() { [ "$(cat "$WAL/phase")" = "$1" ]; }
 restored() {
@@ -422,6 +639,11 @@ case "${1:-}" in
 	--clock-backward) backward_clock_test; exit 0 ;;
 	--clock-forward) forward_clock_test; exit 0 ;;
 	--clock-tests) monotonic_clock_tests; confirm_boot_tests; exit 0 ;;
+	--policy-apply) policy_apply_test; exit 0 ;;
+	--policy-rollback) policy_rollback_test; exit 0 ;;
+	--dhcp-readiness) dhcp_readiness_test; exit 0 ;;
+	--policy-runtime-tests) policy_runtime_tests; exit 0 ;;
+	--dhcp-readiness-tests) dhcp_readiness_tests; exit 0 ;;
 esac
 
 if [ "${1:-}" = --native-transaction ] || [ "${1:-}" = --native-cas-audit ]; then
@@ -450,7 +672,7 @@ EOF
 		rm -rf "$tmp/external" "$tmp/concurrent"
 		mkdir "$tmp/external" "$tmp/concurrent"
 		printf "config interface 'lan'\n\toption ipaddr '192.0.2.1'\n" >"$tmp/root/etc/config/network"
-		printf "config main 'main'\n\toption lan_interface 'lan'\n\toption default_interface 'wan'\n\toption policy_interface 'usbwan'\n" >"$tmp/root/etc/config/routepolicy"
+		printf "config main 'main'\n\toption enabled '0'\n\toption lan_interface 'lan'\n\toption default_interface 'wan'\n\toption policy_interface 'usbwan'\n" >"$tmp/root/etc/config/routepolicy"
 		printf "config dhcp 'lan'\n\toption ignore '0'\n\toption ra 'server'\nconfig dhcp 'other'\n\toption leasetime '12h'\n" >"$tmp/root/etc/config/dhcp"
 	}
 	native_get() {
@@ -772,6 +994,8 @@ phase_is conflict
 guard_race_tests
 confirm_boot_tests
 monotonic_clock_tests
+policy_runtime_tests
+dhcp_readiness_tests
 
 # Admin-DOWN static egress: review stays read-only; DAD precedes every UCI commit.
 reset; touch "$tmp/link-enabled"
