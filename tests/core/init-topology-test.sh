@@ -256,6 +256,10 @@ apply_mock_plan() {
 insert_forward_rule() {
 	TEST_RULE_TEXT="$1" awk '/chain forward_lan \{/{print;print ENVIRON["TEST_RULE_TEXT"];next}{print}' "$tmp/nft" >"$2"
 }
+insert_rule_pair() {
+	TEST_CHAIN="$1" TEST_FIRST="$2" TEST_SECOND="$3" \
+		awk '$1=="chain"&&$2==ENVIRON["TEST_CHAIN"]{print;print ENVIRON["TEST_FIRST"];print ENVIRON["TEST_SECOND"];next}{print}' "$tmp/nft" >"$4"
+}
 baseline
 cp "$tmp/config" "$tmp/before"
 "$tool" discover >"$tmp/discover"
@@ -267,6 +271,48 @@ cmp "$tmp/config" "$tmp/before"
 awk '/chain forward_lan \{/{print;print "meta nfproto 2 counter packets 0 bytes 0 drop comment \"!fw4: existing IPv4 deny-all\"";next}{print}' "$tmp/nft" >"$tmp/early-ipv4-drop.nft"
 reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" plan lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
+# Nonmatching or partial ACCEPT must not hide a later DROP on the same path.
+coverage_bad=0
+for first in \
+	'ip saddr 198.51.100.0/24 oifname "eth1" counter accept' \
+	'ip saddr 198.51.0.0/16 oifname "eth1" counter accept' \
+	'ip saddr 192.168.1.0/25 oifname "eth1" counter accept' \
+	'meta nfproto 2 meta l4proto 6 oifname "eth1" counter accept' \
+	'meta nfproto 2 tcp dport 80 oifname "eth1" counter accept' \
+	'meta nfproto 2 iifname "br-other" oifname "eth1" counter accept' \
+	'meta nfproto 2 oifname "eth9" counter accept' \
+	'meta nfproto 2 ct state 0x1 oifname "eth1" counter accept' \
+	'ip saddr 192.168.1.0/24 ip saddr 198.51.100.0/24 oifname "eth1" counter accept'; do
+	coverage_bad=$((coverage_bad + 1))
+	insert_rule_pair accept_to_wan "$first" 'meta nfproto 2 oifname "eth1" counter log prefix "LAN blocked" drop' "$tmp/coverage-bad-$coverage_bad.nft"
+done
+for tuple in 'wan eth1' 'policy eth2'; do
+	set -- $tuple; zone=$1; dev=$2
+	coverage_bad=$((coverage_bad + 1))
+	insert_rule_pair "accept_to_$zone" "ip saddr 198.51.100.0/24 oifname \"$dev\" counter accept" "meta nfproto 2 oifname \"$dev\" counter log prefix \"LAN blocked\" drop" "$tmp/coverage-bad-$coverage_bad.nft"
+	coverage_bad=$((coverage_bad + 1))
+	insert_rule_pair "accept_to_$zone" '' "meta nfproto 2 oifname \"$dev\" counter log prefix \"LAN blocked\" drop" "$tmp/coverage-bad-$coverage_bad.nft"
+	coverage_bad=$((coverage_bad + 1))
+	insert_rule_pair forward_lan "ip saddr 198.51.100.0/24 counter jump accept_to_$zone" "meta nfproto 2 oifname \"$dev\" counter log prefix \"LAN blocked\" drop" "$tmp/coverage-bad-$coverage_bad.nft"
+done
+coverage_bad=$((coverage_bad + 1))
+insert_rule_pair forward_lan 'ip saddr 198.51.100.0/24 counter accept' 'meta nfproto 2 counter log prefix "LAN blocked" drop' "$tmp/coverage-bad-$coverage_bad.nft"
+for blocked in "$tmp"/coverage-bad-*.nft; do
+	reject env TEST_NFT_FILE="$blocked" "$tool" plan lan wan policy
+	grep -Fq 'IPv4 forwarding' "$tmp/error"
+done
+grep -v 'routepolicy-init-' "$tmp/coverage-bad-1.nft" >"$tmp/coverage-fresh-helper.nft"
+reject env TEST_NFT_FILE="$tmp/coverage-fresh-helper.nft" "$tool" plan lan wan policy
+coverage_safe=0
+for tuple in 'wan eth1' 'policy eth2'; do
+	set -- $tuple; zone=$1; dev=$2
+	for source in 192.168.1.0/24 192.168.0.0/16; do
+		coverage_safe=$((coverage_safe + 1))
+		insert_rule_pair "accept_to_$zone" "ip saddr $source oifname \"$dev\" counter accept" "meta nfproto 2 oifname \"$dev\" counter log prefix \"already accepted\" drop" "$tmp/coverage-safe-$coverage_safe.nft"
+		TEST_NFT_FILE="$tmp/coverage-safe-$coverage_safe.nft" "$tool" plan lan wan policy >"$tmp/coverage-safe-plan"
+		cmp "$tmp/plan" "$tmp/coverage-safe-plan"
+	done
+done
 ipv4_bad=0
 for verdict in \
 	'meta nfproto ipv4 counter drop' \
@@ -506,6 +552,11 @@ apply_mock_plan "$tmp/plan"
 "$tool" verify lan wan policy >"$tmp/verify"
 grep -Fq '"packet_evidence":"EVIDENCE_MISSING"' "$tmp/verify"
 grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
+for blocked in "$tmp"/coverage-bad-*.nft; do
+	reject env TEST_NFT_FILE="$blocked" "$tool" verify lan wan policy
+	grep -Fq 'IPv4 forwarding' "$tmp/error"
+done
+for safe in "$tmp"/coverage-safe-*.nft; do TEST_NFT_FILE="$safe" "$tool" verify lan wan policy >"$tmp/verify-coverage-safe"; done
 reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" verify lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
 for blocked in "$tmp"/blocked4-*.nft; do

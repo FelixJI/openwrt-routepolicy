@@ -584,7 +584,7 @@ ipv4_forward_guard() {
 				if(w=="ip"&&(t[i+1]=="saddr"||t[i+1]=="daddr")) {
 					field=t[i+1];if(!prefix(t[i+2]))return 0
 					minbits=bits<lan_bits?bits:lan_bits;block=2^(32-minbits)
-					if(field=="saddr"&&int(network/block)!=int(lan_network/block)){pd=0;ppending=0}
+					if(field=="saddr"&&int(network/block)!=int(lan_network/block)){pd=0;ppending=0;ud=0;up=0}
 					if(field=="saddr"&&bits>lan_bits||field=="daddr"&&bits!=0){ud=0;up=0}
 					i+=3;continue
 				}
@@ -613,7 +613,7 @@ ipv4_forward_guard() {
 			if(!pd&&!ppending||action=="")return 1
 			if(action=="accept")return oif
 			if(action=="jump"&&!helper&&target~/^accept_to_/) {
-				if(mode=="plan"&&comment~/^"!fw4: routepolicy-init-(default4|policy4)"$/)return 1
+				if(mode=="plan"&&comment~/^"!fw4: routepolicy-init-(default4|policy4)"$/&&target!="accept_to_" default_zone&&target!="accept_to_" policy_zone)return 1
 				return safe[target]
 			}
 			return 0
@@ -633,8 +633,10 @@ ipv4_forward_guard() {
 				d=1;p=1;safe[h]=1
 				for(r=1;r<=count[h];r++) {
 					if(!parse(rules[h,r],d,p,1)){safe[h]=0;break}
-					if(action=="accept"){if(ud)d=0;if(up)p=0}
+					# Retire a path only when this rule can match and covers it completely.
+					if(action=="accept"){if(pd&&ud)d=0;if(ppending&&up)p=0}
 				}
+				if(mode=="plan"&&!safe[h])bad=1
 			}
 			d=1;p=1;f="forward_" zone
 			for(r=1;r<=count[f];r++) {
@@ -642,9 +644,9 @@ ipv4_forward_guard() {
 				if(mode=="plan"&&native_tail(rules[f,r]))break
 				if(!parse(rules[f,r],d,p,0)){bad=1;break}
 				if(mode=="verify") {
-					if(action=="accept"){if(ud)d=0;if(up)p=0}
-					if(action=="jump"&&target=="accept_to_" default_zone&&ud)d=0
-					if(action=="jump"&&target=="accept_to_" policy_zone&&up)p=0
+					if(action=="accept"){if(pd&&ud)d=0;if(ppending&&up)p=0}
+					if(action=="jump"&&target=="accept_to_" default_zone&&pd&&ud)d=0
+					if(action=="jump"&&target=="accept_to_" policy_zone&&ppending&&up)p=0
 				}
 			}
 			exit bad
