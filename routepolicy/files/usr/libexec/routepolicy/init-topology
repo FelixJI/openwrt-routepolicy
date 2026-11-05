@@ -486,7 +486,7 @@ forward_include_guard() {
 		"$RP_ROOT/usr/share/nftables.d/chain-pre/handle_reject/"*.nft \
 		"$RP_ROOT/usr/share/nftables.d/table-pre/"*.nft "$RP_ROOT/usr/share/nftables.d/table-post/"*.nft \
 		"$RP_ROOT/usr/share/nftables.d/ruleset-pre/"*.nft "$RP_ROOT/usr/share/nftables.d/ruleset-post/"*.nft; do
-		[ ! -e "$file" ] || fail 'IPv6 control flow: an automatic nftables include requires manual review'
+		[ ! -e "$file" ] || awk '/^[[:space:]]*($|#)/{next}{active=1}END{exit active}' "$file" || fail 'IPv6 control flow: an active automatic nftables include requires manual review'
 	done
 }
 

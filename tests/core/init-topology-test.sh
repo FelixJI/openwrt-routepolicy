@@ -367,6 +367,19 @@ baseline
 grep -v 'routepolicy-init-' "$tmp/nft" >"$tmp/official-before.nft"
 TEST_NFT_FILE="$tmp/official-before.nft" "$tool" plan lan wan policy >"$tmp/official-before-plan"
 cmp "$tmp/plan" "$tmp/official-before-plan"
+mkdir -p "$tmp/root/etc/nftables.d"
+cat >"$tmp/root/etc/nftables.d/10-custom-filter-chains.nft" <<'EOF'
+## Official firewall4 ships this file as comments and whitespace only.
+# chain user_pre_forward {
+#     type filter hook forward priority -1; policy accept;
+#     meta nfproto ipv6 accept
+# }
+EOF
+"$tool" plan lan wan policy >"$tmp/official-comment-include-plan"
+cmp "$tmp/plan" "$tmp/official-comment-include-plan"
+printf 'chain forward_lan { meta nfproto ipv6 accept; }\n' >>"$tmp/root/etc/nftables.d/10-custom-filter-chains.nft"
+reject "$tool" plan lan wan policy
+rm "$tmp/root/etc/nftables.d/10-custom-filter-chains.nft"
 awk '/chain forward_lan \{/{print;print "meta nfproto ipv6 accept";next}{print}' "$tmp/nft" >"$tmp/early-access-accept.nft"
 awk '/chain forward \{/{print;print "meta nfproto 10 accept";next}{print}' "$tmp/nft" >"$tmp/early-root-accept.nft"
 awk '/chain handle_reject \{/{print;print "meta nfproto 10 accept";next}{print}' "$tmp/nft" >"$tmp/early-reject-accept.nft"
