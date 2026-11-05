@@ -277,11 +277,12 @@ new_dhcp_probe() {
 	dhcp_gateway=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null) || dhcp_gateway=
 	[ -n "$dhcp_address" ] && [ -n "$dhcp_gateway" ] && [ -n "$dhcp_l3" ] || return 75
 	rp_is_ipv4 "$dhcp_address" && rp_is_ipv4 "$dhcp_gateway" || return 1
-	dhcp_routes=$(timeout 3 ip -4 route show table main default dev "$a5") || return 1
+	# A dev filter makes native ip omit dev, so inspect explicit devices instead.
+	dhcp_routes=$(timeout 3 ip -4 route show table main default) || return 1
 	[ -n "$dhcp_routes" ] || return 75
 	printf '%s\n' "$dhcp_routes" | awk -v device="$a5" -v gateway="$dhcp_gateway" '
-		$1=="default"{d="";g="";for(i=1;i<NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1)}if(d==device&&g==gateway)n++;else bad=1}
-		END{exit n!=1||bad}'
+		$1=="default"{d="";g="";for(i=1;i<NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1)}if(d==device){if(g==gateway)n++;else bad=1}}
+		END{if(bad||n>1)exit 1;if(n==0)exit 75}'
 }
 wait_new_dhcp() {
 	case "$a4:$a6" in default:dhcp|policy:dhcp) ;; *) return 0 ;; esac

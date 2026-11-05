@@ -283,8 +283,18 @@ cat >"$tmp/bin/ip" <<'EOF'
 set -eu
 if [ "$1:$2:${3:-}:${4:-}" = -4:route:show:table ]; then
 	if [ "$5" = main ]; then
-		if [ "$(cat "$TEST_TX_DIR/dhcp-mode" 2>/dev/null)" = kernel-pending ] && [ "$(cat "$TEST_TX_DIR/dhcp-polls")" -lt 3 ]; then exit 0; fi
-		printf '%s\n' 'default via 198.51.100.1 dev eth9 metric 200'; exit 0
+		mode=$(cat "$TEST_TX_DIR/dhcp-mode" 2>/dev/null || printf ready)
+		# Native ip omits dev after a dev filter; replay its captured output shape.
+		if [ "${7:-}" = dev ]; then
+			printf '%s\n' 'default via 198.51.100.1 proto static src 198.51.100.2 metric 200 '; exit 0
+		fi
+		printf '%s\n' 'default via 198.51.100.1 dev wan proto dhcp metric 10'
+		if [ "$mode" = kernel-pending ] && [ "$(cat "$TEST_TX_DIR/dhcp-polls")" -lt 3 ]; then exit 0; fi
+		[ "$mode" != kernel-other-only ] || exit 0
+		gateway=198.51.100.1; [ "$mode" != wrong-route-gateway ] || gateway=198.51.100.99
+		printf 'default via %s dev eth9 proto static src 198.51.100.2 metric 200 \n' "$gateway"
+		[ "$mode" != duplicate-route ] || printf '%s\n' 'default via 198.51.100.1 dev eth9 metric 201'
+		exit 0
 	fi
 	policy=$(cat "$TEST_TX_DIR/runtime-policy")
 	device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
@@ -495,7 +505,7 @@ dhcp_readiness_tests() {
 	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf warmup >"$tmp/dhcp-mode"
 	prepare_dhcp default; "$TX" apply "$token" >/dev/null; phase_is pending
 	[ "$(cat "$tmp/db/routepolicy.main.default_interface")" = rp_init_default ]
-	for dhcp_fault in wrong-device wrong-proto bad-gateway error rpc-error; do
+	for dhcp_fault in wrong-device wrong-proto bad-gateway error rpc-error wrong-route-gateway duplicate-route; do
 		reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf '%s' "$dhcp_fault" >"$tmp/dhcp-mode"
 		prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
 		[ "$(cat "$tmp/dhcp-polls")" = 1 ]
@@ -506,10 +516,12 @@ dhcp_readiness_tests() {
 	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
 	[ "$(wc -l <"$tmp/dhcp-verify-calls")" = 1 ]
 	"$TX" status | grep -Fq '"failed_stage":"runtime-verify"'
-	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf pending >"$tmp/dhcp-mode"
-	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
-	[ "$(cat "$tmp/root/proc/uptime")" = '1100.00 0.00' ]
-	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000120 ]
+	for incomplete in pending kernel-other-only; do
+		reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf '%s' "$incomplete" >"$tmp/dhcp-mode"
+		prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
+		[ "$(cat "$tmp/root/proc/uptime")" = '1100.00 0.00' ]
+		[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000120 ]
+	done
 	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test" "$tmp/dhcp-short-window"
 	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
 	[ ! -f "$tmp/dhcp-polls" ]
