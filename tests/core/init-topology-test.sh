@@ -253,6 +253,9 @@ apply_mock_plan() {
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
 }
+insert_forward_rule() {
+	TEST_RULE_TEXT="$1" awk '/chain forward_lan \{/{print;print ENVIRON["TEST_RULE_TEXT"];next}{print}' "$tmp/nft" >"$2"
+}
 baseline
 cp "$tmp/config" "$tmp/before"
 "$tool" discover >"$tmp/discover"
@@ -264,6 +267,7 @@ cmp "$tmp/config" "$tmp/before"
 awk '/chain forward_lan \{/{print;print "meta nfproto 2 counter packets 0 bytes 0 drop comment \"!fw4: existing IPv4 deny-all\"";next}{print}' "$tmp/nft" >"$tmp/early-ipv4-drop.nft"
 reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" plan lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
+ipv4_bad=0
 for verdict in \
 	'meta nfproto ipv4 counter drop' \
 	'meta nfproto 2 drop' \
@@ -273,10 +277,51 @@ for verdict in \
 	'meta nfproto 2 counter jump reject_to_policy' \
 	'meta nfproto 2 counter name "deny_stats" drop' \
 	'ip saddr 0.0.0.0/0 counter drop' \
-	'ip daddr 0.0.0.0/0 counter reject'; do
-	awk -v verdict="$verdict" '/chain forward_lan \{/{print;print verdict;next}{print}' "$tmp/nft" >"$tmp/early-ipv4-verdict.nft"
-	reject env TEST_NFT_FILE="$tmp/early-ipv4-verdict.nft" "$tool" plan lan wan policy
+	'ip daddr 0.0.0.0/0 counter reject' \
+	'meta nfproto 2 counter packets 0 bytes 0 log prefix "review-existing-lan-all-drop: " drop comment "!fw4: review-existing-lan-all-drop"' \
+	'meta nfproto ipv4 log prefix "quoted \"drop\" and \\ slash" counter packets 9 bytes 1500 reject with icmp type admin-prohibited' \
+	'meta nfproto 2 log prefix "comment \"!fw4: routepolicy-init-default4\" accept jump return" counter drop' \
+	'meta nfproto 2 counter log prefix "meta nfproto ipv6 } chain forward_lan {" drop' \
+	'meta nfproto 2 log counter drop' \
+	'ip saddr 192.168.1.0/24 counter log prefix "LAN deny" drop' \
+	'ip saddr 192.168.0.0/16 log prefix "overlap" counter reject' \
+	'ip saddr 192.168.1.9 counter drop' \
+	'meta nfproto 2 iifname "br-lan" counter log prefix "deny" drop' \
+	'meta nfproto 2 counter log prefix "return" return' \
+	'meta nfproto 2 counter log prefix "jump" jump custom_path' \
+	'meta nfproto 2 counter goto accept_to_wan' \
+	'meta nfproto 2 meta mark set 0x100 counter accept' \
+	'ip saddr 198.51.100.0/24 ip daddr { 1.1.1.1, 2.2.2.2 } counter drop' \
+	'meta nfproto 2 limit rate 10/second log prefix "limited" drop' \
+	'meta nfproto 2 log group 1 counter drop'; do
+	ipv4_bad=$((ipv4_bad + 1))
+	insert_forward_rule "$verdict" "$tmp/blocked4-$ipv4_bad.nft"
+	reject env TEST_NFT_FILE="$tmp/blocked4-$ipv4_bad.nft" "$tool" plan lan wan policy
 	grep -Fq 'IPv4 forwarding' "$tmp/error"
+done
+ipv4_safe=0
+for rule in \
+	'meta nfproto 2 log prefix "drop reject return \"quoted\" \\ slash" counter packets 1 bytes 50' \
+	'meta nfproto ipv4 counter name "drop" log prefix "comment \"!fw4: routepolicy-init-default4\""' \
+	'ip saddr 198.51.100.0/24 log prefix "drop" counter drop' \
+	'ip saddr 192.168.2.0/24 counter log prefix "reject" reject' \
+	'meta nfproto 2 ip saddr 198.51.100.0/24 udp dport 53 log prefix "drop" drop' \
+	'meta nfproto 2 iifname "br-other" log prefix "drop" counter drop' \
+	'meta nfproto 2 oifname "eth9" counter log prefix "drop" drop' \
+	'meta nfproto 2 oifname "eth1" tcp dport 80 counter log prefix "drop is data" accept'; do
+	ipv4_safe=$((ipv4_safe + 1))
+	insert_forward_rule "$rule" "$tmp/safe4-$ipv4_safe.nft"
+	TEST_NFT_FILE="$tmp/safe4-$ipv4_safe.nft" "$tool" plan lan wan policy >"$tmp/safe4-plan"
+	cmp "$tmp/plan" "$tmp/safe4-plan"
+done
+for rule in \
+	'meta nfproto 10 counter log prefix "drop is IPv6-only" drop' \
+	'ip6 saddr 2001:db8::/64 log prefix "IPv6 drop" counter drop' \
+	'icmpv6 type 134 counter log prefix "IPv6 reject" drop'; do
+	ipv4_safe=$((ipv4_safe + 1))
+	TEST_RULE_TEXT="$rule" awk '{print} /comment "!fw4: routepolicy-init-ipv6"/{print ENVIRON["TEST_RULE_TEXT"]}' "$tmp/nft" >"$tmp/safe4-$ipv4_safe.nft"
+	TEST_NFT_FILE="$tmp/safe4-$ipv4_safe.nft" "$tool" plan lan wan policy >"$tmp/safe4-plan"
+	cmp "$tmp/plan" "$tmp/safe4-plan"
 done
 grep -Fq 'set	dhcp.lan.ignore	1' "$tmp/plan"
 grep -Fq 'set	dhcp.lan.ra	disabled' "$tmp/plan"
@@ -463,15 +508,18 @@ grep -Fq '"packet_evidence":"EVIDENCE_MISSING"' "$tmp/verify"
 grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
 reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" verify lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
-for verdict in \
-	'meta nfproto ipv4 counter drop' \
-	'meta nfproto 2 counter reject with icmp type port-unreachable' \
-	'meta nfproto 2 counter jump drop_to_wan' \
-	'meta nfproto 2 counter jump reject_to_policy'; do
-	awk -v verdict="$verdict" '/chain forward_lan \{/{print;print verdict;next}{print}' "$tmp/nft" >"$tmp/early-ipv4-verdict.nft"
-	reject env TEST_NFT_FILE="$tmp/early-ipv4-verdict.nft" "$tool" verify lan wan policy
+for blocked in "$tmp"/blocked4-*.nft; do
+	reject env TEST_NFT_FILE="$blocked" "$tool" verify lan wan policy
 	grep -Fq 'IPv4 forwarding' "$tmp/error"
 done
+for safe in "$tmp"/safe4-*.nft; do TEST_NFT_FILE="$safe" "$tool" verify lan wan policy >"$tmp/verify-safe4"; done
+TEST_RULE_TEXT='meta nfproto 2 oifname "eth1" ct state 0x1 counter packets 0 bytes 0 log prefix "NAT leakage drop: " drop' \
+	awk '/chain accept_to_wan \{/{print;print ENVIRON["TEST_RULE_TEXT"];next}{print}' "$tmp/nft" >"$tmp/official-nat-leak.nft"
+TEST_NFT_FILE="$tmp/official-nat-leak.nft" "$tool" verify lan wan policy >"$tmp/verify-nat-leak"
+TEST_RULE_TEXT='meta nfproto 2 counter log prefix "hidden drop" drop' \
+	awk '/chain accept_to_wan \{/{print;print ENVIRON["TEST_RULE_TEXT"];next}{print}' "$tmp/nft" >"$tmp/early-helper-drop.nft"
+reject env TEST_NFT_FILE="$tmp/early-helper-drop.nft" "$tool" verify lan wan policy
+grep -Fq 'IPv4 forwarding' "$tmp/error"
 awk '{print} /comment "!fw4: routepolicy-init-default4"/{print "meta nfproto 2 counter drop"}' "$tmp/nft" >"$tmp/between-ipv4-allows.nft"
 reject env TEST_NFT_FILE="$tmp/between-ipv4-allows.nft" "$tool" verify lan wan policy
 grep -Fq 'IPv4 forwarding' "$tmp/error"
