@@ -27,6 +27,7 @@ return view.extend({
 
 	render: function() {
 		let m = new form.Map('routepolicy', _('基础设置'), _('“保存”只把修改加入 LuCI 变更队列，不会改变当前网络；“保存并应用”会提交 UCI，并由服务触发器同步运行态。'));
+		m.description += ' ' + _('初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙或 RoutePolicy 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。');
 		let s = m.section(form.NamedSection, 'main', 'main', _('策略控制面'));
 		s.addremove = false;
 

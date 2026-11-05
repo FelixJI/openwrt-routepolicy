@@ -44,6 +44,25 @@ RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 n
 
 依赖由 OpenWrt 软件包仓库解析；离线安装前请确保设备已具备发布说明所列依赖。`--allow-untrusted` 仅适用于直接安装本项目未签名的 release APK，请只从本仓库 Release 获取文件。
 
+### 首次旁路由初始化（管理员 CLI）
+
+请从预览开始安排一次单人维护。初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙或 RoutePolicy 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。
+
+从带外控制台或 SSH 运行 `routepolicyctl init-discover`。核对接入侧的管理地址、两个出口的逻辑接口与网关，以及接入侧现有的 DHCP 服务。保留带外控制台，以便更改地址后重新连接。以下示例假设已存在 `lan`、`wan`、`policy` 三个接口。单臂接入与默认出口共用 `lan` 时，前两个参数均为 `lan`，该接口须有可达的上游网关。
+
+```sh
+routepolicyctl init-preview lan wan policy - - - - - - - -
+routepolicyctl init-prepare lan wan policy - - - - - - - -
+```
+
+`-` 表示保留对应设置。三个角色之后依次为新建出口的角色、网卡、协议、IPv4 地址、前缀长度、网关，以及接入侧的新管理地址和前缀长度。为尚未配置的独立网卡创建出口时，逻辑接口名使用 `rp_init_default` 或 `rp_init_policy`。`dhcp` 出口的静态地址、前缀和网关填 `-`。`static` 出口需填写这三项。
+
+如果新静态出口的网卡处于 DOWN，预览会标记地址冲突探测待执行，网卡保持原状态。显式应用后，事务才临时启用这块网卡，等待链路就绪并用 ARP 探测候选地址。发现地址已占用或无法确认链路时，事务停止，并在网卡仍由本事务管理时恢复原状态。
+
+核对 `init-prepare` 返回的变更和管理入口，保存该次返回的 token。确认要应用时执行 `routepolicyctl init-apply TOKEN`。从接入侧通过 SSH 连接预览中的管理地址，检查管理连接与网络，再执行 `routepolicyctl init-confirm TOKEN`。可从带外控制台运行 `routepolicyctl init-status` 查看状态；待确认期间可用 `routepolicyctl init-recover` 主动回滚。超过确认时限，守卫会回滚本次变更。若状态为 `conflict`，从控制台核对外部改动后再处理。
+
+初始化仅管理所选接口。受管接入侧停止提供 DHCPv4 及本机 RA/DHCPv6，出口 DHCP client 保留。终端仍须通过现有 DHCP 或其网络设置，把网关和 DNS 指向旁路由的接入地址。首期仅分流 IPv4；防火墙拒绝经本机的新 IPv6 转发连接，已有连接可持续至连接跟踪过期。外部路由器通告的 IPv6 网关可能让终端直接绕过旁路由。
+
 ## 升级
 
 LuCI 的“服务 → 路由策略 → 运行状态”会显示当前安装的 luci-app-routepolicy 与 SmartDNS 完整 APK 版本，并提供同一份更新脚本和显式启用命令，供管理员复制到 SSH 执行；页面不会自动执行这些命令。
@@ -101,7 +120,7 @@ LuCI 入口为“服务 → 路由策略 → SmartDNS”。它不依赖官方 `l
 - `/etc/config/smartdns` 保存 SmartDNS 服务、监听、上游、缓存、TTL、DNS 行为及两个附加片段的 `conf_files` 登记。RoutePolicy 只精确修改页面涉及的字段，保留未知 option、未知段和其他 `conf_files`。
 - `/etc/smartdns/conf.d/90-routepolicy.conf` 只保存 RoutePolicy domain-set/nftset/domain-rules、本地主机引用和 PTR 扩展；`routepolicy.main.smartdns_enabled` 只控制这一适配片段。
 - `/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf` 保存 OpenWrt init 未映射的 `serve-expired-reply-ttl`、`cache-checkpoint-time` 和受支持的可选仪表盘字段。
-- `/etc/routepolicy/user.d/local-hosts.list` 是保留的用户配置，每行为 `IP 主名称 [别名 ...]`；A/AAAA 覆盖全部名称，PTR 只扩展主名称。DHCP 租约只读展示，项目不会创建、启用、启动、修改或重载 DHCP。
+- `/etc/routepolicy/user.d/local-hosts.list` 是保留的用户配置，每行为 `IP 主名称 [别名 ...]`；A/AAAA 覆盖全部名称，PTR 只扩展主名称。DHCP 租约页面只读。只有管理员确认旁路由初始化方案后，后端才可关闭选定接入接口的 DHCPv4、RA、DHCPv6 与 NDP 服务。其他接口的 DHCP 服务、出口 DHCP client 和 dnsmasq 的 DNS 功能应保留。
 
 服务启用、RoutePolicy 启用、90 适配启用是三个独立状态。90/91 的 loaded 状态来自 `/var/etc/smartdns/smartdns.conf` 中实际生成的 `conf-file`，不是仅检查文件存在。
 

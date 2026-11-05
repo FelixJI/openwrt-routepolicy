@@ -13,13 +13,21 @@ printf '%s\n' "$*" >>"$TEST_LIFECYCLE_LOG"
 printf '%s\n' 'RoutePolicy 配置已成功应用'
 EOF
 chmod +x "$tmp/routepolicyctl"
+cat >"$tmp/init-transaction" <<'EOF'
+#!/bin/sh
+[ "$1" = recover-startup ] || exit 1
+printf '%s\n' "$1" >>"$TEST_RECOVERY_LOG"
+[ "${TEST_RECOVERY_FAIL:-0}" != 1 ]
+EOF
+chmod +x "$tmp/init-transaction"
 
 run_start() (
 	TEST_ENABLED=$1
 	export TEST_ENABLED TEST_LIFECYCLE_LOG="$tmp/lifecycle.log"
 	ROUTEPOLICY_CTL="$tmp/routepolicyctl"
 	ROUTEPOLICY_WATCH="$tmp/watch"
-	export ROUTEPOLICY_CTL ROUTEPOLICY_WATCH
+	ROUTEPOLICY_INIT_TRANSACTION="$tmp/init-transaction"
+	export ROUTEPOLICY_CTL ROUTEPOLICY_WATCH ROUTEPOLICY_INIT_TRANSACTION TEST_RECOVERY_LOG="$tmp/recovery.log"
 	# The test resolves this repository-owned fixture before sourcing it.
 	# shellcheck disable=SC1090
 	. "$INIT"
@@ -65,5 +73,13 @@ if grep -Fq open "$tmp/lifecycle.log"; then
 	printf '%s\n' 'failed apply unexpectedly registered a watcher' >&2
 	exit 1
 fi
+
+: >"$tmp/lifecycle.log"
+if TEST_RECOVERY_FAIL=1 run_start 1 >/dev/null 2>&1; then
+	printf '%s\n' 'conflicted startup recovery unexpectedly allowed normal apply/watch' >&2
+	exit 1
+fi
+[ ! -s "$tmp/lifecycle.log" ]
+grep -Fxq recover-startup "$tmp/recovery.log"
 
 printf '%s\n' 'init lifecycle tests: passed'

@@ -1,0 +1,746 @@
+#!/bin/sh
+# Initialization owns only its journaled fields; never restore whole UCI packages.
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+umask 077
+TX="$RP_STATE_DIR/init-transaction"
+WAL="$TX/current"
+TAB=$(printf '\t')
+PACKAGES='network dhcp firewall routepolicy'
+
+fail() { rp_output_error "init-${operation:-transaction}" "$*"; exit 1; }
+phase() { printf '%s\n' "$1" >"$WAL/phase.new" && mv "$WAL/phase.new" "$WAL/phase" && sync; }
+read_phase() { cat "$WAL/phase" 2>/dev/null || printf absent; }
+safe_dir() {
+	[ ! -L "$1" ] || fail '事务目录不能是符号链接'
+	[ ! -e "$1" ] || [ -d "$1" ] || fail '事务目录类型非法'
+	mkdir -p "$1" && chmod 700 "$1" || fail '无法创建受限事务目录'
+}
+lock() {
+	for parent in "$RP_ETC" "$RP_STATE_DIR"; do
+		[ ! -L "$parent" ] && { [ ! -e "$parent" ] || [ -d "$parent" ]; } || fail '事务父目录不安全'
+	done
+	mkdir -p "$RP_STATE_DIR" || fail '不能创建事务父目录'
+	safe_dir "$TX"
+	[ ! -L "$TX/lock" ] || fail '事务锁不是安全文件'
+	exec 9>"$TX/lock"
+	if [ "${operation:-}" = recover-startup ]; then
+		flock -w 180 9 || fail '启动恢复等待写锁超时'
+	else flock -n 9 || fail '另一个初始化事务正在写入'; fi
+	[ ! -L "$WAL" ] && [ ! -L "$TX/previous" ] || fail '事务记录路径不安全'
+	# Restore the previous terminal/prepared generation if power failed during promotion.
+	if [ ! -e "$WAL" ] && [ -d "$TX/previous" ]; then
+		mv "$TX/previous" "$WAL" && sync || fail '不能恢复准备事务记录'
+	fi
+}
+uci_layout() {
+	namespace_token=$(cat "$WAL/token") || return 1
+	[ "${#namespace_token}" -eq 32 ] || return 1
+	case "$namespace_token" in *[!0-9a-f]*) return 1 ;; esac
+	safe_dir "$WAL/config"; safe_dir "$WAL/delta"; safe_dir "$WAL/read-delta"
+	for namespace_package in $PACKAGES; do
+		namespace_target="$RP_ROOT/etc/config/$namespace_package"
+		[ -f "$namespace_target" ] && [ ! -L "$namespace_target" ] || return 1
+		namespace_link="$WAL/config/rp_${namespace_token}_$namespace_package"
+		if [ -e "$namespace_link" ] || [ -L "$namespace_link" ]; then
+			[ -L "$namespace_link" ] && [ "$(readlink "$namespace_link")" = "$namespace_target" ] || return 1
+		else ln -s "$namespace_target" "$namespace_link" || return 1; fi
+	done
+}
+uci_alias() {
+	namespace_package=${1%%.*}
+	case "$namespace_package" in network|dhcp|firewall|routepolicy) ;; *) return 1 ;; esac
+	namespace_token=$(cat "$WAL/token") || return 1
+	namespace_argument="rp_${namespace_token}_${namespace_package}${1#"$namespace_package"}"
+}
+# -t still searches /tmp/.uci. Token-named package aliases isolate the delta lookup,
+# while libuci commits through the symlink target after its locked fresh-file merge.
+uci_private() {
+	uci_alias "$2" || return 1
+	uci -c "$WAL/config" -t "$WAL/delta" "$1" "$namespace_argument"
+}
+uci_committed() {
+	uci_alias "$2" || return 1
+	uci -q -c "$WAL/config" -t "$WAL/read-delta" "$1" "$namespace_argument"
+}
+field_pending() {
+	pending_field=$1
+	pending_package=${pending_field%%.*}
+	pending_changes=$(uci -q changes "$pending_package") || return 2
+	printf '%s\n' "$pending_changes" | awk -F= -v wanted="$pending_field" -v package="$pending_package" '
+		NF {
+			key=$1; sub(/^[+-]/,"",key); sub(/[+-]$/,"",key)
+			if(key !~ ("^" package "\\.[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)?$")) {unknown=1;next}
+			if(key==wanted || index(wanted,key ".")==1 || index(key,wanted ".")==1) found=1
+		} END {exit !(found||unknown)}'
+}
+no_pending() {
+	for pkg in $PACKAGES; do
+		pending=$(uci -q changes "$pkg") || return 1
+		[ -z "$pending" ] || return 1
+	done
+}
+args_valid() {
+	[ "$#" -eq 11 ] || return 1
+	for argument do
+		[ -n "$argument" ] && [ "${#argument}" -le 64 ] || return 1
+		case "$argument" in *[!A-Za-z0-9_.:/-]*) return 1 ;; esac
+	done
+}
+plan_valid() {
+	# The topology helper validates values and role semantics; this is the write boundary.
+	awk -F '\t' '
+		NF != 3 || $1 != "set" || length($3)>256 || $3 ~ /[^ -~]/ {exit 1}
+		$2 !~ /^(network|dhcp|firewall|routepolicy)\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$/ {exit 1}
+		seen[$2]++ {exit 1}
+		{
+			key=$2
+			if(key ~ /^routepolicy\.main\.(lan_interface|default_interface|policy_interface)$/) next
+			if(key ~ /^network\.[A-Za-z0-9_]+\.(ipaddr|netmask)$/) next
+			if(key ~ /^network\.[A-Za-z0-9_]+\.metric$/ && $3=="200") next
+			if(key ~ /^network\.rp_init_(default|policy)(\.(device|proto|gateway|defaultroute|peerdns|metric))?$/) next
+			if(key ~ /^dhcp\.[A-Za-z0-9_]+\.(ignore|ra|dhcpv6|ndp)$/) next
+			if(key ~ /^firewall\.rp_init_(default|policy|default4|policy4|default_nat|policy_nat|default_dhcp_client|policy_dhcp_client|dns|ipv6|dhcp4|dhcp6|ra|redirects)(\.(name|network|input|output|forward|src|dest|src_ip|family|proto|target|src_port|dest_port|icmp_type))?$/) next
+			exit 1
+		}
+		END {if (NR<1 || NR>128) exit 1}
+	' "$1"
+}
+make_plan() { "$LIBEXEC/init-topology" plan "$@" 9>&-; }
+link_value() { awk -F '\t' -v wanted="$1" '$1==wanted {print $2}' "$2"; }
+link_plan_valid() {
+	awk -F '\t' 'NF!=2 || length($2)>256 || $2~/[^ -~]/ || seen[$1]++ {exit 1}
+		$1!~/^(required|dad_required|device|ifindex|mac|device_path|up|carrier|target|dad)$/ {exit 1}
+		{value[$1]=$2}
+		END {
+			if(NR<1 || NR>10 || value["required"] !~ /^[01]$/) exit 1
+			if(value["required"]==1) {
+				if(value["device"] !~ /^[A-Za-z0-9_-]+$/ || value["device"]=="lo" || length(value["device"])>32) exit 1
+				if(value["ifindex"] !~ /^[0-9]+$/ || value["ifindex"]<1 || value["ifindex"]>2147483647) exit 1
+				if(value["device_path"] !~ /^\// || value["up"] !~ /^[01]$/) exit 1
+				if(value["dad_required"] !~ /^[01]$/) exit 1
+				if(split(value["mac"],mac,":")!=6) exit 1
+				for(i=1;i<=6;i++) if(length(mac[i])!=2 || mac[i] !~ /^[0-9a-fA-F]+$/) exit 1
+				if(value["dad_required"]==1) {
+					if(split(value["target"],ip,".")!=4) exit 1
+					for(i=1;i<=4;i++) if(ip[i] !~ /^[0-9]+$/ || ip[i]>255) exit 1
+				} else if(value["target"]!="-" || value["dad"]!="not-required") exit 1
+			}
+		}' "$1"
+}
+link_live_up() {
+	link_flags=$(cat "$RP_ROOT/sys/class/net/$LINK_DEVICE/flags" 2>/dev/null) || return 1
+	rp_is_hex32 "$link_flags" || return 1
+	LINK_UP=$((link_flags & 1))
+}
+link_identity_matches() {
+	LINK_DEVICE=$(link_value device "$WAL/link-plan")
+	rp_is_device "$LINK_DEVICE" || return 1
+	[ "$(cat "$RP_ROOT/sys/class/net/$LINK_DEVICE/address" 2>/dev/null)" = "$(link_value mac "$WAL/link-plan")" ] || return 1
+	[ "$(readlink -f "$RP_ROOT/sys/class/net/$LINK_DEVICE/device")" = "$(link_value device_path "$WAL/link-plan")" ] || return 1
+	current_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
+	old_boot=$(cat "$WAL/link-boot") || return 1
+	if [ "$current_boot" = "$old_boot" ]; then
+		[ "$(cat "$RP_ROOT/sys/class/net/$LINK_DEVICE/ifindex" 2>/dev/null)" = "$(link_value ifindex "$WAL/link-plan")" ] || return 1
+	fi
+}
+link_apply() {
+	[ "$(link_value required "$WAL/link-plan")" = 1 ] || return 0
+	printf '%s\n' link-preparation >"$WAL/stage" || return 1
+	link_identity_matches && link_live_up || return 1
+	[ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ] || return 1
+	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-error" || return 1
+	[ "$(link_value dad_required "$WAL/link-plan")" = 1 ] || return 0
+	if [ "$LINK_UP" = 0 ]; then
+		printf '%s\n' link-up >"$WAL/stage" &&
+			printf '%s\n' 1 >"$WAL/link-expected-up" &&
+			printf '%s' '' >"$WAL/link-attempted" && sync || return 1
+		timeout 5 ip link set dev "$LINK_DEVICE" up >"$WAL/link-result" 2>"$WAL/link-error" || return 1
+		link_live_up && [ "$LINK_UP" = 1 ] || return 1
+	fi
+	printf '%s\n' link-dad >"$WAL/stage" && sync || return 1
+	timeout 20 "$LIBEXEC/init-topology" link-dad "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&- >"$WAL/link-result" 2>"$WAL/link-error"
+}
+link_restore() {
+	[ -f "$WAL/link-attempted" ] || return 0
+	load_args || return 1
+	# A different physical card or external owner always wins over our old admin state.
+	link_identity_matches && link_live_up || return 1
+	[ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ] && return 0
+	[ "$LINK_UP" = "$(cat "$WAL/link-expected-up")" ] || return 1
+	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-restore-error" || return 1
+	printf '%s\n' link-restore >"$WAL/stage" && sync || return 1
+	timeout 5 ip link set dev "$LINK_DEVICE" down >"$WAL/link-result" 2>"$WAL/link-restore-error" || return 1
+	link_live_up && [ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ]
+}
+read_current() {
+	# Sentinel retains trailing newlines, which shell command substitution otherwise loses.
+	raw=$(uci_committed get "$1" 2>/dev/null && printf '.') || return 1
+	FIELD_VALUE=${raw%.}
+	newline='
+'
+	case "$FIELD_VALUE" in *"$newline") FIELD_VALUE=${FIELD_VALUE%"$newline"} ;; *) return 2 ;; esac
+	case "$FIELD_VALUE" in *"$newline"*) return 2 ;; esac
+	[ "${#FIELD_VALUE}" -le 256 ] || return 2
+	if printf '%s' "$FIELD_VALUE" | LC_ALL=C grep -q '[^ -~]'; then return 2; fi
+	FIELD_TYPE=scalar
+	case "$1" in
+		*.*.*)
+			field_package=${1%%.*}; field_rest=${1#*.}; field_section=${field_rest%%.*}; field_option=${field_rest#*.}
+			exported=$(uci_committed export "$field_package") || return 2
+			FIELD_TYPE=$(printf '%s\n' "$exported" | awk -v section="$field_section" -v option="$field_option" '
+				$1=="config" {name=$3; gsub(/\047/,"",name); selected=(name==section)}
+				selected && ($1=="option" || $1=="list") {name=$2; gsub(/\047/,"",name); if(name==option){n++;type=$1}}
+				END {if(n==1) print type; else exit 1}
+			') || return 2
+			case "$FIELD_TYPE" in
+				option) FIELD_TYPE=scalar ;;
+				list)
+					# First-release network addresses may use one CIDR-valued UCI list item.
+					case "$1" in network.*.ipaddr) ;; *) return 2 ;; esac
+					case "$FIELD_VALUE" in *' '*) return 2 ;; esac
+					ip=${FIELD_VALUE%/*}; rp_is_ipv4 "$ip" || return 2
+					if [ "$ip" != "$FIELD_VALUE" ]; then rp_uint_between "${FIELD_VALUE##*/}" 0 32 || return 2; fi
+					;;
+				*) return 2 ;;
+			esac
+			;;
+	esac
+}
+snapshot() {
+	while IFS="$TAB" read -r _action key value; do
+		if read_current "$key"; then
+			printf '%s\t%s\t%s\n' "$key" "$FIELD_TYPE" "$FIELD_VALUE"
+		else
+			[ "$?" -eq 1 ] || return 1
+			printf '%s\t0\t-\n' "$key"
+		fi
+	done <"$1"
+}
+preview_json() {
+	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":120,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
+		"$operation" "$(rp_json_escape "$1")"
+	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
+	printf ',"maintenance_notice":"初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙或 RoutePolicy 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。"'
+	printf ',"link_preparation":"%s"' "$(rp_json_escape "${link_preview:-required\t0}")"
+	printf '}\n'
+}
+smartdns_coordinate() {
+	# The fixed four-phase seam reserves #18 ownership; #17 never changes DNS manager state.
+	case "$1" in prepare|apply|verify|rollback) ;; *) return 1 ;; esac
+	printf '%s\n' "$1" >>"$WAL/smartdns-stages" && sync
+}
+check_token() {
+	[ "$#" -eq 1 ] && [ "${#1}" -eq 32 ] || fail '事务 token 非法'
+	case "$1" in *[!0-9a-f]*) fail '事务 token 非法' ;; esac
+	[ -f "$WAL/token" ] && [ ! -L "$WAL" ] && [ "$(cat "$WAL/token")" = "$1" ] || fail '事务 token 不匹配'
+}
+load_args() {
+	[ -f "$WAL/parameters" ] || return 1
+	# Values are fixed-position validated words, never shell source or eval.
+	set -f
+	IFS="$TAB" read -r a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 <"$WAL/parameters"
+	args_valid "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11"
+}
+topology() { "$LIBEXEC/init-topology" "$1" "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&-; }
+verify_runtime() {
+	# Only the fixed topology verifier writes this private diagnostic; no UCI export is exposed.
+	while IFS="$TAB" read -r _action verify_key verify_expected; do
+		if ! read_current "$verify_key" || [ "$FIELD_TYPE" != scalar ] || [ "$FIELD_VALUE" != "$verify_expected" ]; then
+			printf 'prepared candidate differs: %s\n' "$verify_key" >"$WAL/verify-error"
+			return 1
+		fi
+	done <"$WAL/candidate"
+	if [ "$(link_value required "$WAL/link-plan")" = 1 ] && ! link_identity_matches; then
+		printf '%s\n' 'new egress physical identity differs from the prepared candidate' >"$WAL/verify-error"
+		return 1
+	fi
+	topology verify >"$WAL/verify-result" 2>"$WAL/verify-error"
+}
+new_dhcp_probe() {
+	dhcp_dump=$(timeout 3 ubus call network.interface dump) || return 1
+	dhcp_interfaces=$(printf '%s\n' "$dhcp_dump" | jsonfilter -e '@.interface') || return 1
+	case "$dhcp_interfaces" in \[*\]) ;; *) return 1 ;; esac
+	dhcp_status=$(printf '%s\n' "$dhcp_dump" | jsonfilter -e "@.interface[@.interface=\"$dhcp_interface\"]") || return 75
+	dhcp_proto=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.proto') || return 1
+	[ "$dhcp_proto" = dhcp ] || return 1
+	dhcp_errors=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.errors[*]' 2>/dev/null) || dhcp_errors=
+	[ -z "$dhcp_errors" ] || return 1
+	dhcp_device=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.device' 2>/dev/null) || dhcp_device=
+	dhcp_l3=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.l3_device' 2>/dev/null) || dhcp_l3=
+	[ -z "$dhcp_device" ] || [ "$dhcp_device" = "$a5" ] || return 1
+	[ -z "$dhcp_l3" ] || [ "$dhcp_l3" = "$a5" ] || return 1
+	dhcp_up=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.up') || return 1
+	case "$dhcp_up" in true) ;; false) return 75 ;; *) return 1 ;; esac
+	dhcp_address=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null) || dhcp_address=
+	dhcp_gateway=$(printf '%s\n' "$dhcp_status" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null) || dhcp_gateway=
+	[ -n "$dhcp_address" ] && [ -n "$dhcp_gateway" ] && [ -n "$dhcp_l3" ] || return 75
+	rp_is_ipv4 "$dhcp_address" && rp_is_ipv4 "$dhcp_gateway" || return 1
+	# A dev filter makes native ip omit dev, so inspect explicit devices instead.
+	dhcp_routes=$(timeout 3 ip -4 route show table main default) || return 1
+	[ -n "$dhcp_routes" ] || return 75
+	printf '%s\n' "$dhcp_routes" | awk -v device="$a5" -v gateway="$dhcp_gateway" '
+		$1=="default"{d="";g="";for(i=1;i<NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1)}if(d==device){if(g==gateway)n++;else bad=1}}
+		END{if(bad||n>1)exit 1;if(n==0)exit 75}'
+}
+wait_new_dhcp() {
+	case "$a4:$a6" in default:dhcp|policy:dhcp) ;; *) return 0 ;; esac
+	dhcp_interface="rp_init_$a4"
+	[ "$(uci_committed get "network.$dhcp_interface.proto")" = dhcp ] &&
+		[ "$(uci_committed get "network.$dhcp_interface.device")" = "$a5" ] || return 1
+	printf '%s\n' dhcp-readiness >"$WAL/stage" && sync || return 1
+	while :; do
+		pending_recovery_due && break
+		dhcp_wait_now=$(monotonic_now) || break
+		dhcp_started=$(cat "$WAL/uptime-start-cs") || break
+		# Spend the existing window, leaving 20 seconds for management confirmation.
+		[ "$dhcp_wait_now" -lt "$((dhcp_started + 10000))" ] || break
+		link_identity_matches || break
+		if new_dhcp_probe; then return 0; else dhcp_result=$?; fi
+		if [ "$dhcp_result" != 75 ]; then
+			printf '%s\n' 'new DHCP egress has invalid protocol/device or explicit netifd error' >"$WAL/verify-error"
+			return 1
+		fi
+		sleep 1
+	done
+	printf '%s\n' 'new DHCP egress readiness timed out within the original confirmation window' >"$WAL/verify-error"
+	return 1
+}
+policy_runtime_present() {
+	policy_state_interface=$(rp_state_get policy_interface) || return 1
+	rp_is_name "$policy_state_interface" 32 && timeout 3 nft list table inet routepolicy >/dev/null 2>&1
+}
+policy_sync() {
+	policy_mode=${1:-apply}
+	if ! policy_required=$(cat "$WAL/policy-active" 2>/dev/null); then
+		policy_required=$(uci_committed get routepolicy.main.enabled) || return 1
+		[ "$policy_required" != 1 ] || policy_runtime_present || return 1
+	fi
+	case "$policy_required" in 0) return 0 ;; 1) ;; *) return 1 ;; esac
+	[ "$(uci_committed get routepolicy.main.enabled)" = 1 ] || return 1
+	for policy_package in routepolicy network smartdns; do
+		policy_pending=$(uci -q changes "$policy_package") || return 1
+		if [ -n "$policy_pending" ]; then
+			printf 'policy-runtime:%s\n' "$policy_package" >>"$WAL/deferred-services"
+			return 1
+		fi
+	done
+	policy_timeout=30
+	if [ "$policy_mode" = apply ]; then
+		policy_runtime_present && ! pending_recovery_due || return 1
+		policy_now=$(monotonic_now) || return 1
+		policy_started=$(cat "$WAL/uptime-start-cs") || return 1
+		policy_remaining=$(( (policy_started + 12000 - policy_now) / 100 ))
+		case "$a4:$a6" in default:dhcp|policy:dhcp) policy_remaining=$((policy_remaining - 20)) ;; esac
+		[ "$policy_remaining" -gt 0 ] || return 1
+		[ "$policy_remaining" -ge "$policy_timeout" ] || policy_timeout=$policy_remaining
+	fi
+	policy_wait_started=$(monotonic_now) || return 1
+	while [ -d "$RP_RUN_DIR/apply.lock" ]; do
+		policy_wait_now=$(monotonic_now) || return 1
+		if [ "$policy_wait_now" -ge "$((policy_wait_started + policy_timeout * 100))" ]; then
+			printf '%s\n' 'existing RoutePolicy apply is busy; its lock was preserved' >"$WAL/policy-error"; return 1
+		fi
+		sleep 1
+	done
+	policy_wait_now=$(monotonic_now) || return 1
+	policy_timeout=$((policy_timeout - (policy_wait_now - policy_wait_started + 99) / 100))
+	[ "$policy_timeout" -gt 0 ] || return 1
+	printf '%s\n' policy-runtime >"$WAL/stage" && sync || return 1
+	# The finite supervisor owns FD9; the policy writer and its service children never inherit it.
+	ROUTEPOLICY_OUTPUT=text timeout -k 2 "$policy_timeout" sh -c 'exec 9>&-; exec "$1"' routepolicy-policy-sync "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || return 1
+	if ! policy_verify_runtime; then
+		printf '%s\n' 'RoutePolicy policy table does not match the selected interface/gateway' >"$WAL/policy-error"
+		return 1
+	fi
+}
+policy_verify_runtime() {
+	policy_required=$(cat "$WAL/policy-active" 2>/dev/null) || policy_required=$(uci_committed get routepolicy.main.enabled) || return 1
+	case "$policy_required" in 0) return 0 ;; 1) ;; *) return 1 ;; esac
+	policy_runtime_present || return 1
+	policy_expected=$(uci_committed get routepolicy.main.policy_interface) || return 1
+	[ "$(rp_state_get policy_interface)" = "$policy_expected" ] || return 1
+	rp_is_name "$policy_expected" 32 || return 1
+	policy_status=$(timeout 3 ubus call "network.interface.$policy_expected" status) || return 1
+	policy_device=$(printf '%s\n' "$policy_status" | jsonfilter -e '@.l3_device') || return 1
+	policy_gateway=$(printf '%s\n' "$policy_status" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop') || return 1
+	rp_is_device "$policy_device" && rp_is_ipv4 "$policy_gateway" && [ "$(rp_state_get policy_device)" = "$policy_device" ] || return 1
+	policy_table=$(rp_state_get route_table) && rp_uint_between "$policy_table" 1 252 || return 1
+	policy_config_table=$(uci_committed get routepolicy.main.route_table) || policy_config_table=200
+	[ "$policy_table" = "$policy_config_table" ] || return 1
+	policy_routes=$(timeout 3 ip -4 route show table "$policy_table") || return 1
+	printf '%s\n' "$policy_routes" | awk -v device="$policy_device" -v gateway="$policy_gateway" '
+		$1=="default" || ($2=="default" && $1~/^(blackhole|unreachable|prohibit|throw)$/) {
+			d="";g="";m=0;for(i=1;i<NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1);if($i=="metric")m=$(i+1)}
+			if($1=="default"&&m==10){n++;if(d!=device||g!=gateway)bad=1}else if(m<=10)bad=1}
+		END{exit n!=1||bad}'
+}
+services_reload() {
+	reload_mode=${1:-apply}
+	reload_errors=0
+	printf '%s' '' >"$WAL/deferred-services" || return 1
+	for service in network firewall dnsmasq odhcpd; do
+		if [ "$service" = odhcpd ] && [ ! -e "$RP_ROOT/etc/init.d/$service" ] && [ ! -L "$RP_ROOT/etc/init.d/$service" ]; then continue; fi
+		case "$service" in network) service_packages=network ;; firewall) service_packages='network firewall' ;; *) service_packages='network dhcp' ;; esac
+		service_deferred=0
+		for service_package in $service_packages; do
+			if ! service_pending=$(uci -q changes "$service_package") || [ -n "$service_pending" ]; then
+				printf '%s:%s\n' "$service" "$service_package" >>"$WAL/deferred-services"
+				printf 'pending-service:%s:%s\n' "$service" "$service_package" >>"$WAL/conflicts"
+				service_deferred=1
+			fi
+		done
+		if [ "$service_deferred" = 1 ]; then
+			[ "$reload_mode" = restore ] || return 1
+			reload_errors=1; continue
+		fi
+		if [ ! -x "$RP_ROOT/etc/init.d/$service" ]; then
+			[ "$reload_mode" = restore ] || return 1
+			printf 'service-unavailable:%s\n' "$service" >>"$WAL/conflicts"; reload_errors=1; continue
+		fi
+		printf 'reload:%s\n' "$service" >"$WAL/stage" && sync || return 1
+		if ! timeout 15 "$RP_ROOT/etc/init.d/$service" reload 9>&- >/dev/null 2>&1; then
+			[ "$reload_mode" = restore ] || return 1
+			printf 'reload:%s\n' "$service" >>"$WAL/conflicts"; reload_errors=1
+		fi
+	done
+	[ "$reload_errors" = 0 ]
+}
+guard_start() {
+	[ -x "$RP_ROOT/etc/init.d/routepolicy-initguard" ] || return 1
+	"$RP_ROOT/etc/init.d/routepolicy-initguard" start 9>&- >/dev/null 2>&1 || return 1
+	guard_attempt=0
+	while [ "$guard_attempt" -lt 10 ]; do
+		if service_state=$(ubus call service list '{"name":"routepolicy-initguard"}' 9>&- 2>/dev/null); then
+			running=$(printf '%s\n' "$service_state" | jsonfilter -e '@["routepolicy-initguard"].instances.guard.running') || running=
+		else running=; fi
+		[ "$running" != true ] || return 0
+		guard_attempt=$((guard_attempt + 1)); sleep 0.2
+	done
+	return 1
+}
+guard_stop_if_inactive() (
+	# Recheck under the writer lock so an old guard cannot delete a newly started instance.
+	exec 9>"$TX/lock"
+	flock -n 9 || exit 1
+	case "$(read_phase)" in
+		applying|rolling_back|pending) exit 1 ;;
+		prepared) pending_recovery_due || exit 1 ;;
+	esac
+	ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' 9>&- >/dev/null 2>&1
+)
+rollback_fields() {
+	phase rolling_back || return 1
+	uci_layout || { phase conflict; return 1; }
+	printf '%s' '' >"$WAL/conflicts" || return 1
+	# A failed commit may leave unapplied private changes; never commit those during restore.
+	[ -d "$WAL/delta" ] && [ ! -L "$WAL/delta" ] || { phase conflict; return 1; }
+	find "$WAL/delta" -type f -exec rm -f '{}' ';' || { phase conflict; return 1; }
+	conflicts=0
+	field_attempted=0
+	smartdns_coordinate rollback || { phase conflict; return 1; }
+	count=$(cat "$WAL/count" 2>/dev/null) || { phase conflict; return 1; }
+	rp_uint_between "$count" 1 128 || { phase conflict; return 1; }
+	while [ "$count" -gt 0 ]; do
+		entry="$WAL/fields/$count"
+		if [ ! -f "$entry/attempted" ]; then count=$((count - 1)); continue; fi
+		field_attempted=1
+		key=$(cat "$entry/key") || return 1
+		expected=$(cat "$entry/expected") || return 1
+		existed=$(cat "$entry/existed") || return 1
+		old=$(cat "$entry/old") || return 1
+		oldtype=$(cat "$entry/type") || return 1
+		if field_pending "$key"; then
+			printf 'pending:%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+		elif [ "$?" -ne 1 ]; then
+			printf 'pending-package:%s\n' "${key%%.*}" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+		fi
+		present=0; current=; currenttype=
+		if read_current "$key"; then
+			present=1; current=$FIELD_VALUE; currenttype=$FIELD_TYPE
+		elif [ "$?" -ne 1 ]; then
+			printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+		fi
+		if { [ "$existed" = 0 ] && [ "$present" = 0 ]; } || { [ "$existed" = 1 ] && [ "$present" = 1 ] && [ "$current" = "$old" ] && [ "$currenttype" = "$oldtype" ]; }; then
+			:
+		elif [ "$present" = 1 ] && [ "$current" = "$expected" ] && [ "$currenttype" = scalar ]; then
+			case "$key" in
+				*.*.*) ;;
+				*)
+					# Unknown children make a newly created section user-owned; preserve it.
+					if [ "$(uci_committed show "$key" | wc -l)" -ne 1 ]; then
+						printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1; count=$((count - 1)); continue
+					fi
+					;;
+			esac
+			if [ "$existed" = 1 ]; then
+				restore_ok=1
+				if [ "$oldtype" = list ]; then
+					uci_private delete "$key" && uci_private add_list "$key=$old" || restore_ok=0
+				else
+					uci_private set "$key=$old" || restore_ok=0
+				fi
+			else
+				restore_ok=1; uci_private delete "$key" || restore_ok=0
+			fi
+			if [ "$restore_ok" = 0 ]; then
+				printf 'write:%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
+				find "$WAL/delta" -type f -exec rm -f '{}' ';' || return 1
+				count=$((count - 1)); continue
+			fi
+			# Commit a single owned field, never import or overwrite a package.
+			if ! uci_private commit "${key%%.*}"; then
+				printf 'commit:%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
+				find "$WAL/delta" -type f -exec rm -f '{}' ';' || return 1
+			fi
+		else
+			printf '%s\n' "$key" >>"$WAL/conflicts"; conflicts=1
+		fi
+		count=$((count - 1))
+	done
+	if [ "$field_attempted" = 1 ]; then
+		services_reload restore || conflicts=1
+		if ! policy_sync restore; then printf '%s\n' policy-runtime >>"$WAL/conflicts"; conflicts=1; fi
+	fi
+	if ! link_restore; then printf '%s\n' link-ownership >>"$WAL/conflicts"; conflicts=1; fi
+	if [ "$conflicts" -eq 0 ]; then phase rolled_back; else phase conflict; return 1; fi
+}
+recover_locked() {
+	case "$(read_phase)" in
+		applying|rolling_back|pending) rollback_fields ;;
+		prepared|confirmed|rolled_back|absent) return 0 ;;
+		conflict) rollback_fields ;;
+		*) phase conflict; return 1 ;;
+	esac
+}
+transaction_same_boot() {
+	transaction_boot=$(cat "$WAL/boot-id" 2>/dev/null) || return 1
+	running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
+	[ -n "$transaction_boot" ] && [ -n "$running_boot" ] && [ "$transaction_boot" = "$running_boot" ]
+}
+monotonic_now() {
+	# /proc/uptime supplies boot-scoped centiseconds, unaffected by wall-clock correction.
+	LC_ALL=C awk '
+		NR!=1 || NF!=2 || $1 !~ /^[0-9]+\.[0-9][0-9]$/ || $1>=10000000000 {exit 1}
+		{printf "%.0f\n", $1*100}
+		END {if(NR!=1) exit 1}
+	' "$RP_ROOT/proc/uptime"
+}
+pending_recovery_due() {
+	transaction_same_boot || return 0
+	# Legacy or invalid timing evidence is due immediately; never fall back to epoch time.
+	pending_started=$(cat "$WAL/uptime-start-cs" 2>/dev/null) || return 0
+	case "$pending_started" in 0[0-9]*) return 0 ;; esac
+	rp_uint_between "$pending_started" 0 999999999999 || return 0
+	pending_now=$(monotonic_now) || return 0
+	[ "$pending_now" -ge "$pending_started" ] || return 0
+	[ "$pending_now" -ge "$((pending_started + 12000))" ]
+}
+recover_auto_locked() {
+	# The guard's earlier observation is advisory; only this locked state permits rollback.
+	case "$(read_phase)" in
+		applying|rolling_back) rollback_fields ;;
+		pending) if pending_recovery_due; then rollback_fields; fi ;;
+		prepared|confirmed|rolled_back|conflict|absent) return 0 ;;
+		*) phase conflict; return 1 ;;
+	esac
+}
+status_json() {
+	p=$(read_phase)
+	printf '{"ok":true,"operation":"init-status","phase":"%s"' "$(rp_json_escape "$p")"
+	if [ -f "$WAL/deadline" ]; then printf ',"deadline":"%s"' "$(rp_json_escape "$(cat "$WAL/deadline")")"; fi
+	if [ -f "$WAL/stage" ]; then printf ',"stage":"%s"' "$(rp_json_escape "$(cat "$WAL/stage")")"; fi
+	if [ -f "$WAL/failed-stage" ]; then printf ',"failed_stage":"%s"' "$(rp_json_escape "$(cat "$WAL/failed-stage")")"; fi
+	if [ -f "$WAL/conflicts" ]; then printf ',"conflicts":"%s"' "$(rp_json_escape "$(cat "$WAL/conflicts")")"; fi
+	if [ -s "$WAL/deferred-services" ]; then printf ',"deferred_services":"%s"' "$(rp_json_escape "$(cat "$WAL/deferred-services")")"; fi
+	if [ -s "$WAL/verify-error" ]; then printf ',"verification_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/verify-error")")"; fi
+	if [ -s "$WAL/link-error" ]; then printf ',"link_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-error")")"; fi
+	if [ -s "$WAL/link-restore-error" ]; then printf ',"link_restore_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-restore-error")")"; fi
+	if [ -s "$WAL/policy-error" ]; then printf ',"policy_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/policy-error")")"; fi
+	printf '}\n'
+}
+
+operation=${1:-}; [ "$#" -eq 0 ] || shift
+case "$operation" in
+	discover) [ "$#" -eq 0 ] || fail 'discover 不接受参数'; exec "$LIBEXEC/init-topology" discover ;;
+	preview)
+		args_valid "$@" || fail '初始化参数非法'
+		no_pending || fail '存在外部 UCI pending changes'
+		candidate=$(make_plan "$@") || fail '拓扑预检失败'
+		# Read-only preview validates the same plan without creating any files.
+		printf '%s\n' "$candidate" | plan_valid /dev/stdin || fail '候选格式非法'
+		link_preview=$("$LIBEXEC/init-topology" link-plan "$@") || fail '新出口链路预检失败'
+		printf '%s\n' "$link_preview" | link_plan_valid /dev/stdin || fail '新出口链路候选非法'
+		preview_json "$candidate"
+		;;
+	prepare)
+		args_valid "$@" || fail '初始化参数非法'
+		lock
+		case "$(read_phase)" in absent|prepared|confirmed|rolled_back) ;; *) fail '存在未完成事务；请先恢复' ;; esac
+		no_pending || fail '存在外部 UCI pending changes'
+		candidate=$(make_plan "$@") || fail '拓扑预检失败'
+		link_preview=$("$LIBEXEC/init-topology" link-plan "$@" 9>&-) || fail '新出口链路预检失败'
+		# Build a complete replacement before discarding the previous reviewable candidate.
+		original_wal=$WAL
+		WAL="$TX/preparing"
+		[ ! -L "$WAL" ] || fail '事务准备目录不安全'
+		rm -rf "$WAL" || fail '不能清理准备事务目录'
+		safe_dir "$WAL"; safe_dir "$WAL/delta"; safe_dir "$WAL/fields"
+		printf '%s\n' "$candidate" >"$WAL/candidate" || fail '不能保存候选'
+		printf '%s\n' "$link_preview" >"$WAL/link-plan" || fail '不能保存链路候选'
+		link_plan_valid "$WAL/link-plan" || fail '新出口链路候选非法'
+		plan_valid "$WAL/candidate" || fail '候选字段超出初始化白名单'
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >"$WAL/parameters" || fail '不能保存固定参数'
+		token=$(sed 's/-//g' /proc/sys/kernel/random/uuid) || fail '无法读取内核随机 token'
+		[ "${#token}" -eq 32 ] || fail '无法生成事务 token'
+		case "$token" in *[!0-9a-f]*) fail '内核随机 token 格式非法' ;; esac
+		printf '%s\n' "$token" >"$WAL/token" || fail '不能保存事务token'
+		uci_layout || fail '不能建立隔离 UCI 包命名空间'
+		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
+		smartdns_coordinate prepare || fail 'SmartDNS 协调准备阶段失败'
+		phase prepared || fail '持久化准备状态失败'
+		[ ! -L "$TX/previous" ] || fail '事务旧代目录不安全'
+		rm -rf "$TX/previous" || fail '不能清理旧准备代'
+		if [ -e "$original_wal" ]; then mv "$original_wal" "$TX/previous" || fail '不能保留旧候选'; fi
+		mv "$WAL" "$original_wal" && sync || fail '不能提升准备事务'
+		WAL=$original_wal
+		rm -rf "$TX/previous" || fail '新候选已保存，但不能清理旧准备代'
+		preview_json "$candidate" "$token"
+		;;
+	apply)
+		lock; check_token "$@"
+		case "$(read_phase)" in pending|confirmed) status_json; exit 0 ;; prepared) ;; *) fail '事务阶段不能应用' ;; esac
+		load_args || fail '事务参数损坏'
+		uci_layout || fail '隔离 UCI 包命名空间不可用'
+		no_pending || fail '存在外部 UCI pending changes'
+		policy_active=0
+		policy_enabled=$(uci_committed get routepolicy.main.enabled) || fail '不能读取 RoutePolicy enabled 状态'
+		case "$policy_enabled" in
+			0) ;;
+			1) policy_runtime_present || fail '已启用 RoutePolicy 的运行态缺失；请先恢复服务后再初始化'; policy_active=1 ;;
+			*) fail 'RoutePolicy enabled 配置非法' ;;
+		esac
+		printf '%s\n' "$policy_active" >"$WAL/policy-active" || fail '不能记录原策略运行状态'
+		topology plan >"$WAL/recheck" && cmp -s "$WAL/candidate" "$WAL/recheck" || fail '候选已陈旧；请重新准备'
+		snapshot "$WAL/candidate" >"$WAL/baseline-now" && cmp -s "$WAL/baseline" "$WAL/baseline-now" || fail '配置基线已变化；拒绝陈旧提交'
+		topology link-plan >"$WAL/link-now" && link_plan_valid "$WAL/link-now" || fail '新出口链路候选不能重验'
+		for identity_field in required dad_required device ifindex mac device_path up target; do
+			[ "$(link_value "$identity_field" "$WAL/link-plan")" = "$(link_value "$identity_field" "$WAL/link-now")" ] || fail '新出口链路身份或管理状态已变化；请重新准备'
+		done
+		if [ "$(link_value required "$WAL/link-plan")" = 1 ]; then
+			cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/link-boot" || fail '无法记录链路启动身份'
+		fi
+		# A failed pre-apply guard readiness check leaves a prepared, safely retryable candidate.
+		rm -rf "$WAL/fields" || fail '不能清理旧字段WAL'
+		safe_dir "$WAL/fields"
+		count=0
+		while IFS="$TAB" read -r _action key value; do
+			count=$((count + 1)); entry="$WAL/fields/$count"; mkdir "$entry" || fail '无法准备 WAL'
+			printf '%s\n' "$key" >"$entry/key" && printf '%s' "$value" >"$entry/expected" || fail '不能保存字段WAL'
+			baseline_type=$(awk -F '\t' -v wanted="$key" '$1==wanted {n++;type=$2} END{if(n!=1)exit 1;print type}' "$WAL/baseline") || fail '准备基线字段损坏'
+			baseline_value=$(awk -F '\t' -v wanted="$key" '$1==wanted {print $3}' "$WAL/baseline") || fail '准备基线值损坏'
+			case "$baseline_type" in
+				0) printf 0 >"$entry/existed" && printf '%s' '' >"$entry/old" && printf scalar >"$entry/type" || fail '不能保存缺失字段基线' ;;
+				scalar|list) printf 1 >"$entry/existed" && printf '%s' "$baseline_value" >"$entry/old" && printf '%s' "$baseline_type" >"$entry/type" || fail '不能保存字段旧值和类型' ;;
+				*) fail '准备基线类型损坏' ;;
+			esac
+		done <"$WAL/candidate"
+		wall_started=$(date +%s) && rp_uint_between "$wall_started" 0 9999999999 || fail '不能读取确认期限的墙钟时间'
+		uptime_started=$(monotonic_now) || fail '不能读取启动单调时钟'
+		# Keep the public epoch deadline; enforce the 120-second window using uptime only.
+		printf '%s\n' "$count" >"$WAL/count" && printf '%s\n' "$((wall_started + 120))" >"$WAL/deadline" &&
+			printf '%s\n' "$uptime_started" >"$WAL/uptime-start-cs" || fail '不能保存WAL计数和确认期限'
+		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/boot-id" || fail '无法记录事务启动身份'
+		[ -s "$WAL/boot-id" ] || fail '事务启动身份缺失'
+		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
+		phase applying || fail '持久化 WAL 失败'
+		failed_stage=
+		link_apply || failed_stage=$(cat "$WAL/stage" 2>/dev/null || printf link-preparation)
+		[ -n "$failed_stage" ] || { smartdns_coordinate apply || failed_stage='smartdns-apply'; }
+		index=0
+		while IFS="$TAB" read -r _action key value; do
+			[ -z "$failed_stage" ] || break
+			index=$((index + 1)); entry="$WAL/fields/$index"
+			present=0; current=; currenttype=scalar
+			if read_current "$key"; then present=1; current=$FIELD_VALUE; currenttype=$FIELD_TYPE
+			elif [ "$?" -ne 1 ]; then failed_stage='concurrent-write'; break; fi
+			old=$(cat "$entry/old")
+			if [ "$present" != "$(cat "$entry/existed")" ] || [ "$current" != "$old" ] || [ "$currenttype" != "$(cat "$entry/type")" ]; then failed_stage='concurrent-write'; break; fi
+			if ! { printf 'commit:%s\n' "$key" >"$WAL/stage" && sync && printf '%s' '' >"$entry/attempted" && sync; }; then
+				failed_stage='wal-persist'; break
+			fi
+			no_pending && uci_private set "$key=$value" && uci_private commit "${key%%.*}" || { failed_stage=commit; break; }
+		done <"$WAL/candidate"
+		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage" && timeout 15 fw4 check 9>&- >/dev/null 2>&1 || failed_stage='firewall-check'; }
+		[ -n "$failed_stage" ] || { services_reload || failed_stage="reload:$service"; }
+		[ -n "$failed_stage" ] || { wait_new_dhcp || failed_stage='dhcp-readiness'; }
+		[ -n "$failed_stage" ] || { printf '%s\n' runtime-verify >"$WAL/stage" && verify_runtime || failed_stage='runtime-verify'; }
+		[ -n "$failed_stage" ] || { policy_sync || failed_stage='policy-runtime'; }
+		[ -n "$failed_stage" ] || { smartdns_coordinate verify || failed_stage='smartdns-verify'; }
+		[ -n "$failed_stage" ] || { ! pending_recovery_due || failed_stage='confirmation-timeout'; }
+		case "$a4:$a6" in default:dhcp|policy:dhcp)
+			if [ -z "$failed_stage" ]; then
+				dhcp_finished=$(monotonic_now) || failed_stage='confirmation-window'
+				dhcp_started=$(cat "$WAL/uptime-start-cs") || failed_stage='confirmation-window'
+				[ "$dhcp_finished" -le "$((dhcp_started + 10000))" ] || failed_stage='confirmation-window'
+			fi ;;
+		esac
+		if [ -n "$failed_stage" ]; then
+			printf '%s\n' "$failed_stage" >"$WAL/failed-stage"
+			rollback_fields || fail "阶段 $failed_stage 失败；恢复有冲突，需人工处理"
+			fail "阶段 $failed_stage 失败；本事务字段已恢复"
+		fi
+		phase pending || fail '不能记录待连通性确认状态'
+		status_json
+		;;
+	confirm)
+		lock; check_token "$@"
+		[ "$(read_phase)" != confirmed ] || { status_json; exit 0; }
+		[ "$(read_phase)" = pending ] || fail '事务不在待确认阶段'
+		if ! transaction_same_boot; then
+			rollback_fields || fail '不能确认上次启动的事务；恢复有冲突，需人工处理'
+			fail '不能确认上次启动的事务；本事务字段已恢复'
+		fi
+		load_args || fail '事务参数损坏'
+		if pending_recovery_due; then
+			rollback_fields || fail '连通性确认已超时；恢复有冲突，需人工处理'
+			fail '连通性确认已超时；本事务字段已恢复'
+		fi
+		set -f; set -- ${SSH_CONNECTION:-}
+		[ "$#" -eq 4 ] || fail '确认需要来自新管理入口的可信 SSH 会话'
+		management=$(topology management-address) || fail '无法确认当前管理地址'
+		[ "$3" = "$management" ] || fail 'SSH 会话未连接到预览的新管理入口'
+		no_pending && verify_runtime || fail '服务或规则运行证据不满足确认条件'
+		policy_verify_runtime || fail 'RoutePolicy 实际出站策略表与选定角色不一致'
+		phase confirmed || fail '不能持久化确认状态'
+		status_json
+		;;
+	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
+	guard-needed)
+		case "$(read_phase)" in prepared|applying|pending|rolling_back) exit 0 ;; *) exit 1 ;; esac
+		;;
+	recover|recover-startup|recover-auto)
+		[ "$#" -eq 0 ] || fail 'recover 不接受参数'
+		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ]; then status_json; exit 0; fi
+		lock
+		if [ "$operation" = recover-startup ] && [ "$(read_phase)" = conflict ]; then fail '启动恢复存在真实冲突；请先处理并显式recover'; fi
+		if [ "$operation" = recover-auto ]; then
+			recover_auto_locked || fail '自动恢复有冲突；已保留未知配置与 WAL'
+		else recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; fi
+		status_json
+		;;
+	guard)
+		[ "$#" -eq 0 ] || fail 'guard 不接受参数'
+		while :; do
+			case "$(read_phase)" in
+				applying|rolling_back) "$0" recover-auto >/dev/null 2>&1 || true ;;
+				pending) if pending_recovery_due; then "$0" recover-auto >/dev/null 2>&1 || true; fi ;;
+				prepared) if pending_recovery_due; then guard_stop_if_inactive && exit 0; fi ;;
+				*) guard_stop_if_inactive && exit 0 ;;
+			esac
+			sleep 2
+		done
+		;;
+	*) fail '未知初始化操作' ;;
+esac

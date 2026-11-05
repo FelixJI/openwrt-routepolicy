@@ -11,8 +11,13 @@ USE_PROCD=1
 ROUTEPOLICY_CTL=${ROUTEPOLICY_CTL:-/usr/sbin/routepolicyctl}
 ROUTEPOLICY_APPLY=${ROUTEPOLICY_APPLY:-/usr/libexec/routepolicy/apply}
 ROUTEPOLICY_WATCH=${ROUTEPOLICY_WATCH:-/usr/libexec/routepolicy/watch}
+ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routepolicy/init-transaction}
 
 start_service() {
+	# Startup is the reboot boundary; restore unfinished mutations before normal policy apply.
+	if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
+		"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || return 1
+	fi
 	config_load routepolicy
 	enabled=0
 	config_get_bool enabled main enabled 0

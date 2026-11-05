@@ -1,6 +1,6 @@
 # SmartDNS 管理功能实施方案
 
-> 状态：需求已确认，等待实施
+> 历史设计。本文中的 DHCP 限制适用于 SmartDNS 管理页面。旁路由初始化的授权范围和恢复要求见 [Task #17](https://github.com/FelixJI/openwrt-routepolicy/issues/17)。
 >
 > 日期：2026-08-25
 >

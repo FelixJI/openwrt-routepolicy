@@ -13,7 +13,7 @@ define Package/routepolicy
   CATEGORY:=Network
   TITLE:=Policy routing with nftables and SmartDNS
   URL:=https://github.com/FelixJI/openwrt-routepolicy
-  DEPENDS:=+nftables +ip-full +curl +ca-bundle +jsonfilter +ubus +uci +smartdns
+  DEPENDS:=+nftables +ip-full +curl +ca-bundle +jsonfilter +ubus +uci +smartdns +flock +coreutils-timeout +iputils-arping
 endef
 
 define Package/routepolicy/description
@@ -41,6 +41,7 @@ define Package/routepolicy/install
 	$(INSTALL_DIR) $(1)/usr/libexec/routepolicy/converters
 	$(INSTALL_CONF) ./files/etc/config/routepolicy $(1)/etc/config/routepolicy
 	$(INSTALL_BIN) ./files/etc/init.d/routepolicy $(1)/etc/init.d/routepolicy
+	$(INSTALL_BIN) ./files/etc/init.d/routepolicy-initguard $(1)/etc/init.d/routepolicy-initguard
 	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/95-routepolicy $(1)/etc/hotplug.d/iface/95-routepolicy
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/routepolicy $(1)/lib/upgrade/keep.d/routepolicy
 	$(INSTALL_BIN) ./files/usr/sbin/routepolicyctl $(1)/usr/sbin/routepolicyctl
@@ -49,6 +50,8 @@ define Package/routepolicy/install
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/converter-lib $(1)/usr/libexec/routepolicy/converter-lib
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/diagnose $(1)/usr/libexec/routepolicy/diagnose
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/import-legacy $(1)/usr/libexec/routepolicy/import-legacy
+	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-transaction $(1)/usr/libexec/routepolicy/init-transaction
+	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-topology $(1)/usr/libexec/routepolicy/init-topology
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/observe $(1)/usr/libexec/routepolicy/observe
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/render $(1)/usr/libexec/routepolicy/render
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/rollback $(1)/usr/libexec/routepolicy/rollback
