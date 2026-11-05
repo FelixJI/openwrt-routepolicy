@@ -261,6 +261,23 @@ grep -Fq '"devices":{"eth3"' "$tmp/discover"
 grep -Fq 'existing conntrack sessions are not forcibly cut off' "$tmp/discover"
 "$tool" plan lan wan policy >"$tmp/plan"
 cmp "$tmp/config" "$tmp/before"
+awk '/chain forward_lan \{/{print;print "meta nfproto 2 counter packets 0 bytes 0 drop comment \"!fw4: existing IPv4 deny-all\"";next}{print}' "$tmp/nft" >"$tmp/early-ipv4-drop.nft"
+reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" plan lan wan policy
+grep -Fq 'IPv4 forwarding' "$tmp/error"
+for verdict in \
+	'meta nfproto ipv4 counter drop' \
+	'meta nfproto 2 drop' \
+	'meta nfproto 2 counter packets 9 bytes 1500 reject with icmp type admin-prohibited' \
+	'meta nfproto 2 counter jump handle_reject' \
+	'meta nfproto 2 counter jump drop_to_wan' \
+	'meta nfproto 2 counter jump reject_to_policy' \
+	'meta nfproto 2 counter name "deny_stats" drop' \
+	'ip saddr 0.0.0.0/0 counter drop' \
+	'ip daddr 0.0.0.0/0 counter reject'; do
+	awk -v verdict="$verdict" '/chain forward_lan \{/{print;print verdict;next}{print}' "$tmp/nft" >"$tmp/early-ipv4-verdict.nft"
+	reject env TEST_NFT_FILE="$tmp/early-ipv4-verdict.nft" "$tool" plan lan wan policy
+	grep -Fq 'IPv4 forwarding' "$tmp/error"
+done
 grep -Fq 'set	dhcp.lan.ignore	1' "$tmp/plan"
 grep -Fq 'set	dhcp.lan.ra	disabled' "$tmp/plan"
 grep -Fq 'set	firewall.rp_init_default4.src_ip	192.168.1.0/24' "$tmp/plan"
@@ -444,6 +461,24 @@ apply_mock_plan "$tmp/plan"
 "$tool" verify lan wan policy >"$tmp/verify"
 grep -Fq '"packet_evidence":"EVIDENCE_MISSING"' "$tmp/verify"
 grep -Fq 'preserve-existing-conntrack-and-management' "$tmp/verify"
+reject env TEST_NFT_FILE="$tmp/early-ipv4-drop.nft" "$tool" verify lan wan policy
+grep -Fq 'IPv4 forwarding' "$tmp/error"
+for verdict in \
+	'meta nfproto ipv4 counter drop' \
+	'meta nfproto 2 counter reject with icmp type port-unreachable' \
+	'meta nfproto 2 counter jump drop_to_wan' \
+	'meta nfproto 2 counter jump reject_to_policy'; do
+	awk -v verdict="$verdict" '/chain forward_lan \{/{print;print verdict;next}{print}' "$tmp/nft" >"$tmp/early-ipv4-verdict.nft"
+	reject env TEST_NFT_FILE="$tmp/early-ipv4-verdict.nft" "$tool" verify lan wan policy
+	grep -Fq 'IPv4 forwarding' "$tmp/error"
+done
+awk '{print} /comment "!fw4: routepolicy-init-default4"/{print "meta nfproto 2 counter drop"}' "$tmp/nft" >"$tmp/between-ipv4-allows.nft"
+reject env TEST_NFT_FILE="$tmp/between-ipv4-allows.nft" "$tool" verify lan wan policy
+grep -Fq 'IPv4 forwarding' "$tmp/error"
+awk '{print} /comment "!fw4: routepolicy-init-policy4"/{print "meta nfproto 2 counter drop"}' "$tmp/nft" >"$tmp/after-ipv4-allows.nft"
+TEST_NFT_FILE="$tmp/after-ipv4-allows.nft" "$tool" verify lan wan policy >"$tmp/verify-after-ipv4-allows"
+awk '/chain forward_lan \{/{print;print "ip saddr 198.51.100.0/24 counter drop";next}{print}' "$tmp/nft" >"$tmp/conditional-ipv4-drop.nft"
+TEST_NFT_FILE="$tmp/conditional-ipv4-drop.nft" "$tool" verify lan wan policy >"$tmp/verify-conditional-ipv4"
 for poisoned in early-access-accept early-root-accept early-reject-accept; do
 	reject env TEST_NFT_FILE="$tmp/$poisoned.nft" "$tool" verify lan wan policy
 	grep -Fq 'IPv6 control flow' "$tmp/error"

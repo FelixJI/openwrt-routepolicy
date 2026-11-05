@@ -513,6 +513,28 @@ forward_include_guard() {
 	done
 }
 
+ipv4_forward_guard() {
+	local mode=$1 snapshot=$2
+	printf '%s\n' "$snapshot" | awk -v mode="$mode" -v zone="$access_zone" -v default_zone="$default_zone" -v policy_zone="$policy_zone" '
+		$1=="chain"&&$3=="{"{chain=$2;next}
+		$1=="}"{chain="";next}
+		chain=="forward_" zone {
+			if(mode=="verify") {
+				if(index($0,"comment \"!fw4: routepolicy-init-default4\""))default_seen=1
+				if(index($0,"comment \"!fw4: routepolicy-init-policy4\""))policy_seen=1
+			}
+			if(default_seen&&policy_seen)next
+			line=$0;sub(/ comment ".*"$/,"",line);gsub(/counter packets [0-9]+ bytes [0-9]+/,"counter",line)
+			gsub(/[[:space:]]+/," ",line);sub(/^ /,"",line);sub(/ $/,"",line)
+			sub(/^meta nfproto (2|ipv4) /,"",line)
+			while(sub(/^ip (saddr|daddr) 0\.0\.0\.0\/0 /,"",line)){}
+			sub(/^counter( name ("[^"]+"|[A-Za-z0-9_.-]+))? /,"",line)
+			if(line=="drop"||line~/^reject( with .*)?$/||line=="jump handle_reject")bad=1
+			if(!default_seen&&(line=="jump drop_to_" default_zone||line=="jump reject_to_" default_zone))bad=1
+			if(!policy_seen&&(line=="jump drop_to_" policy_zone||line=="jump reject_to_" policy_zone))bad=1
+		}END{exit bad}' || fail 'IPv4 forwarding: an unconditional DROP/REJECT precedes a managed egress allowance'
+}
+
 ipv6_forward_guard() {
 	local mode=$1 snapshot=$2
 	forward_include_guard
@@ -678,6 +700,7 @@ verify() {
 	[ "$(cat "$RP_ROOT/proc/sys/net/ipv4/ip_forward")" = 1 ] || fail 'IPv4 forwarding is disabled'
 	fw4 check >/dev/null 2>&1 || fail 'fw4 validation failed'
 	nft_snapshot=$(nft -n list table inet fw4) || fail 'running fw4 table unavailable'
+	ipv4_forward_guard verify "$nft_snapshot"
 	ipv6_forward_guard verify "$nft_snapshot"
 	for setting in input forward output; do
 		[ "$setting" = output ] && action=oifname || action=iifname
@@ -717,6 +740,7 @@ case "$operation" in
 	plan)
 		parse "$@"; conflicts; default_route_guard plan
 		nft_snapshot=$(nft -n list table inet fw4) || fail 'IPv6 control flow: running fw4 table unavailable'
+		ipv4_forward_guard plan "$nft_snapshot"
 		ipv6_forward_guard plan "$nft_snapshot"
 		emit_plan
 		rp_err 'IPv6 policy: reject new forwarding connections through this router; preserve existing conntrack and management. Disable upstream RA/client IPv6 separately to prevent direct L2 bypass.'
