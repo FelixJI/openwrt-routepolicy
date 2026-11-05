@@ -8,6 +8,7 @@
 | 单臂仅新增验证器的只读verify；分离拓扑全量及提交/重载/超时/所有权恢复 | `2b48d8ac073421d857a2b3636e7fff8bbd4f52f6` |
 | 原生 DOWN 静态出口、显式恢复与真实 SSH 确认分支 | `f53c73d363d90b8dbc21b7f5e3244233ddca3097` |
 | 最终 DAD 冲突/进程终止、pending 跨 boot、新 DHCP 出口 | `c9e8bf2a2c0187d36bf866e3b74aa8775eca62ce` |
+| 审阅整改后的管理/pending/zone/FIB/IPv6/启动与非直连流量增量 | `673f524cc4537e56560465baeada73a46daeb8df` |
 
 早期 ARP/rp_filter/陈旧提交只读用例实测于 `e7d1c5e8e70d16460b07e95cbeabbf6c87b8ec05`。其后的 `0a8ef25ddc500868872639fedde3da06b3586e09` 仅保留原 DAD 失败阶段/错误，由主流程回归测试验证；没有重复相同真实回滚节点。
 
@@ -40,7 +41,7 @@ $T apply "$token"
 /usr/libexec/routepolicy/init-transaction confirm "$(jsonfilter -i /tmp/prepare.json -e '@.token')"  # 新SSH会话
 ```
 
-以上为互斥场景，分别从对应干净快照开始。实测 `apply→pending`、实际 client SSH 确认后 `confirmed`；未伪造 `SSH_CONNECTION`。全程配置 `routepolicy.main.enabled=0`，没有开启既有分流应用。
+以上为互斥场景，分别从对应干净快照开始。实测 `apply→pending`、实际 client SSH 确认后 `confirmed`；未伪造 `SSH_CONNECTION`。此前矩阵配置 `routepolicy.main.enabled=0`；下述审阅增量另有 enabled=1 的真实启动/策略流量分支。
 
 ## 服务与报文观测
 
@@ -64,7 +65,7 @@ ubus call network.interface.policy renew  # 新卡换 rp_init_policy；默认出
 | DNS / 双出口转发 | 经管理地址解析 openwrt.lan、example.com；两个 HTTP 均返回约定正文，fw4 forwarding/MASQUERADE计数命中。单臂另加 `10.17.1.2/32 via 10.17.1.16` 排除直接上游旁路，出口源分别为.16与10.17.2.15 |
 | WAN 管理/DNS隔离 | 对两 WAN hostfwd 发真实 SSH/HTTP/DNS；TCP关闭无banner、DNS超时；LAN SSH与DNS为正控制 |
 | IPv6 | 显式测试路由强制新 IPv6 流经本机，拒绝规则0→1包/104字节；link-local ping及真实SSH管理仍成功，不把一次超时当规则证据 |
-| 预检门禁/幂等 | 原生UCI私有delta、真实commit、list/scalar恢复合约通过；实际 rp_filter max门禁、已占用管理.99的ARP拒绝、外部提交后陈旧基线拒绝均通过；重复apply新interface/zone仍各1 |
+| 预检门禁/幂等 | 原生UCI真实commit、list/scalar恢复基础合约通过（`-t` 本身不提供默认pending读隔离，完整隔离见下述alias实测）；实际 rp_filter max门禁、已占用管理.99的ARP拒绝、外部提交后陈旧基线拒绝均通过；重复apply新interface/zone仍各1 |
 
 ## 故障、所有权与新卡
 
@@ -85,6 +86,30 @@ ubus call network.interface.policy renew  # 新卡换 rp_init_policy；默认出
 
 快照分支使用 QEMU monitor `savevm NAME` / `loadvm NAME`；重启用 `system_reset`。早期 `-no-reboot` 导致guest退出时，以同一磁盘/4网卡冷启动；最终 pending 用例在同一QEMU进程内真实重启。关键干净快照包括 `singlearm-full-baseline`、`free-nic-2b48`（原生DOWN）、`free-nic-f53`、`free-nic-c9`；pending快照只在其自身版本完成确认/恢复，未热替换旧pending守卫。
 
-边界：没有真实物理/USB/无线驱动、设备热拔插或生产网络验证；外部设备认领、改MAC/ifindex、同名替换等异常仅有边界测试，未逐项做真实硬件故障。外部RA/已有IPv6 conntrack与外部终端/主路由设置不宣称已阻断或已修改。所有地址/MAC/租约及SSH密钥仅为隔离实验数据。
+## 审阅增量：原生合同与失败反例
 
-清理：两台自建 guest 与回环 HTTP 服务均已关闭，未关闭 WSL 或其他任务进程。
+以下代码增量实测于 `673f524`；较早反例另标版本，原生UCI合同与只读FIB命令不绑定脚本版本。分别恢复 clean 快照，不重复前轮全矩阵。本轮 QEMU/client/HTTP 同处独立 Linux NET namespace，只有 lo，无宿主/物理出口；lo 上添加受控目标 198.18.0.1/32、203.0.114.1/32，HTTP 仅存在于该 namespace。普通 FIB 探针 `ip -4 route get fibmatch 198.18.0.1 mark 0` 和附加 `from ACCESS_NONLOCAL iif br-lan` 在双拓扑均 RC0、指所选默认出口。
+
+| 条件/复现动作 | 实际观测 |
+| --- | --- |
+| 同包默认pending隔离：独立 `/tmp/rp-test/config/rpcontract`，暂存 other.pending=2h；随机alias symlink指向真实包，以 `uci -c PRIVATECONF -t PRIVATEDELTA set/commit ALIAS` 写lan | absolute get/export绕过pending，absolute set RC1/I/O error；alias真实提交lan=.8，other落盘1h/默认读2h，默认delta与changes原字节cmp0。两个独立alias分别暂存lan=.88/提交无关other.committed，再提交前者，两项已提交值并存，默认pending仍cmp0 |
+| 管理1→2成功pending后 `uci set dhcp.other.leasetime=2h`，不commit，等待自然120秒恢复 | old管理1真实SSH可达；committed租期1h/默认读2h，pending文件和changes均cmp0；诚实conflict并延后dnsmasq/odhcpd。用户 `uci commit dhcp; $T recover` 后rolled_back，外部2h落盘保留 |
+| 同一pending快照暂存 `network.lan.ipaddr=192.168.1.3/24`，显式recover | 仅该受管键仍为候选落盘.2（默认pending读.3），其余字段恢复；pending原字节cmp0，明确字段冲突和network/firewall/DHCP服务延后，管理2真实SSH仍可达。用户revert此key后recover，四包与baseline cmp0/管理1恢复 |
+| 新DHCP zone被外部提交output=DROP并reload后真实SSH confirm | `926d432`原始缺口确会confirmed；`673f524` RC1且保留pending，精确报 `prepared candidate differs: firewall.rp_init_policy.output`；恢复ACCEPT/reload后真实SSH confirmed |
+| 原生默认include及早放行IPv6 | 官方纯注释 `10-custom-filter-chains.nft` 在 `4d66e84` 后clean双拓扑plan通过。clean未初始化基线的 `chain-pre/forward_lan/90-review.nft` 写入 `meta nfproto ipv6 counter accept` 并reload，673 plan明确IPv6 control flow拒绝RC1。另926实际向forward/forward_lan/handle_reject链首插accept，verify均RC1，reload恢复后verify RC0 |
+| existing policy metric0 + newdefault DHCP | `prepare lan rp_init_default policy default eth0 dhcp - - - - -` 候选调policy200/newdefault10；apply真pending，main/FIB mark0确经eth0/gw10.17.1.2；真实SSH confirmed。实际另加未选eth3默认metric1后plan RC1，明确其将优先于候选10；初次metric0注入因内核File exists未创建，不算负例 |
+| 新static覆盖未选网段 | other10.3.0.1/24 +新10.3.0.200/25拒绝；other10.3.0.129/25 +新10.3.0.2/24也拒绝；相邻10.3.0.1/25与10.3.0.200/25允许。仅live route10.4.0.0/24的重叠也拒绝，各给精确overlap诊断 |
+| 新DHCP prepare后同名网卡改MAC（4d66e84） | link-plan required1/dad_required0；eth2改MAC后apply RC1/身份变化、保持prepared且四包cmp0，无DHCP/DAD越界写入 |
+| 已启用服务与guard并发启动 | 合法IP-only配置enabled1/smartdns0/auto_update0；apply提交节点SIGKILL，真实phase=rolling_back且flock探测RC1时调用init start，等待7秒RC0；恢复rolled_back后真实原子apply完成、ubus watch实例running=true，0x100规则与table200存在 |
+| 非直连默认/策略包 | 上述enabled分支static_policy4仅含203.0.114.1；client wget两受控目标均返回约定正文/RC0。持续20秒tcpdump：eth0仅默认198.18.0.1完整连接14包/NAT源10.17.1.15；eth2仅策略203.0.114.1完整连接14包/NAT源10.17.2.15，均含SYN/SYN-ACK/数据且kernel drop0 |
+| 无odhcpd的IPv4安装 | 原生apk卸载odhcpd-ipv6only成功，init脚本/二进制均不存在；apply pending RC0、显式recover rolled_back RC0、管理1真实SSH RC0 |
+
+启动分支按Makefile补齐官方smartdns46.1/libopenssl3：直接APK不受信任时没有使用allow-untrusted，改用官方原样缓存的base/packages签名 `packages.adb`，原生apk成功验签安装。未补依赖的首轮start虽RC0但无watcher，已丢弃其策略流量结论；最终证据来自补齐依赖后的重跑。抓包使用持续窗口，先见listening再发送，未以单次HTTP成功代替出口证据。
+
+复现要点：管理变更用 `prepare lan wan policy - - - - - - 192.168.1.2 24`；只在apply返回且status真pending后加上述外部delta/zone变更。`uci get /etc/config/PACKAGE.SECTION.KEY`观察落盘，普通get观察pending；用 `cmp` 对照默认delta/changes原字节。所有confirm由client新建真实SSH执行，没有伪造连接信息。原始诊断与完整包文本仅保存在实验目录 `/tmp/routepolicy-lab-17`（`dut.commands.log`、`review-incremental-673.txt`、`review-startup-retry-673.txt`），不提交磁盘/整套控制代码。
+
+未完成门禁：外部进程在基线重验与受管字段提交之间修改同一key的原子CAS合同仍为 **BLOCKED**；本轮不宣称此窗口已解决或验证通过。alias无关字段合并和默认pending保持不能证明该原子合同。未因此扩充到真实网络/设备热插拔。
+
+边界：没有真实物理/USB/无线驱动、设备热拔插或生产网络验证；除上述新DHCP同名改MAC反例外，外部设备认领、改ifindex、同名替换等异常仅有边界测试，未逐项做真实硬件故障。外部RA/已有IPv6 conntrack与外部终端/主路由设置不宣称已阻断或已修改。所有地址/MAC/租约及SSH密钥仅为隔离实验数据。
+
+清理：两台自建 guest 与 namespace 内 HTTP 服务均已关闭，精确进程扫描无残留，未关闭 WSL 或其他任务进程。
