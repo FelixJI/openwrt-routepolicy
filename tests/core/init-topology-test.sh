@@ -42,12 +42,13 @@ case "$data:$2" in
 	'new_policy:@.l3_device') echo "${TEST_NEW_DEVICE:-eth3}" ;;
 	'lan:@["ipv4-address"][0].address') echo "${TEST_MANAGEMENT_IP:-192.168.1.1}" ;;
 	'wan:@["ipv4-address"][0].address') echo 10.1.0.2 ;;
-	'policy:@["ipv4-address"][0].address') echo 10.2.0.2 ;;
+	'policy:@["ipv4-address"][0].address') echo "${TEST_POLICY_ADDRESS:-10.2.0.2}" ;;
 	'new_policy:@["ipv4-address"][0].address') echo "${TEST_NEW_ADDRESS:-10.3.0.2}" ;;
+	'lan:@["ipv4-address"][0].mask') echo "${TEST_ACCESS_PREFIX:-24}" ;;
 	*:'@["ipv4-address"][0].mask') echo 24 ;;
-	'lan:@.route[@.target="0.0.0.0"].nexthop') echo 192.168.1.254 ;;
+	'lan:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_ACCESS_GATEWAY:-192.168.1.254}" ;;
 	'wan:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_GATEWAY:-10.1.0.1}" ;;
-	'policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.2.0.1 ;;
+	'policy:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_POLICY_GATEWAY:-10.2.0.1}" ;;
 	'new_policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.3.0.1 ;;
 	'services:@dnsmasq.instances.*.running'|'services:@.dnsmasq.instances.*.running'|'services:@.dropbear.instances.*.running'|'services:@.odhcpd.instances.*.running') [ "${TEST_SERVICE_DOWN:-0}" != 1 ] && echo true || echo false ;;
 	*:'@.interface[*].l3_device') [ -z "${TEST_DYNAMIC_CLAIM:-}" ] || echo "$TEST_DYNAMIC_CLAIM" ;;
@@ -69,16 +70,23 @@ case "$*" in
 		esac
 		[ "${TEST_TABLE_CONFLICT:-0}" = 0 ] || echo 'default via 10.9.0.1 dev eth9' ;;
 	'-4 -o addr show'|'-o addr show')
-		printf '%s\n' '2: br-lan inet 192.168.1.1/24 brd 192.168.1.255' '3: eth1 inet 10.1.0.2/24 brd 10.1.0.255'
+		if [ -n "${TEST_LOCAL_ADDRESS_LINES:-}" ]; then printf '%s\n' "$TEST_LOCAL_ADDRESS_LINES"
+		else printf '%s\n' '2: br-lan inet 192.168.1.1/24 brd 192.168.1.255' '3: eth1 inet 10.1.0.2/24 brd 10.1.0.255'; fi
 		[ -z "${TEST_OTHER_ADDRESS:-}" ] || echo "$TEST_OTHER_ADDRESS" ;;
 	'-4 route show table main default')
 		echo "default via ${TEST_DEFAULT_GATEWAY:-10.1.0.1} dev ${TEST_DEFAULT_DEVICE:-eth1} proto static metric ${TEST_DEFAULT_METRIC:-0}"
 		echo "default via 10.2.0.1 dev eth2 proto static metric ${TEST_POLICY_METRIC:-200}"
 		[ -z "${TEST_THIRD_DEFAULT:-}" ] || echo "$TEST_THIRD_DEFAULT" ;;
 	'-4 route get fibmatch '*)
+		printf '%s\n' "$*" >>"$TEST_TOPOLOGY_DIR/fib.log"
 		if [ "${TEST_FIB_CONNECTED:-0}" = 1 ]; then echo '198.18.0.0/15 dev eth9 proto kernel'; exit 0; fi
 		device=${TEST_FIB_DEVICE:-${TEST_DEFAULT_DEVICE:-eth1}}
-		case "$*" in *' from '*) device=${TEST_FORWARDED_DEVICE:-$device} ;; esac
+		case "$*" in *' from '*)
+			device=${TEST_FORWARDED_DEVICE:-$device}
+			source=$(printf '%s\n' "$*" | awk '{for(i=1;i<NF;i++)if($i=="from")print $(i+1)}')
+			if [ -n "${TEST_EXPECT_FIB_SOURCE:-}" ] && [ "$source" != "$TEST_EXPECT_FIB_SOURCE" ]; then echo "unexpected FIB source: $source" >&2; exit 2; fi
+			if [ "${TEST_FAIL_LOCAL_FIB:-0}" = 1 ] && "$0" -4 -o addr show | awk -v ip="$source" '{split($4,a,"/");if(a[1]==ip)found=1}END{exit !found}'; then echo 'RTNETLINK answers: Invalid argument' >&2; exit 2; fi
+			;; esac
 		echo "default via ${TEST_DEFAULT_GATEWAY:-10.1.0.1} dev $device proto static ${TEST_FIB_TABLE:-}" ;;
 	'-4 route show table all') [ -z "${TEST_EXTRA_ROUTE:-}" ] || echo "$TEST_EXTRA_ROUTE" ;;
 	'-6 rule show') : ;;
@@ -506,5 +514,27 @@ apply_mock_plan "$tmp/single-arm-final"
 sed -e 's/wan/lan/g' -e 's/eth1/br-lan/g' "$tmp/nft" >"$tmp/single-arm-runtime.nft"
 TEST_NFT_FILE="$tmp/single-arm-runtime.nft" TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 "$tool" verify lan lan policy >"$tmp/verify-single-arm"
 reject env TEST_NFT_FILE="$tmp/single-arm-runtime.nft" TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=192.168.1.254 TEST_FIB_DEVICE=eth2 "$tool" verify lan lan policy
+baseline
+# Prepare must use current access subnet and avoid both old local and candidate IPs.
+TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=192.168.1.3 "$tool" plan lan wan policy - - - - - - 192.168.1.2 24 >"$tmp/management-two"
+alias_addresses=$(printf '%s\n' '2: br-lan inet 192.168.1.1/24 scope global' '2: br-lan inet 192.168.1.3/24 scope global' '3: eth1 inet 10.1.0.2/24 scope global')
+TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=192.168.1.4 TEST_LOCAL_ADDRESS_LINES="$alias_addresses" "$tool" plan lan wan policy - - - - - - 192.168.1.2 24 >"$tmp/management-alias"
+TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=192.168.1.2 "$tool" plan lan wan policy - - - - - - 192.168.2.1 24 >"$tmp/management-new-subnet"
+sed 's/192.168.1.0\/24/192.168.2.0\/24/g' "$tmp/nft" >"$tmp/management-new-subnet.nft"
+apply_mock_plan "$tmp/management-new-subnet"
+TEST_MANAGEMENT_IP=192.168.2.1 TEST_LOCAL_ADDRESS_LINES='2: br-lan inet 192.168.2.1/24 scope global' TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=192.168.2.2 TEST_NFT_FILE="$tmp/management-new-subnet.nft" "$tool" verify lan wan policy - - - - - - 192.168.2.1 24 >"$tmp/verify-new-subnet"
+baseline
+: >"$tmp/fib.log"
+TEST_ACCESS_PREFIX=30 TEST_LOCAL_ADDRESS_LINES='2: br-lan inet 192.168.1.1/30 scope global' "$tool" plan lan wan policy - - - - - - 192.168.1.2 30 >"$tmp/management-thirty" 2>"$tmp/deferred-fib"
+grep -Fq 'forwarded FIB check deferred to verify' "$tmp/deferred-fib"
+if grep -Fq ' from ' "$tmp/fib.log"; then echo 'prepare fabricated a /30 forwarded FIB source' >&2; exit 1; fi
+apply_mock_plan "$tmp/management-thirty"
+sed 's/192.168.1.0\/24/192.168.1.0\/30/g' "$tmp/nft" >"$tmp/management-thirty.nft"
+TEST_MANAGEMENT_IP=192.168.1.2 TEST_ACCESS_PREFIX=30 TEST_LOCAL_ADDRESS_LINES='2: br-lan inet 192.168.1.2/30 scope global' TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=192.168.1.1 TEST_NFT_FILE="$tmp/management-thirty.nft" "$tool" verify lan wan policy - - - - - - 192.168.1.2 30 >"$tmp/verify-management-thirty"
+exhausted_sources=$(printf '%s\n' '2: br-lan inet 192.168.1.1/30 scope global' '2: br-lan inet 192.168.1.2/30 scope global')
+reject env TEST_MANAGEMENT_IP=192.168.1.2 TEST_ACCESS_PREFIX=30 TEST_LOCAL_ADDRESS_LINES="$exhausted_sources" TEST_FAIL_LOCAL_FIB=1 TEST_NFT_FILE="$tmp/management-thirty.nft" "$tool" verify lan wan policy - - - - - - 192.168.1.2 30
+grep -Fq 'EVIDENCE_MISSING' "$tmp/error"
+baseline
+TEST_MANAGEMENT_IP=10.17.1.1 TEST_ACCESS_PREFIX=1 TEST_LOCAL_ADDRESS_LINES='2: br-lan inet 10.17.1.1/1 scope global' TEST_ACCESS_GATEWAY=10.17.1.2 TEST_POLICY_ADDRESS=203.0.113.2 TEST_POLICY_GATEWAY=203.0.113.1 TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=10.17.1.2 TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=1.0.0.0 "$tool" plan lan lan policy >"$tmp/wide-source"
 [ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
 printf '%s\n' 'init topology tests: passed'

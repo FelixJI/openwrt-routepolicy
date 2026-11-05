@@ -409,7 +409,7 @@ conflicts() {
 }
 
 default_route_guard() {
-	local mode=$1 rules marks token mark mask routes summary lowest best_count best_device best_gateway dev gateway metric probe source result cidr candidate route_mode
+	local mode=$1 rules marks token mark mask routes summary lowest best_count best_device best_gateway dev gateway metric probe source result cidr candidate route_mode addresses source_cidr
 	rules=$(ip -4 rule show) || fail 'default route: RPDB evidence unavailable'
 	marks=$(printf '%s\n' "$rules" | awk '
 		{gsub(/[[:space:]]+/," ");sub(/^ /,"")}
@@ -461,8 +461,29 @@ EOF
 		probe=$candidate; break
 	done
 	[ -n "$probe" ] || fail 'default route: no non-connected FIB probe target is available'
-	source=$(awk -v net="${access_cidr%/*}" -v own="$access_ip" 'BEGIN{split(net,a,".");a[4]++;v=a[1]"."a[2]"."a[3]"."a[4];if(v==own)a[4]++;print a[1]"."a[2]"."a[3]"."a[4]}')
+	[ "$mode" = plan ] && source_cidr=$current_access_cidr || source_cidr=$access_cidr
+	addresses=$(ip -4 -o addr show) || fail 'default route: local address evidence unavailable for forwarded FIB lookup'
+	source=$(printf '%s\n' "$addresses" | awk -v cidr="$source_cidr" -v candidate="$access_ip" '
+		function number(ip,a){split(ip,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]}
+		function text(n,a,b,c){a=int(n/16777216);n-=a*16777216;b=int(n/65536);n-=b*65536;c=int(n/256);return a"."b"."c"."(n-c*256)}
+		NF {split($4,a,"/");local_address[number(a[1])]=1}
+		END {
+			split(cidr,c,"/");first=number(c[1])+1;last=first+2^(32-c[2])-3
+			local_address[number(candidate)]=1
+			for(n=first;n<=last;n++){
+				octet=int(n/16777216)
+				if(octet==0||octet==127){n=(octet+1)*16777216-1;continue}
+				if(n>=number("169.254.0.0")&&n<=number("169.254.255.255")){n=number("169.254.255.255");continue}
+				if(octet>=224)break
+				if(!(n in local_address)){print text(n);exit}
+			}
+		}')
+	if [ -z "$source" ]; then
+		if [ "$mode" = plan ]; then rp_err 'default route: forwarded FIB check deferred to verify; current access subnet has no non-local, non-candidate source'
+		else fail 'default route: EVIDENCE_MISSING; effective access subnet has no valid forwarded FIB source'; fi
+	fi
 	for route_mode in local forwarded; do
+		[ "$route_mode" != forwarded ] || [ -n "$source" ] || continue
 		if [ "$route_mode" = local ]; then result=$(ip -4 route get fibmatch "$probe" mark 0)
 		else result=$(ip -4 route get fibmatch "$probe" from "$source" iif "$access_device" mark 0); fi || fail "default route: $route_mode FIB lookup failed"
 		printf '%s\n' "$result" | awk -v dev="$default_device" -v gw="$default_gateway" '
