@@ -141,6 +141,7 @@ EOF
 cat >"$tmp/bin/ubus" <<'EOF'
 #!/bin/sh
 [ ! -f "$TEST_TX_DIR/guard-down" ] || exit 1
+[ "${3:-}" != delete ] || { printf '%s\n' delete >>"$TEST_TX_DIR/guard-delete"; exit 0; }
 printf '%s\n' '{"routepolicy-initguard":{"instances":{"guard":{"running":true}}}}'
 EOF
 cat >"$tmp/bin/jsonfilter" <<'EOF'
@@ -180,6 +181,7 @@ reset() {
 	rm -f "$tmp/fail-at" "$tmp/kill-at" "$tmp/fw4-fail" "$tmp/verify-fail" "$tmp/service-fail" "$tmp/pending" "$tmp/commits" "$tmp/bad-plan" "$tmp/guard-down" "$tmp/services"
 	rm -f "$tmp/"list.*
 	rm -f "$tmp/"link-*
+	rm -f "$tmp/guard-delete"
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
 	rm -f "$tmp/root/sys/class/net/eth9/device"
 	ln -s "$tmp/physical/eth9" "$tmp/root/sys/class/net/eth9/device"
@@ -307,6 +309,18 @@ wait "$guard_pid"
 phase_is rolled_back
 restored
 
+for boot_fault in changed missing; do
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	printf 9999999999 >"$WAL/deadline"
+	if [ "$boot_fault" = changed ]; then
+		printf '00000000-0000-4000-8000-000000000002' >"$tmp/root/proc/sys/kernel/random/boot_id"
+	else rm "$WAL/boot-id"; fi
+	"$TX" guard & boot_guard=$!
+	wait "$boot_guard"
+	phase_is rolled_back
+	restored
+done
+
 reset; prepare; "$TX" apply "$token" >/dev/null
 printf external >"$tmp/db/dhcp.lan.ignore"
 printf keep >"$tmp/db/firewall.rp_init_dns.custom"
@@ -393,4 +407,16 @@ SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/nul
 "$TX" recover >/dev/null
 phase_is confirmed
 [ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x1 ]
+
+# An old terminal guard cannot unregister a fresh apply while the writer owns its lock.
+rm -f "$tmp/guard-delete"
+exec 7>"$tmp/root/etc/routepolicy/state/init-transaction/lock"
+flock -x 7
+"$TX" guard 7>&- & old_guard=$!
+sleep 2
+[ ! -f "$tmp/guard-delete" ]
+flock -u 7
+exec 7>&-
+wait "$old_guard"
+[ -f "$tmp/guard-delete" ]
 printf '%s\n' 'init transaction tests: passed (mock UCI/services; packet evidence remains EVIDENCE_MISSING)'

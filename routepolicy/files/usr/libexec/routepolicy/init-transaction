@@ -220,6 +220,18 @@ guard_start() {
 	done
 	return 1
 }
+guard_stop_if_inactive() (
+	# Recheck under the writer lock so an old guard cannot delete a newly started instance.
+	exec 9>"$TX/lock"
+	flock -n 9 || exit 1
+	case "$(read_phase)" in
+		applying|rolling_back|pending) exit 1 ;;
+		prepared)
+			deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
+			if rp_uint_between "$deadline" 1 9999999999 && [ "$(date +%s)" -lt "$deadline" ]; then exit 1; fi ;;
+	esac
+	ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' 9>&- >/dev/null 2>&1
+)
 rollback_fields() {
 	phase rolling_back || return 1
 	no_pending || { phase conflict; return 1; }
@@ -374,6 +386,8 @@ case "$operation" in
 		done <"$WAL/candidate"
 		printf '%s\n' "$count" >"$WAL/count"
 		printf '%s\n' "$(( $(date +%s) + 120 ))" >"$WAL/deadline"
+		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/boot-id" || fail '无法记录事务启动身份'
+		[ -s "$WAL/boot-id" ] || fail '事务启动身份缺失'
 		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
 		phase applying || fail '持久化 WAL 失败'
 		failed_stage=
@@ -433,13 +447,14 @@ case "$operation" in
 			case "$(read_phase)" in
 				applying|rolling_back) "$0" recover >/dev/null 2>&1 || true ;;
 				pending) deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
-					if ! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then "$0" recover >/dev/null 2>&1 || true; fi ;;
+					if [ ! -s "$WAL/boot-id" ] || [ "$(cat "$WAL/boot-id" 2>/dev/null)" != "$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null)" ] ||
+						! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then "$0" recover >/dev/null 2>&1 || true; fi ;;
 				prepared)
 					deadline=$(cat "$WAL/deadline" 2>/dev/null) || deadline=0
 					if ! rp_uint_between "$deadline" 1 9999999999 || [ "$(date +%s)" -ge "$deadline" ]; then
-						ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit 0
+						guard_stop_if_inactive && exit 0
 					fi ;;
-				*) ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit 0 ;;
+				*) guard_stop_if_inactive && exit 0 ;;
 			esac
 			sleep 2
 		done
