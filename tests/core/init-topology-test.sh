@@ -152,6 +152,18 @@ table inet fw4 {
 		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 jump accept_to_policy comment "!fw4: routepolicy-init-policy4"
 		meta nfproto 10 counter packets 0 bytes 0 jump handle_reject comment "!fw4: routepolicy-init-ipv6"
 	}
+	chain accept_to_wan {
+		oifname "eth1" counter packets 0 bytes 0 accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+	chain accept_from_wan {
+		iifname "eth1" counter packets 0 bytes 0 accept comment "!fw4: accept wan IPv4/IPv6 traffic"
+	}
+	chain accept_to_policy {
+		oifname "eth2" counter packets 0 bytes 0 accept comment "!fw4: accept policy IPv4/IPv6 traffic"
+	}
+	chain handle_reject {
+		reject comment "!fw4: Reject any other traffic"
+	}
 	chain srcnat_wan {
 		ip saddr 192.168.1.0/24 counter packets 0 bytes 0 masquerade comment "!fw4: routepolicy-init-default-nat"
 	}
@@ -285,6 +297,8 @@ sed 's/oifname "eth2" jump srcnat_policy/oifname "eth9" jump srcnat_policy/' "$t
 reject env TEST_NFT_FILE="$tmp/wrong-egress.nft" "$tool" verify lan wan policy
 sed 's/counter packets 1 bytes 104 drop /counter packets 1 bytes 104 accept /' "$tmp/nft" >"$tmp/wrong-action.nft"
 reject env TEST_NFT_FILE="$tmp/wrong-action.nft" "$tool" verify lan wan policy
+sed 's/reject comment "!fw4: Reject any other traffic"/accept comment "!fw4: Reject any other traffic"/' "$tmp/nft" >"$tmp/wrong-reject-target.nft"
+reject env TEST_NFT_FILE="$tmp/wrong-reject-target.nft" "$tool" verify lan wan policy
 sed 's/ip saddr 192.168.1.0\/24 counter/ip saddr 192.168.2.0\/24 counter/' "$tmp/nft" >"$tmp/wrong-source.nft"
 reject env TEST_NFT_FILE="$tmp/wrong-source.nft" "$tool" verify lan wan policy
 grep -v 'tcp dport 53' "$tmp/nft" >"$tmp/missing-tcp.nft"

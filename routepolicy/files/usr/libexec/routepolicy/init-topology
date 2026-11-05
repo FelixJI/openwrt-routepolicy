@@ -359,7 +359,10 @@ live_rule() {
 		{
 			line=$0; sub(/[[:space:]]+$/, "", line)
 			if (substr(line, length(line)-length(marker)+1) != marker) next
-			if (chain != wanted_chain) { bad=1; next }
+			if (chain != wanted_chain) {
+				if(index(comment,"!fw4: routepolicy-init-")==1) bad=1
+				next
+			}
 			line=normalized(substr(line, 1, length(line)-length(marker)))
 			found=0
 			for (i=1;i<=n;i++) if (line==normalized(expected[i])) { count[i]++; found=1 }
@@ -393,12 +396,15 @@ verify() {
 	done
 	live_rule "forward_$access_zone" '!fw4: routepolicy-init-default4' "ip saddr $access_cidr counter jump accept_to_$default_zone"
 	live_rule "forward_$access_zone" '!fw4: routepolicy-init-policy4' "ip saddr $access_cidr counter jump accept_to_$policy_zone"
+	live_rule "accept_to_$default_zone" "!fw4: accept $default_zone IPv4/IPv6 traffic" "oifname \"$default_device\" counter accept"
+	live_rule "accept_to_$policy_zone" "!fw4: accept $policy_zone IPv4/IPv6 traffic" "oifname \"$policy_device\" counter accept"
 	live_rule "srcnat_$default_zone" '!fw4: routepolicy-init-default-nat' "ip saddr $access_cidr counter masquerade"
 	live_rule "srcnat_$policy_zone" '!fw4: routepolicy-init-policy-nat' "ip saddr $access_cidr counter masquerade"
 	live_rule srcnat "!fw4: Handle $default_zone IPv4/IPv6 srcnat traffic" "oifname \"$default_device\" jump srcnat_$default_zone"
 	live_rule srcnat "!fw4: Handle $policy_zone IPv4/IPv6 srcnat traffic" "oifname \"$policy_device\" jump srcnat_$policy_zone"
 	live_rule "input_$access_zone" '!fw4: routepolicy-init-dns' "ip saddr $access_cidr tcp dport 53 counter accept" "ip saddr $access_cidr udp dport 53 counter accept"
 	live_rule "forward_$access_zone" '!fw4: routepolicy-init-ipv6' 'meta nfproto 10 counter jump handle_reject'
+	live_rule handle_reject '!fw4: Reject any other traffic' reject
 	live_rule "output_$access_zone" '!fw4: routepolicy-init-dhcp4' "meta nfproto 2 udp sport 67 udp dport 68 counter jump drop_to_$access_zone"
 	live_rule "output_$access_zone" '!fw4: routepolicy-init-dhcp6' "meta nfproto 10 udp sport 547 udp dport 546 counter jump drop_to_$access_zone"
 	live_rule "output_$access_zone" '!fw4: routepolicy-init-ra' "icmpv6 type 134 counter jump drop_to_$access_zone"
