@@ -53,6 +53,71 @@ safe_cache_path() {
 	}
 }
 
+# 官方 init 通过 addition_arg 将 -interface 传给上游，参数必须是实际设备名。
+server_interface_device() {
+	rp_is_name "${1-}" 32 || return 1
+	device=$(rp_interface_device "$1")
+	rp_is_device "$device" || return 1
+	printf '%s\n' "$device"
+}
+
+# 仅在当前参数与上次写入值逐字相等时，才允许替换或删除受管后缀。
+server_addition_arg_target() {
+	upstream=$1 wanted=${2-}
+	addition_action=keep addition_value='' marker_action=keep marker_value=''
+	marker=$(rp_uci_config_get smartdns "$upstream" routepolicy_bound_device '')
+	existing=$(rp_uci_config_get smartdns "$upstream" addition_arg '')
+	managed_tail=
+	if [ -n "$marker" ] && [ "$existing" = "$marker" ]; then
+		tail="-interface ${existing##* }"
+		case "$existing" in
+			"$tail"|*" $tail")
+				case ${existing%"$tail"} in
+					*-interface*) ;;
+					*) managed_tail=$tail ;;
+				esac
+				;;
+		esac
+	fi
+	if [ -n "$wanted" ]; then
+		device=$(server_interface_device "$wanted") || {
+			rp_err "上游 $upstream 的接口 $wanted 无法解析为合法实际设备"
+			return 1
+		}
+		managed="-interface $device"
+		if [ -n "$managed_tail" ]; then
+			prefix=${existing%"$managed_tail"}
+			addition_value="$prefix$managed"
+			if [ "$addition_value" = "$existing" ]; then return 0; fi
+			addition_action='set' marker_action='set' marker_value=$addition_value
+		elif [ -z "$existing" ]; then
+			addition_action='set' addition_value=$managed
+			marker_action='set' marker_value=$managed
+		elif [ "$existing" = "$managed" ]; then
+			return 0
+		else
+			case "$existing" in
+				*-interface*|*[!a-zA-Z0-9._:/=+,@\ -]*)
+					rp_err "上游 $upstream 的 addition_arg 含无法安全合并的内容，请先手工调整或清空接口字段"
+					return 1 ;;
+			esac
+			addition_action='set' addition_value="$existing $managed"
+			marker_action='set' marker_value=$addition_value
+		fi
+	elif [ -n "$managed_tail" ]; then
+		# 清空接口字段：删除可由归属标记证明由本应用安装的绑定，保留用户前缀
+		prefix=${existing%"$managed_tail"}
+		case "$prefix" in *' ') prefix=${prefix%' '} ;; esac
+		if [ -n "$prefix" ]; then addition_action='set' addition_value=$prefix; else addition_action='absent'; fi
+		marker_action='absent'
+	fi
+	if [ "$addition_action" = set ]; then
+		case "$addition_value" in *[!a-zA-Z0-9._:/=+,@\ -]*) rp_err '上游参数无法安全写入'; return 1 ;; esac
+		[ "${#addition_value}" -le 255 ] || { rp_err '上游参数过长'; return 1; }
+	fi
+	return 0
+}
+
 validate_candidate() {
 	file=$1
 	[ -f "$file" ] && [ ! -L "$file" ] || { rp_err 'SmartDNS 候选不存在或不安全'; return 1; }
@@ -87,7 +152,13 @@ validate_candidate() {
 					enabled|exclude_default_group|fallback) case "$value" in ''|0|1) ;; *) rp_err "$key 必须为继承、0 或 1"; errors=$((errors + 1)) ;; esac ;;
 					type) case "$value" in udp|tcp|tls|https|quic|h3) ;; *) rp_err "$key 协议非法"; errors=$((errors + 1)) ;; esac ;;
 					port) [ -z "$value" ] || rp_uint_between "$value" 1 65535 || { rp_err "$key 端口非法"; errors=$((errors + 1)); } ;;
-					name|ip|server_group|host_name|http_host|proxy|interface|set_mark) [ -z "$value" ] || safe_scalar "$value" 255 || { rp_err "$key 含非法字符"; errors=$((errors + 1)); } ;;
+					name|ip|server_group|host_name|http_host|proxy|set_mark) [ -z "$value" ] || safe_scalar "$value" 255 || { rp_err "$key 含非法字符"; errors=$((errors + 1)); } ;;
+					interface)
+						[ -z "$value" ] || rp_is_name "$value" 32 || { rp_err "$key 必须为空或合法逻辑接口名"; errors=$((errors + 1)); continue; }
+						[ -n "$value" ] || continue
+						[ "$(candidate_value "server.$id.delete" "$file")" = 1 ] && continue
+						server_addition_arg_target "$id" "$value" || errors=$((errors + 1))
+						;;
 					*) rp_err "不支持的上游字段: $field"; errors=$((errors + 1)) ;;
 				esac ;;
 			*) rp_err "不支持的 SmartDNS 字段: $key"; errors=$((errors + 1)) ;;
@@ -300,6 +371,17 @@ emit_uci_batch() {
 				[ "$(candidate_value "server.$id.delete" "$file")" = 1 ] && continue
 				case "$id" in @server\[*\]) ;; *) printf "set smartdns.%s=server\n" "$id" >>"$output" ;; esac
 				[ -n "$value" ] && printf "set smartdns.%s.%s='%s'\n" "$id" "$field" "$value" >>"$output" || printf "delete smartdns.%s.%s\n" "$id" "$field" >>"$output"
+				if [ "$field" = interface ]; then
+					server_addition_arg_target "$id" "$value" || return 1
+					case "$addition_action" in
+						set) printf "set smartdns.%s.addition_arg='%s'\n" "$id" "$addition_value" >>"$output" ;;
+						absent) printf "delete smartdns.%s.addition_arg\n" "$id" >>"$output" ;;
+					esac
+					case "$marker_action" in
+						set) printf "set smartdns.%s.routepolicy_bound_device='%s'\n" "$id" "$marker_value" >>"$output" ;;
+						absent) printf "delete smartdns.%s.routepolicy_bound_device\n" "$id" >>"$output" ;;
+					esac
+				fi
 				;;
 			*)
 				[ -n "$value" ] && printf "set smartdns.%s.%s='%s'\n" "$root" "$key" "$value" >>"$output" || printf "delete smartdns.%s.%s\n" "$root" "$key" >>"$output"
@@ -330,7 +412,7 @@ smartdns_apply() {
 	fi
 	roots=$(rp_smartdns_root_sections); root=$(printf '%s\n' "$roots" | sed -n '1p')
 	if [ -z "$root" ]; then root=main; printf 'set smartdns.%s=smartdns\n' "$root" >"$work/uci.batch"; else : >"$work/uci.batch"; fi
-	emit_uci_batch "$RP_SMARTDNS_CANDIDATE" "$root" "$work/options.batch"
+	emit_uci_batch "$RP_SMARTDNS_CANDIDATE" "$root" "$work/options.batch" || { rp_output_error smartdns-apply '生成上游接口绑定失败'; return 1; }
 	cat "$work/options.batch" >>"$work/uci.batch"
 	render_extra_fragment "$RP_SMARTDNS_CANDIDATE" "$work/91.candidate"
 	hosts_source=$RP_LOCAL_HOSTS
