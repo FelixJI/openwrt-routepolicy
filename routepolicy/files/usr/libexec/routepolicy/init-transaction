@@ -153,13 +153,13 @@ link_apply() {
 	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-error" || return 1
 	[ "$(link_value dad_required "$WAL/link-plan")" = 1 ] || return 0
 	if [ "$LINK_UP" = 0 ]; then
-		printf '%s\n' link-up >"$WAL/stage"
-		printf '%s\n' 1 >"$WAL/link-expected-up"
-		: >"$WAL/link-attempted"; sync || return 1
+		printf '%s\n' link-up >"$WAL/stage" &&
+			printf '%s\n' 1 >"$WAL/link-expected-up" &&
+			printf '%s' '' >"$WAL/link-attempted" && sync || return 1
 		timeout 5 ip link set dev "$LINK_DEVICE" up >"$WAL/link-result" 2>"$WAL/link-error" || return 1
 		link_live_up && [ "$LINK_UP" = 1 ] || return 1
 	fi
-	printf '%s\n' link-dad >"$WAL/stage"; sync || return 1
+	printf '%s\n' link-dad >"$WAL/stage" && sync || return 1
 	timeout 20 "$LIBEXEC/init-topology" link-dad "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&- >"$WAL/link-result" 2>"$WAL/link-error"
 }
 link_restore() {
@@ -170,7 +170,7 @@ link_restore() {
 	[ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ] && return 0
 	[ "$LINK_UP" = "$(cat "$WAL/link-expected-up")" ] || return 1
 	topology link-unclaimed >"$WAL/link-unclaimed-result" 2>"$WAL/link-restore-error" || return 1
-	printf '%s\n' link-restore >"$WAL/stage"; sync || return 1
+	printf '%s\n' link-restore >"$WAL/stage" && sync || return 1
 	timeout 5 ip link set dev "$LINK_DEVICE" down >"$WAL/link-result" 2>"$WAL/link-restore-error" || return 1
 	link_live_up && [ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ]
 }
@@ -245,6 +245,12 @@ load_args() {
 topology() { "$LIBEXEC/init-topology" "$1" "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" 9>&-; }
 verify_runtime() {
 	# Only the fixed topology verifier writes this private diagnostic; no UCI export is exposed.
+	while IFS="$TAB" read -r _action verify_key verify_expected; do
+		if ! read_current "$verify_key" || [ "$FIELD_TYPE" != scalar ] || [ "$FIELD_VALUE" != "$verify_expected" ]; then
+			printf 'prepared candidate differs: %s\n' "$verify_key" >"$WAL/verify-error"
+			return 1
+		fi
+	done <"$WAL/candidate"
 	if [ "$(link_value required "$WAL/link-plan")" = 1 ] && ! link_identity_matches; then
 		printf '%s\n' 'new egress physical identity differs from the prepared candidate' >"$WAL/verify-error"
 		return 1
@@ -254,7 +260,7 @@ verify_runtime() {
 services_reload() {
 	reload_mode=${1:-apply}
 	reload_errors=0
-	: >"$WAL/deferred-services"
+	printf '%s' '' >"$WAL/deferred-services" || return 1
 	for service in network firewall dnsmasq odhcpd; do
 		if [ "$service" = odhcpd ] && [ ! -e "$RP_ROOT/etc/init.d/$service" ] && [ ! -L "$RP_ROOT/etc/init.d/$service" ]; then continue; fi
 		case "$service" in network) service_packages=network ;; firewall) service_packages='network firewall' ;; *) service_packages='network dhcp' ;; esac
@@ -310,13 +316,13 @@ guard_stop_if_inactive() (
 rollback_fields() {
 	phase rolling_back || return 1
 	uci_layout || { phase conflict; return 1; }
-	: >"$WAL/conflicts"
+	printf '%s' '' >"$WAL/conflicts" || return 1
 	# A failed commit may leave unapplied private changes; never commit those during restore.
 	[ -d "$WAL/delta" ] && [ ! -L "$WAL/delta" ] || { phase conflict; return 1; }
 	find "$WAL/delta" -type f -exec rm -f '{}' ';' || { phase conflict; return 1; }
 	conflicts=0
 	field_attempted=0
-	smartdns_coordinate rollback || conflicts=1
+	smartdns_coordinate rollback || { phase conflict; return 1; }
 	count=$(cat "$WAL/count" 2>/dev/null) || { phase conflict; return 1; }
 	rp_uint_between "$count" 1 128 || { phase conflict; return 1; }
 	while [ "$count" -gt 0 ]; do
@@ -426,27 +432,27 @@ case "$operation" in
 		original_wal=$WAL
 		WAL="$TX/preparing"
 		[ ! -L "$WAL" ] || fail '事务准备目录不安全'
-		rm -rf "$WAL"
+		rm -rf "$WAL" || fail '不能清理准备事务目录'
 		safe_dir "$WAL"; safe_dir "$WAL/delta"; safe_dir "$WAL/fields"
-		printf '%s\n' "$candidate" >"$WAL/candidate"
-		printf '%s\n' "$link_preview" >"$WAL/link-plan"
+		printf '%s\n' "$candidate" >"$WAL/candidate" || fail '不能保存候选'
+		printf '%s\n' "$link_preview" >"$WAL/link-plan" || fail '不能保存链路候选'
 		link_plan_valid "$WAL/link-plan" || fail '新出口链路候选非法'
 		plan_valid "$WAL/candidate" || fail '候选字段超出初始化白名单'
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >"$WAL/parameters"
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >"$WAL/parameters" || fail '不能保存固定参数'
 		token=$(sed 's/-//g' /proc/sys/kernel/random/uuid) || fail '无法读取内核随机 token'
 		[ "${#token}" -eq 32 ] || fail '无法生成事务 token'
 		case "$token" in *[!0-9a-f]*) fail '内核随机 token 格式非法' ;; esac
-		printf '%s\n' "$token" >"$WAL/token"
+		printf '%s\n' "$token" >"$WAL/token" || fail '不能保存事务token'
 		uci_layout || fail '不能建立隔离 UCI 包命名空间'
 		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
 		smartdns_coordinate prepare || fail 'SmartDNS 协调准备阶段失败'
 		phase prepared || fail '持久化准备状态失败'
 		[ ! -L "$TX/previous" ] || fail '事务旧代目录不安全'
-		rm -rf "$TX/previous"
+		rm -rf "$TX/previous" || fail '不能清理旧准备代'
 		if [ -e "$original_wal" ]; then mv "$original_wal" "$TX/previous" || fail '不能保留旧候选'; fi
 		mv "$WAL" "$original_wal" && sync || fail '不能提升准备事务'
 		WAL=$original_wal
-		rm -rf "$TX/previous"
+		rm -rf "$TX/previous" || fail '新候选已保存，但不能清理旧准备代'
 		preview_json "$candidate" "$token"
 		;;
 	apply)
@@ -465,22 +471,21 @@ case "$operation" in
 			cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/link-boot" || fail '无法记录链路启动身份'
 		fi
 		# A failed pre-apply guard readiness check leaves a prepared, safely retryable candidate.
-		rm -rf "$WAL/fields"
+		rm -rf "$WAL/fields" || fail '不能清理旧字段WAL'
 		safe_dir "$WAL/fields"
 		count=0
 		while IFS="$TAB" read -r _action key value; do
 			count=$((count + 1)); entry="$WAL/fields/$count"; mkdir "$entry" || fail '无法准备 WAL'
-			printf '%s\n' "$key" >"$entry/key"; printf '%s' "$value" >"$entry/expected"
+			printf '%s\n' "$key" >"$entry/key" && printf '%s' "$value" >"$entry/expected" || fail '不能保存字段WAL'
 			baseline_type=$(awk -F '\t' -v wanted="$key" '$1==wanted {n++;type=$2} END{if(n!=1)exit 1;print type}' "$WAL/baseline") || fail '准备基线字段损坏'
 			baseline_value=$(awk -F '\t' -v wanted="$key" '$1==wanted {print $3}' "$WAL/baseline") || fail '准备基线值损坏'
 			case "$baseline_type" in
-				0) printf 0 >"$entry/existed"; : >"$entry/old"; printf scalar >"$entry/type" ;;
-				scalar|list) printf 1 >"$entry/existed"; printf '%s' "$baseline_value" >"$entry/old"; printf '%s' "$baseline_type" >"$entry/type" ;;
+				0) printf 0 >"$entry/existed" && printf '%s' '' >"$entry/old" && printf scalar >"$entry/type" || fail '不能保存缺失字段基线' ;;
+				scalar|list) printf 1 >"$entry/existed" && printf '%s' "$baseline_value" >"$entry/old" && printf '%s' "$baseline_type" >"$entry/type" || fail '不能保存字段旧值和类型' ;;
 				*) fail '准备基线类型损坏' ;;
 			esac
 		done <"$WAL/candidate"
-		printf '%s\n' "$count" >"$WAL/count"
-		printf '%s\n' "$(( $(date +%s) + 120 ))" >"$WAL/deadline"
+		printf '%s\n' "$count" >"$WAL/count" && printf '%s\n' "$(( $(date +%s) + 120 ))" >"$WAL/deadline" || fail '不能保存WAL计数和确认期限'
 		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/boot-id" || fail '无法记录事务启动身份'
 		[ -s "$WAL/boot-id" ] || fail '事务启动身份缺失'
 		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
@@ -497,13 +502,14 @@ case "$operation" in
 			elif [ "$?" -ne 1 ]; then failed_stage='concurrent-write'; break; fi
 			old=$(cat "$entry/old")
 			if [ "$present" != "$(cat "$entry/existed")" ] || [ "$current" != "$old" ] || [ "$currenttype" != "$(cat "$entry/type")" ]; then failed_stage='concurrent-write'; break; fi
-			printf 'commit:%s\n' "$key" >"$WAL/stage"; sync
-			: >"$entry/attempted"; sync
+			if ! { printf 'commit:%s\n' "$key" >"$WAL/stage" && sync && printf '%s' '' >"$entry/attempted" && sync; }; then
+				failed_stage='wal-persist'; break
+			fi
 			no_pending && uci_private set "$key=$value" && uci_private commit "${key%%.*}" || { failed_stage=commit; break; }
 		done <"$WAL/candidate"
-		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage"; timeout 15 fw4 check 9>&- >/dev/null 2>&1 || failed_stage='firewall-check'; }
+		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage" && timeout 15 fw4 check 9>&- >/dev/null 2>&1 || failed_stage='firewall-check'; }
 		[ -n "$failed_stage" ] || { services_reload || failed_stage="reload:$service"; }
-		[ -n "$failed_stage" ] || { printf '%s\n' runtime-verify >"$WAL/stage"; verify_runtime || failed_stage='runtime-verify'; }
+		[ -n "$failed_stage" ] || { printf '%s\n' runtime-verify >"$WAL/stage" && verify_runtime || failed_stage='runtime-verify'; }
 		[ -n "$failed_stage" ] || { smartdns_coordinate verify || failed_stage='smartdns-verify'; }
 		if [ -n "$failed_stage" ]; then
 			printf '%s\n' "$failed_stage" >"$WAL/failed-stage"

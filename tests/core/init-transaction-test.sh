@@ -42,7 +42,8 @@ cp "$REAL_LIB/common" "$REAL_LIB/init-transaction" "$tmp/lib/"
 chmod +x "$tmp/lib/init-transaction"
 export TEST_TX_DIR="$tmp" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
-export TEST_NATIVE_UCI_PATH
+TEST_SYNC_BIN=$(command -v sync)
+export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN
 export PATH="$tmp/bin:$PATH"
 TX="$tmp/lib/init-transaction"
 WAL="$tmp/root/etc/routepolicy/state/init-transaction/current"
@@ -133,7 +134,10 @@ case "$1" in
 		printf 'set\tfirewall.rp_init_dns\trule\n'
 		printf 'set\tfirewall.rp_init_dns.name\tinit-dns\n'
 		printf 'set\tfirewall.rp_init_dns.target\tACCEPT\n'
-		[ ! -f "$TEST_TX_DIR/extra-dhcp" ] || printf 'set\tdhcp.lan.ra\tdisabled\n' ;;
+		[ ! -f "$TEST_TX_DIR/extra-dhcp" ] || printf 'set\tdhcp.lan.ra\tdisabled\n'
+		if [ -f "$TEST_TX_DIR/extra-zone" ]; then
+			printf 'set\tfirewall.rp_init_policy\tzone\nset\tfirewall.rp_init_policy.name\trp_init_policy\nset\tfirewall.rp_init_policy.network\tusbwan\nset\tfirewall.rp_init_policy.input\tREJECT\nset\tfirewall.rp_init_policy.output\tACCEPT\nset\tfirewall.rp_init_policy.forward\tDROP\n'
+		fi ;;
 	verify)
 		if [ -f "$TEST_TX_DIR/verify-fail" ]; then printf '%s\n' 'fixture runtime evidence unavailable' >&2; exit 1; fi ;;
 	management-address) cat "$TEST_TX_DIR/db/network.lan.ipaddr" ;;
@@ -147,6 +151,9 @@ case "$1" in
 					else printf foreign >"$TEST_TX_DIR/db/routepolicy.main.lan_interface"; fi ;;
 				absent) printf rule >"$TEST_TX_DIR/db/firewall.rp_init_dns" ;;
 				list) : >"$TEST_TX_DIR/list.network.lan.ipaddr" ;;
+				wal-stage) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/stage" ;;
+				wal-boot) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/boot-id" ;;
+				wal-link) mkdir "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/link-expected-up" ;;
 			esac
 			rm "$TEST_TX_DIR/window-change"
 		fi
@@ -202,6 +209,15 @@ if [ "$5" = up ] && [ -f "$TEST_TX_DIR/link-delay-kill" ]; then
 fi
 case "$5" in up) printf 0x1 >"$ROUTEPOLICY_ROOT/sys/class/net/eth9/flags" ;; down) printf 0x0 >"$ROUTEPOLICY_ROOT/sys/class/net/eth9/flags" ;; *) exit 1 ;; esac
 EOF
+cat >"$tmp/bin/sync" <<'EOF'
+#!/bin/sh
+wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+if [ -f "$TEST_TX_DIR/wal-fault" ] && [ "$(cat "$wal/stage" 2>/dev/null)" = commit:routepolicy.main.lan_interface ]; then
+	fault=$(cat "$TEST_TX_DIR/wal-fault"); rm "$TEST_TX_DIR/wal-fault"
+	case "$fault" in sync) exit 1 ;; attempted) mkdir "$wal/fields/1/attempted" || exit 1 ;; esac
+fi
+exec "$TEST_SYNC_BIN" "$@"
+EOF
 for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 	cat >"$tmp/root/etc/init.d/$service" <<'EOF'
 #!/bin/sh
@@ -224,7 +240,7 @@ reset() {
 	rm -f "$tmp/"list.*
 	rm -f "$tmp/"link-*
 	rm -f "$tmp/guard-delete"
-	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp"
+	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
 	mkdir -p "$tmp/root/etc/config"
 	for config_package in network dhcp firewall routepolicy; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
@@ -258,11 +274,21 @@ restored() {
 }
 bad() { if "$@" >"$tmp/failure" 2>&1; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi; }
 
-if [ "${1:-}" = --native-transaction ]; then
+if [ "${1:-}" = --native-transaction ] || [ "${1:-}" = --native-cas-audit ]; then
 	[ -n "${TEST_UCI_SDK_ROOT:-}" ] || [ -n "$TEST_NATIVE_UCI_PATH" ]
 	export TEST_NATIVE_TRANSACTION=1
 	cat >"$tmp/bin/uci" <<'EOF'
 #!/bin/sh
+native_set=0; native_managed=0
+for native_arg do
+	[ "$native_arg" != set ] || native_set=1
+	case "$native_arg" in rp_*_network.lan.ipaddr=*) native_managed=1 ;; esac
+done
+if [ "$native_set:$native_managed" = 1:1 ] && [ -f "$TEST_TX_DIR/cas-arm" ]; then
+	rm "$TEST_TX_DIR/cas-arm"
+	: >"$TEST_TX_DIR/cas-ready"
+	while [ ! -f "$TEST_TX_DIR/cas-release" ]; do sleep 0.02; done
+fi
 if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
 	exec "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/sbin/uci" -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_TX_DIR/external" "$@"
 fi
@@ -270,6 +296,7 @@ exec "$TEST_NATIVE_UCI_PATH" -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_TX_DIR/
 EOF
 	native_reset() {
 		reset
+		rm -f "$tmp/"cas-*
 		rm -rf "$tmp/external" "$tmp/concurrent"
 		mkdir "$tmp/external" "$tmp/concurrent"
 		printf "config interface 'lan'\n\toption ipaddr '192.0.2.1'\n" >"$tmp/root/etc/config/network"
@@ -280,6 +307,26 @@ EOF
 		native_pkg=${1%%.*}
 		uci -c "$WAL/config" -t "$WAL/read-delta" get "rp_${token}_${native_pkg}${1#"$native_pkg"}"
 	}
+	if [ "${1:-}" = --native-cas-audit ]; then
+		for cas_phase in apply recover; do
+			native_reset; prepare
+			[ "$cas_phase" = apply ] || "$TX" apply "$token" >/dev/null
+			: >"$tmp/cas-arm"
+			if [ "$cas_phase" = apply ]; then "$TX" apply "$token" >"$tmp/cas-command-output" 2>&1 &
+			else "$TX" recover >"$tmp/cas-command-output" 2>&1 & fi
+			cas_owner=$!
+			while [ ! -f "$tmp/cas-ready" ]; do kill -0 "$cas_owner" || { cat "$tmp/cas-command-output"; exit 1; }; sleep 0.02; done
+			uci -t "$tmp/concurrent" set network.lan.ipaddr=192.0.2.99
+			uci -t "$tmp/concurrent" commit network
+			[ "$(native_get network.lan.ipaddr)" = 192.0.2.99 ]
+			: >"$tmp/cas-release"
+			wait "$cas_owner"
+			cas_after=$(native_get network.lan.ipaddr)
+			printf 'CAS AUDIT %s: external committed=192.0.2.99, final=%s, phase=%s\n' "$cas_phase" "$cas_after" "$(cat "$WAL/phase")"
+			[ "$cas_after" != 192.0.2.99 ] || exit 1
+		done
+		exit 0
+	fi
 	native_reset; prepare; "$TX" apply "$token" >/dev/null
 	uci set dhcp.other.leasetime=2h
 	cp "$tmp/external/dhcp" "$tmp/external-original"
@@ -309,6 +356,13 @@ EOF
 	[ "$(native_get routepolicy.main.lan_interface)" = foreign ]
 	[ "$(cat "$WAL/fields/1/old")" = lan ]
 	"$TX" status | grep -Fq '"failed_stage":"concurrent-write"'
+	native_reset; touch "$tmp/extra-zone"; prepare; "$TX" apply "$token" >/dev/null
+	uci -t "$tmp/concurrent" set firewall.rp_init_policy.output=DROP
+	uci -t "$tmp/concurrent" commit firewall
+	printf 192.0.2.2 >"$tmp/db/network.lan.ipaddr"
+	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"
+	phase_is pending
+	"$TX" status | grep -Fq 'prepared candidate differs: firewall.rp_init_policy.output'
 	printf '%s\n' 'native UCI transaction: unrelated/owned pending isolated, sibling recovery continues, prepare baseline frozen (services mocked)'
 	exit 0
 fi
@@ -362,6 +416,28 @@ for window_kind in scalar absent list; do
 	esac
 done
 
+# Reported WAL writes/flush failures must stop before a configuration or link write.
+for wal_kind in wal-stage wal-boot; do
+	reset; prepare; printf '%s\n' "$wal_kind" >"$tmp/window-change"
+	bad "$TX" apply "$token"
+	[ ! -f "$tmp/commits" ]
+	[ ! -f "$tmp/link-log" ]
+	restored
+done
+for wal_kind in sync attempted; do
+	reset; prepare; printf '%s\n' "$wal_kind" >"$tmp/wal-fault"
+	bad "$TX" apply "$token"
+	phase_is rolled_back
+	[ ! -f "$tmp/commits" ]
+	restored
+done
+reset; touch "$tmp/link-enabled"; prepare; printf wal-link >"$tmp/window-change"
+bad "$TX" apply "$token"
+phase_is rolled_back
+[ ! -f "$tmp/commits" ]
+[ ! -f "$tmp/link-log" ]
+[ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
+
 reset; prepare
 touch "$tmp/guard-down"
 bad "$TX" apply "$token"
@@ -378,6 +454,16 @@ cmp "$tmp/expected-stages" "$WAL/smartdns-stages"
 "$TX" apply "$token" >/dev/null
 "$TX" recover >/dev/null
 phase_is confirmed
+
+# Rebuilt topology plans may omit an adopted zone; the original prepared rows remain binding.
+for zone_edit in changed removed; do
+	reset; touch "$tmp/extra-zone"; prepare; "$TX" apply "$token" >/dev/null
+	if [ "$zone_edit" = changed ]; then printf DROP >"$tmp/db/firewall.rp_init_policy.output"
+	else rm "$tmp/db/firewall.rp_init_policy.output"; fi
+	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"
+	phase_is pending
+	"$TX" status | grep -Fq 'prepared candidate differs: firewall.rp_init_policy.output'
+done
 
 # Unrelated same-package pending is neither committed nor discarded; runtime reload is deferred.
 reset; prepare; "$TX" apply "$token" >/dev/null
