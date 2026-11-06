@@ -103,6 +103,8 @@ if [ -f "$TEST_DNS_TMP/kill-confirm" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = 
 fi
 exit 0
 EOF
+# Keep the real planner ownership decision at the transaction/service fixture seam.
+sed -n '/^own_section() {/,/^}/p' "$REAL_LIB/init-topology" >"$tmp/ownership"
 cat >"$tmp/lib/init-topology" <<'EOF'
 #!/bin/sh
 set -eu
@@ -114,17 +116,25 @@ field() { printf '%s\n' "$1" | jsonfilter -e "$2"; }
 ident() { printf '%s\n' "$1" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; }
 fail() { rp_err "$*"; exit 1; }
 set_value() { printf 'set\t%s\t%s\n' "$1" "$2"; }
+. "$TEST_DNS_TMP/ownership"
+operation=$1
 access=lan default_if=wan policy=wan2 access_device=br-lan default_device=eth1 policy_device=eth2
 dns_default=${13:--} dns_policy=${14:--}
 case "$1" in
 	plan)
+		own_section firewall.rp_init_dns
+		set_value firewall.rp_init_dns rule
+		set_value firewall.rp_init_dns.name routepolicy-init-dns
+		set_value firewall.rp_init_dns.src lan
+		set_value firewall.rp_init_dns.target ACCEPT
+		set_value firewall.rp_init_dns.dest_port 53
 		set_value routepolicy.main.enabled 1
 		set_value routepolicy.main.policy_interface wan2
 		init_ipv4_plan
 		init_dns_plan ;;
 	link-plan) printf 'required\t0\n' ;;
 	management-address) uci -q get network.lan.ipaddr ;;
-	verify) : ;;
+	verify) own_section firewall.rp_init_dns ;;
 	*) exit 1 ;;
 esac
 EOF
@@ -355,6 +365,40 @@ restored() {
 	[ "$(cat "$tmp/root/etc/smartdns/user.cache")" = USER-CACHE ]
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 0 ]
 }
+# A discarded preview cannot authorize a later, ordinary user resource.
+printer_rule() {
+	uci set firewall.rp_init_dns=rule
+	uci set 'firewall.rp_init_dns.name=Living Room Printer'
+	uci set firewall.rp_init_dns.target=REJECT; uci set firewall.rp_init_dns.dest_port=9100
+	uci set 'firewall.rp_init_dns.user_note=Keep this printer rule'; uci commit firewall
+	canonical firewall >"$tmp/firewall.before"
+}
+for ownership_phase in prepared expired rolled_back; do
+	baseline 0 0 1 1; prepare
+	case "$ownership_phase" in expired) "$TX" recover >/dev/null ;; rolled_back) "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null ;; esac
+	printer_rule
+	if prepare >"$tmp/ownership-error" 2>&1; then printf 'unapplied/rolled-back plan adopted printer: %s\n' "$ownership_phase" >&2; exit 1; fi
+	if [ "$ownership_phase" = prepared ]; then
+		if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+	fi
+	restored
+	[ "$(uci -q get firewall.rp_init_dns.user_note)" = 'Keep this printer rule' ]
+done
+baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
+SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
+uci set 'firewall.rp_init_dns.user_note=Keep this DNS note'; uci commit firewall
+ownership_active=$(cat "$tmp/root/etc/routepolicy/state/init-transaction/active")
+prepare; "$TX" recover >/dev/null
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/active")" = "$ownership_active" ]
+prepare; "$TX" apply "$token" >/dev/null
+SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
+printf 'ownership-new-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+"$TX" recover-early >/dev/null; "$TX" boot-dns >/dev/null
+prepare; "$TX" apply "$token" >/dev/null
+SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
+[ "$(uci -q get firewall.rp_init_dns.user_note)" = 'Keep this DNS note' ]
+printf '%s\n' 'init section ownership: passed (discarded/prepared/rolled-back rejection, actual applying/pending, active after cancel/reboot, unknown fields)'
+if [ "${1:-}" = --ownership ]; then exit 0; fi
 # Harmless names must remain single configuration-line values across native init.
 for structure_case in newline crlf tab control del trailing-newline; do
 	baseline 0 0 1 1

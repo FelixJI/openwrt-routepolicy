@@ -379,7 +379,8 @@ init_dns_audit_uci_line() {
 		[ "$optional" = 1 ] && return 0
 		rp_err "不能读取 SmartDNS 原生配置字段: $key"; return 1
 	fi
-	clean=$(printf '%s' "$value" | LC_ALL=C tr -d '[:cntrl:]') || return 1
+	# Target BusyBox tr has ranges but no named character classes.
+	clean=$(printf '%s' "$value" | LC_ALL=C tr -d '\000-\037\177') || return 1
 	[ "$value" = "$clean" ] || { rp_err "SmartDNS 原生配置字段包含换行、回车或控制字符: $key；原值已保留"; return 1; }
 }
 init_dns_audit_uci_structure() {

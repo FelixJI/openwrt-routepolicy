@@ -446,10 +446,11 @@ rp_smartdns_init_probes() {
 }
 
 # A confirmed DNS contract survives replacement of the reviewable candidate WAL.
-rp_init_active_record() {
+rp_init_confirmed_record() {
+	case "$1" in active|source) ;; *) return 1 ;; esac
 	active_tx="$RP_STATE_DIR/init-transaction"
-	[ ! -L "$active_tx" ] && [ -f "$active_tx/active" ] && [ ! -L "$active_tx/active" ] || return 1
-	active_token=$(cat "$active_tx/active") || return 1
+	[ ! -L "$active_tx" ] && [ -f "$active_tx/$1" ] && [ ! -L "$active_tx/$1" ] || return 1
+	active_token=$(cat "$active_tx/$1") || return 1
 	[ "${#active_token}" = 32 ] || return 1
 	case "$active_token" in *[!0-9a-f]*) return 1 ;; esac
 	active_record="$active_tx/confirmed-$active_token"
@@ -457,6 +458,38 @@ rp_init_active_record() {
 		[ "$(cat "$active_record/token")" = "$active_token" ] && [ "$(cat "$active_record/phase")" = confirmed ] || return 1
 	printf '%s\n' "$active_record"
 }
+rp_init_active_record() { rp_init_confirmed_record active; }
+rp_init_source_record() { rp_init_confirmed_record source; }
+rp_init_section_owned() (
+	section_key=$1 section_type=$2
+	section_active=$(rp_init_active_record) || section_active=
+	section_source=$(rp_init_source_record) || section_source=
+	for section_record in "$RP_STATE_DIR/init-transaction/current" "$section_active" "$section_source"; do
+		[ -n "$section_record" ] && [ -d "$section_record" ] && [ ! -L "$section_record" ] || continue
+		[ -f "$section_record/phase" ] && [ ! -L "$section_record/phase" ] || continue
+		case "$(cat "$section_record/phase")" in
+			pending|confirming|confirmed) ;;
+			applying)
+				# This existing stage follows all successful field commits, before the
+				# real planner verifies the runtime. attempted alone precedes commit.
+				[ -f "$section_record/stage" ] && [ ! -L "$section_record/stage" ] && [ "$(cat "$section_record/stage")" = runtime-verify ] || continue ;;
+			*) continue ;;
+		esac
+		[ -f "$section_record/candidate" ] && [ ! -L "$section_record/candidate" ] && [ -d "$section_record/fields" ] && [ ! -L "$section_record/fields" ] || continue
+		# Candidate rows locate entries only; actual applied field evidence authorizes them.
+		section_entries=$(awk -F '\t' -v key="$section_key" -v type="$section_type" '$1=="set"&&$2==key&&$3==type{print NR}' "$section_record/candidate") || continue
+		for section_index in $section_entries; do
+			section_entry="$section_record/fields/$section_index"
+			[ -d "$section_entry" ] && [ ! -L "$section_entry" ] || continue
+			for section_file in key expected expected-type attempted; do
+				[ -f "$section_entry/$section_file" ] && [ ! -L "$section_entry/$section_file" ] || continue 2
+			done
+			[ "$(cat "$section_entry/key")" = "$section_key" ] && [ "$(cat "$section_entry/expected")" = "$section_type" ] && [ "$(cat "$section_entry/expected-type")" = scalar ] && exit 0
+		done
+	done
+	exit 1
+)
+
 rp_dns_boot_pending() {
 	[ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ] && return 0
 	active_pending=$(rp_init_active_record) || return 1

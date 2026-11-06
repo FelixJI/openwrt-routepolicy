@@ -251,13 +251,10 @@ link_unclaimed() {
 own_section() {
 	local existing
 	existing=$(get "$1")
-	# A pre-existing object is never adopted on the strength of its prefix alone.
-	[ -z "$existing" ] || [ "$operation" != plan ] || {
-		# Only a section present in our preceding journal is eligible for reinitialization.
-		local journal="$RP_STATE_DIR/init-transaction/current/candidate"
-		[ -f "$journal" ] && [ ! -L "$journal" ] && awk -F '\t' -v key="$1" -v type="$existing" '$1=="set"&&$2==key&&$3==type{found=1}END{exit !found}' "$journal" || fail "reserved section already exists: $1"
-	}
+	# A preview, prefix or marker cannot adopt a pre-existing user resource.
+	[ -z "$existing" ] || rp_init_section_owned "$1" "$existing" || fail "reserved section already exists: $1; no applied ownership evidence（无法证明已应用归属，配置已保留）"
 }
+
 check_rp_filter() {
 	local global device specific effective
 	global=$(cat "$RP_ROOT/proc/sys/net/ipv4/conf/all/rp_filter" 2>/dev/null) || fail 'cannot inspect global rp_filter'

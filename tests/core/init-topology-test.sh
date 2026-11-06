@@ -148,6 +148,7 @@ exit 0
 EOF
 chmod +x "$tmp/bin/"*
 baseline() {
+	rm -rf "$tmp/root/etc/routepolicy/state/init-transaction"
 	cat >"$tmp/config" <<'EOF'
 network.lan	interface
 network.lan.proto	static
@@ -259,6 +260,18 @@ reject() {
 	if "$@" >"$tmp/rejected" 2>"$tmp/error"; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi
 }
 apply_mock_plan() {
+	# The mock commit publishes the same section-field evidence as an applied WAL.
+	mock_wal="$tmp/root/etc/routepolicy/state/init-transaction/current"
+	mkdir -p "$mock_wal/fields"; cp "$1" "$mock_wal/candidate"
+	printf 'pending\n' >"$mock_wal/phase"
+	mock_index=0
+	while IFS="$(printf '\t')" read -r mock_action mock_key mock_value; do
+		mock_index=$((mock_index+1))
+		case "$mock_action:$mock_key" in set:*.*.*|delete:*|list:*) continue ;; esac
+		mock_entry="$mock_wal/fields/$mock_index"; mkdir -p "$mock_entry"
+		printf '%s' "$mock_key" >"$mock_entry/key"; printf '%s' "$mock_value" >"$mock_entry/expected"
+		printf scalar >"$mock_entry/expected-type"; : >"$mock_entry/attempted"
+	done <"$1"
 	awk -F '\t' '$1=="set"{print $2 "\t" $3}' "$1" >>"$tmp/config"
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
@@ -275,6 +288,20 @@ multidevice_config() {
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
 }
+# A candidate with no committed section fields is never ownership evidence.
+for ownership_phase in prepared expired rolled_back applying pending; do
+	baseline
+	"$tool" plan lan wan policy >"$tmp/preview"
+	wal="$tmp/root/etc/routepolicy/state/init-transaction/current"
+	mkdir -p "$wal/fields"; cp "$tmp/preview" "$wal/candidate"
+	printf '%s\n' "$ownership_phase" >"$wal/phase"
+	printf 'firewall.rp_init_dns\trule\nfirewall.rp_init_dns.name\tLiving Room Printer\nfirewall.rp_init_dns.dest_port\t9100\nfirewall.rp_init_dns.target\tREJECT\n' >>"$tmp/config"
+	cp "$tmp/config" "$tmp/before"
+	reject "$tool" plan lan wan policy
+	grep -Fq 'reserved section already exists: firewall.rp_init_dns' "$tmp/error"
+	cmp "$tmp/config" "$tmp/before"
+done
+printf '%s\n' 'topology section provenance: passed (unwritten previews cannot adopt printer rules)'
 baseline
 cp "$tmp/config" "$tmp/before"
 "$tool" discover >"$tmp/discover"
