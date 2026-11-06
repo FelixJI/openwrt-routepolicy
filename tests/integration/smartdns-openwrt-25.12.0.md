@@ -50,6 +50,8 @@ OpenWrt 官方 46.1 init 的 bind_device=1、bind_device_name=lo 会生成重复
 
 ## 证据
 
-原始实验资料位于隔离主机的 /tmp/routepolicy-lab-17/lab18/，包含 README.md、cache-stage-counts.json、upstream.jsonl、capture-summary.json、原始 pcap，以及 versions-upstream/ 和 fork-c27671b/ 中的兼容输出及版本资产信息。实验只操作自建来宾与临时数据。
+上述历史能力实验的原始资料曾位于隔离主机的 `/tmp/routepolicy-lab-17/lab18/`，已在 2026-11-06 的 WSL 重启中丢失。本节保留当时的版本与观察记录，不将已丢失的原始资料作为当前应用验收通过的证据；版本对照仍按用户授权作为非阻断参考。
+
+重建后的官方 46.1 应用验收使用持久目录 `/var/tmp/routepolicy18-recovery-lab/`，并另行导出 Windows TEMP。每轮记录固定提交、实际 APK 安装、原始配置、服务状态与抓包；失败现场也保留。[PR #23 的分阶段证据记录](https://github.com/FelixJI/openwrt-routepolicy/pull/23#issuecomment-6682200580) 明确区分已通过和待补项目。实验只操作自建隔离来宾与临时数据。
 
 应用初始化、恢复和生命周期测试需绑定其最终提交单独记录；上述能力检查不替代这些验收。
