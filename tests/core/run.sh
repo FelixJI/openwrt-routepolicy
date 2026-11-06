@@ -10,6 +10,7 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/init-transaction-test.sh"
 "$HERE/init-dns-test.sh"
 sh "$HERE/init-dns-listener-test.sh"
+sh "$HERE/init-dns-include-test.sh"
 "$HERE/status-contract-test.sh"
 "$HERE/observe-contract-test.sh"
 "$HERE/warm-state-test.sh"

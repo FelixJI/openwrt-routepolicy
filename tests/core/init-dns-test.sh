@@ -320,6 +320,27 @@ restored() {
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 0 ]
 }
 # Exercise every enabled/running combination for both pre-existing services.
+baseline 0 0 1 1
+include="$tmp/root/etc/smartdns/custom-a.conf"
+child="$tmp/root/etc/smartdns/nested child.conf"
+printf 'server 203.0.113.53 -group rp_init_policy\n' >"$include"
+cp "$include" "$tmp/include.before"
+if prepare >"$tmp/include-error" 2>&1; then exit 1; fi
+cmp "$tmp/include.before" "$include"
+printf "conf-file 'nested child.conf'\n" >"$include"
+printf 'server 203.0.113.53 --gr=rp_init_default\n' >"$child"
+cp "$child" "$tmp/child.before"
+if prepare >"$tmp/include-error" 2>&1; then exit 1; fi
+cmp "$tmp/child.before" "$child"
+printf 'server 203.0.113.53 -group ordinary\n' >"$child"
+prepare
+printf 'server 203.0.113.53 -grp_init_policy\n' >"$child"
+cp "$child" "$tmp/child.before"
+if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+[ "$(find "$tmp/root/etc/routepolicy/state/init-transaction/current/fields" -name attempted | wc -l)" = 0 ]
+cmp "$tmp/child.before" "$child"; restored
+printf '%s\n' 'init DNS include preflight: passed (prepare and pre-write recheck, no UCI/file changes)'
+if [ "${1:-}" = --include-audit ]; then exit 0; fi
 matrix_count=0
 if [ "${1:-}" != --boot-smoke ] && [ "${1:-}" != --quiesce-smoke ] && [ "${1:-}" != --lifecycle-smoke ] && [ "${1:-}" != --restore-smoke ]; then
 for se in 0 1; do for sr in 0 1; do for de in 0 1; do for dr in 0 1; do
@@ -448,7 +469,7 @@ rm "$tmp/query-fail"
 # Drive retries through the real S94 entry and its supervised guard command.
 guard_entry() {
 	guard_pid=
-	ROUTEPOLICY_INIT_TRANSACTION=$TX
+	export ROUTEPOLICY_INIT_TRANSACTION=$TX
 	. "$ROOT/routepolicy/files/etc/init.d/routepolicy-initguard"
 	procd_open_instance() { :; }
 	procd_set_param() { [ "$1" != command ] || guard_command=$2; }

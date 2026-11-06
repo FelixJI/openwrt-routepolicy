@@ -402,6 +402,8 @@ policy_runtime_present() {
 }
 policy_sync() {
 	policy_mode=${1:-apply}
+	policy_log=policy
+	[ "$policy_mode" != restore ] || policy_log=policy-restore
 	if ! policy_required=$(cat "$WAL/policy-active" 2>/dev/null); then
 		policy_required=$(uci_committed get routepolicy.main.enabled) || return 1
 		[ "$policy_required" != 1 ] || policy_runtime_present || return 1
@@ -409,7 +411,7 @@ policy_sync() {
 	case "$policy_required" in 0|1) ;; *) return 1 ;; esac
 	if [ "$policy_required" = 0 ]; then
 		if [ "$policy_mode" = restore ]; then
-			[ ! -f "$WAL/policy-attempted" ] || ROUTEPOLICY_INIT_RESTORE=1 timeout -k 2 30 sh -c 'exec 9>&-; exec "$1" teardown' routepolicy-policy-restore "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || return 1
+			[ ! -f "$WAL/policy-attempted" ] || ROUTEPOLICY_INIT_RESTORE=1 timeout -k 2 30 sh -c 'exec 9>&-; exec "$1" teardown' routepolicy-policy-restore "$LIBEXEC/apply" >"$WAL/policy-restore-result" 2>"$WAL/policy-restore-error" || return 1
 			return 0
 		fi
 		# A DNS initialization activates policy routing in this same transaction.
@@ -438,7 +440,7 @@ policy_sync() {
 	while [ -d "$RP_RUN_DIR/apply.lock" ]; do
 		policy_wait_now=$(monotonic_now) || return 1
 		if [ "$policy_wait_now" -ge "$((policy_wait_started + policy_timeout * 100))" ]; then
-			printf '%s\n' 'existing RoutePolicy apply is busy; its lock was preserved' >"$WAL/policy-error"; return 1
+			printf '%s\n' 'existing RoutePolicy apply is busy; its lock was preserved' >"$WAL/$policy_log-error"; return 1
 		fi
 		sleep 1
 	done
@@ -451,9 +453,9 @@ policy_sync() {
 	else init_dns_coordinate policy-prepare || return 1; fi
 	printf '%s' '' >"$WAL/policy-attempted" && sync || return 1
 	# The finite supervisor owns FD9; the policy writer and its service children never inherit it.
-	ROUTEPOLICY_DNS_DEFER="$( init_dns_owned && printf 1 || printf 0 )" ROUTEPOLICY_INIT_RESTORE="$( [ "$policy_mode" = restore ] && printf 1 || printf 0 )" ROUTEPOLICY_INIT_GENERATION="$(cat "$WAL/token")" ROUTEPOLICY_OUTPUT=text timeout -k 2 "$policy_timeout" sh -c 'exec 9>&-; exec "$1"' routepolicy-policy-sync "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || return 1
+	ROUTEPOLICY_DNS_DEFER="$( init_dns_owned && printf 1 || printf 0 )" ROUTEPOLICY_INIT_RESTORE="$( [ "$policy_mode" = restore ] && printf 1 || printf 0 )" ROUTEPOLICY_INIT_GENERATION="$(cat "$WAL/token")" ROUTEPOLICY_OUTPUT=text timeout -k 2 "$policy_timeout" sh -c 'exec 9>&-; exec "$1"' routepolicy-policy-sync "$LIBEXEC/apply" >"$WAL/$policy_log-result" 2>"$WAL/$policy_log-error" || return 1
 	if ! policy_verify_runtime; then
-		printf '%s\n' 'RoutePolicy policy table does not match the selected interface/gateway' >"$WAL/policy-error"
+		printf '%s\n' 'RoutePolicy policy table does not match the selected interface/gateway' >"$WAL/$policy_log-error"
 		return 1
 	fi
 }
@@ -677,6 +679,7 @@ status_json() {
 	if [ -s "$WAL/link-error" ]; then printf ',"link_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-error")")"; fi
 	if [ -s "$WAL/link-restore-error" ]; then printf ',"link_restore_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-restore-error")")"; fi
 	if [ -s "$WAL/policy-error" ]; then printf ',"policy_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/policy-error")")"; fi
+	if [ -s "$WAL/policy-restore-error" ]; then printf ',"policy_restore_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/policy-restore-error")")"; fi
 	if status_active=$(rp_init_active_record); then
 		status_dns=ready
 		status_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || status_boot=-

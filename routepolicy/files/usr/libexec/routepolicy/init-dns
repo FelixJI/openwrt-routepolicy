@@ -163,6 +163,7 @@ init_dns_plan() {
 	files=$(printf '%s\n' "$files" | tr '|' '\n' | awk '$0!="/etc/smartdns/conf.d/90-routepolicy.conf"&&NF' | tr '\n' '|'); files=${files%|}
 	case "|$files|" in *'|/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf|'*) ;; *) files="${files:+$files|}/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf" ;; esac
 	files="$files|/etc/smartdns/conf.d/90-routepolicy.conf"
+	init_dns_audit_user_files "$files" "$access_device" || fail '用户 SmartDNS include 占用保留上游组或含无法安全审计的语法；文件已保留，请先手工处理'
 	printf 'list\tsmartdns.%s.conf_files\t%s\n' "$root" "$files"
 	set_value routepolicy.main.smartdns_enabled 1
 	set_value routepolicy.main.smartdns_policy_group rp_init_policy
@@ -288,23 +289,74 @@ init_dns_original_probe() {
 	[ "$mode" != save ] || mv "$endpoints.new" "$endpoints"
 }
 init_dns_audit_binds() {
-	local config=$1 depth=$2 port=$3 device=$4 includes include
+	local config=$1 depth=$2 port=$3 device=$4 user=${5:-0} includes include child
 	[ "$depth" -lt 16 ] && [ -f "$config" ] || return 1
-	# Also inspect loaded user includes: a second wildcard bind defeats device isolation.
-	includes=$(awk -v port="$port" -v device="$device" '
-		$1~/^#/ {next}
-		$1~/^bind/ {if($1!~/^bind(-tcp)?$/||($2!=":" port "@lo"&&$2!=":" port "@" device)||$3!="-group"||$4!="rp_init_default")bad=1}
-		$1=="conf-file"||$1=="conf_file" {
-			line=$0;sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/,"",line)
-			q=substr(line,1,1);if(q==sprintf("%c",39)||q=="\""){if(substr(line,length(line),1)!=q){bad=1;next}line=substr(line,2,length(line)-2)}
-			if(line!~/^\//||line~/[[:cntrl:]]/)bad=1;else print line
+	# Native getopt_long_only also accepts -gVALUE, --gr=VALUE and quoted arguments.
+	# Reject escapes/continuations and ambiguous quoting instead of guessing native parsing.
+	includes=$(awk -v port="$port" -v device="$device" -v user="$user" '
+		function tokens(line, i,c,q,word,n,started,closed,k) {
+			for(k in arg)delete arg[k]
+			for(i=1;i<=length(line);i++) {
+				c=substr(line,i,1)
+				if(q!=""){if(c==q){q="";closed=1}else word=word c;continue}
+				if(c~/[ \t]/){if(started){arg[++n]=word;word="";started=closed=0}continue}
+				if(closed)return 0
+				if(c=="\""||c==sprintf("%c",39)){if(started)return 0;q=c;started=1;continue}
+				word=word c;started=1
+			}
+			if(q!="")return 0
+			if(started)arg[++n]=word
+			return n
 		}
-		END{exit bad}' "$config") || return 1
+		/^[ \t]*($|#)/ {next}
+		{
+			line=$0;sub(/\r$/,"",line);clean=line;gsub(/\t/,"",clean)
+			if(length(line)>4095||index(line,"\\")||clean~/[[:cntrl:]]/){bad=1;next}
+			key=$1
+			if(key!~/^server/&&key!~/^bind/&&key!~/^group-/&&key!="conf-file"&&key!="conf_file")next
+			n=tokens(line);if(!n){bad=1;next}
+			if(user&& (key~/^server/||key=="group-begin"||key=="conf-file"||key=="conf_file")) {
+				for(i=2;i<=n;i++) {
+					value=arg[i];sub(/^.*=/,"",value)
+					if(value~/^rp_init_(default|policy)$/||arg[i]~/^-[A-Za-z]*grp_init_(default|policy)$/)bad=1
+				}
+			}
+			if(key~/^bind/&&(key!~/^bind(-tcp)?$/||(arg[2]!=":" port "@lo"&&arg[2]!=":" port "@" device)||arg[3]!="-group"||arg[4]!="rp_init_default"))bad=1
+			if(key=="conf-file"||key=="conf_file"){if(n<2||arg[2]==""||arg[2]~/[[:cntrl:]]/)bad=1;else print arg[2]}
+		}
+		END{exit bad}' "$config") || { rp_err "SmartDNS include 审计失败: $config"; return 1; }
 	[ -n "$includes" ] || return 0
 	while IFS= read -r include; do
-		init_dns_audit_binds "$RP_ROOT$include" "$((depth+1))" "$port" "$device" || return 1
+		case "$include" in *'*'*|*'?'*|*'['*|*']'*) rp_err 'SmartDNS include 通配路径无法安全审计，请改为明确文件'; return 1 ;; esac
+		case "$include" in /*) child="$RP_ROOT$include" ;; *) child="$(dirname "$config")/$include" ;; esac
+		# Native glob ignores missing paths and directories.
+		[ -f "$child" ] || { [ ! -e "$child" ] || [ -d "$child" ]; } || return 1
+		[ ! -f "$child" ] || init_dns_audit_binds "$child" "$((depth+1))" "$port" "$device" 1 || return 1
 	done <<EOF
 $includes
+EOF
+}
+init_dns_audit_user_files() {
+	local files=$1 device=$2 include exported sections section enabled data
+	# Native init also loads enabled client-rule includes and these three fixed files.
+	exported=$(uci -q export smartdns) || return 1
+	sections=$(uci -q show smartdns | sed -n 's/^smartdns\.\([^.=]*\)=client-rule$/\1/p')
+	for section in $sections; do
+		enabled=$(uci -q get "smartdns.$section.enabled") || enabled=0
+		case "$enabled" in 1|on|true|yes|enabled) ;; *) continue ;; esac
+		if data=$(printf '%s\n' "$exported" | rp_uci_field_data "$section" conf_files); then files="$files|${data#*"$(printf '\t')"}"
+		else [ -z "$(uci -q get "smartdns.$section.conf_files")" ] || return 1; fi
+	done
+	files="$files|/etc/smartdns/address.conf|/etc/smartdns/blacklist-ip.conf|/etc/smartdns/custom.conf"
+	while IFS= read -r include; do
+		[ -n "$include" ] || continue
+		case "$include" in /*) ;; *) include="/etc/smartdns/conf.d/$include" ;; esac
+		# Native init wraps these paths in single quotes before native argument parsing.
+		case "$include" in *"'"*|*'\'*) rp_err 'SmartDNS conf_files 引号或转义路径无法安全审计'; return 1 ;; esac
+		case "$include" in *'*'*|*'?'*|*'['*|*']'*) rp_err 'SmartDNS conf_files 通配路径无法安全审计，请改为明确文件'; return 1 ;; esac
+		[ ! -f "$RP_ROOT$include" ] || init_dns_audit_binds "$RP_ROOT$include" 0 53 "$device" 1 || return 1
+	done <<EOF
+$(printf '%s\n' "$files" | tr '|' '\n')
 EOF
 }
 
@@ -346,6 +398,8 @@ init_dns_coordinate() {
 			printf '%s\n' "$enabled" >"$WAL/routepolicy-enabled"
 			;;
 		quiesce)
+			section=$(awk -F '\t' '$1=="list"&&$2~/^smartdns\.[^.]+\.conf_files$/ {print $3;exit}' "$WAL/candidate")
+			init_dns_audit_user_files "$section" "$(awk -F '\t' '$2~/^smartdns\.[^.]+\.bind_device_name$/ {print $3;exit}' "$WAL/candidate")" || return 1
 			for service in smartdns dnsmasq; do
 				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
 			done

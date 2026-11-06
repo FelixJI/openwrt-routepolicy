@@ -272,7 +272,8 @@ mkdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock" || exit 1
 trap 'rmdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock"' EXIT
 policy=$(cat "$TEST_TX_DIR/db/routepolicy.main.policy_interface")
 printf '%s\n' "$policy" >>"$TEST_TX_DIR/policy-apply-calls"
-if { [ "$policy" = wan2 ] && [ -f "$TEST_TX_DIR/policy-apply-fail" ]; } || { [ "$policy" = usbwan ] && [ -f "$TEST_TX_DIR/policy-restore-fail" ]; }; then printf '%s\n' 'fixture policy apply failed' >&2; exit 1; fi
+printf 'fixture policy output: %s\n' "$policy"
+if { [ "$policy" = wan2 ] && [ -f "$TEST_TX_DIR/policy-apply-fail" ]; } || { [ "$policy" = usbwan ] && [ -f "$TEST_TX_DIR/policy-restore-fail" ]; }; then printf 'fixture policy %s failed\n' "$policy" >&2; exit 1; fi
 [ -f "$TEST_TX_DIR/policy-route-stale" ] || printf '%s' "$policy" >"$TEST_TX_DIR/runtime-policy"
 device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
 printf 'schema=1\nroute_table=200\npolicy_interface=%s\npolicy_device=%s\n' "$policy" "$device" >"$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied"
@@ -468,7 +469,18 @@ policy_runtime_tests() {
 		[ "$(cat "$tmp/runtime-policy")" = usbwan ]
 		[ "$(cat "$tmp/db/routepolicy.main.policy_interface")" = usbwan ]
 		"$TX" status | grep -Fq '"failed_stage":"policy-runtime"'
+		if [ "$policy_fault" = policy-apply-fail ]; then
+			grep -Fxq 'fixture policy wan2 failed' "$WAL/policy-error"
+			grep -Fxq 'fixture policy output: wan2' "$WAL/policy-result"
+			grep -Fxq 'fixture policy output: usbwan' "$WAL/policy-restore-result"
+			"$TX" status | grep -Fq 'fixture policy wan2 failed'
+		fi
 	done
+	reset; enable_policy_fixture; touch "$tmp/policy-apply-fail" "$tmp/policy-restore-fail"; prepare_policy
+	bad "$TX" apply "$token"; phase_is conflict
+	grep -Fxq 'fixture policy wan2 failed' "$WAL/policy-error"
+	grep -Fxq 'fixture policy usbwan failed' "$WAL/policy-restore-error"
+	"$TX" status | grep -Fq '"policy_restore_error":"fixture policy usbwan failed'
 	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
 	printf usbwan >"$tmp/runtime-policy"
 	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"; phase_is pending
