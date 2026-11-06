@@ -357,9 +357,21 @@ grep -Fxq import "$tmp/uci.log"
 
 # Initialization's persistent lock and pending phase exclude independent writes.
 mkdir -p "$tmp/root/etc/routepolicy/state/init-transaction/current"
-for phase in prepared applying pending rolling_back conflict; do
+for phase in prepared applying pending rolling_back conflict confirming; do
 	printf '%s\n' "$phase" >"$tmp/root/etc/routepolicy/state/init-transaction/current/phase"
 	if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
 	grep -Fq '初始化事务' "$tmp/locked.json"
 done
+printf confirmed >"$tmp/root/etc/routepolicy/state/init-transaction/current/phase"
+: >"$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
+if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
+grep -Fq '初始化事务' "$tmp/locked.json"
+rm "$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
+token=11111111111111111111111111111111
+record="$tmp/root/etc/routepolicy/state/init-transaction/confirmed-$token"
+mkdir "$record"; printf '%s\n' "$token" >"$record/token"
+printf confirmed >"$record/phase"; : >"$record/dns-boot-pending"
+printf '%s\n' "$token" >"$tmp/root/etc/routepolicy/state/init-transaction/active"
+if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
+grep -Fq '初始化事务' "$tmp/locked.json"
 printf '%s\n' 'SmartDNS management tests: passed'

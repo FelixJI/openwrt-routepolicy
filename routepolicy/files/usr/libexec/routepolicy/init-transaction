@@ -34,6 +34,63 @@ lock() {
 	if [ ! -e "$WAL" ] && [ -d "$TX/previous" ]; then
 		mv "$TX/previous" "$WAL" && sync || fail '不能恢复准备事务记录'
 	fi
+	if [ "${operation:-}" = recover-early ]; then
+		case "$(read_phase)" in confirmed|confirming)
+			if init_dns_managed; then init_dns_coordinate quarantine-boot || fail '不能隔离已确认或提升中的 DNS 自启动'; fi ;;
+		esac
+	fi
+	if [ -e "$TX/active" ] || [ -L "$TX/active" ]; then rp_init_active_record >/dev/null || fail '已确认接管合同路径或内容不安全'; fi
+	# Recover an interrupted confirmation before any caller may consume active.
+	case "$(read_phase)" in
+		confirming) active_publish || fail '接管合同提升中断；保留确认记录等待恢复' ;;
+		confirmed)
+			if init_dns_owned; then active_publish || fail '不能收敛已有确认接管合同'; fi ;;
+	esac
+	if [ -e "$TX/active" ] || [ -L "$TX/active" ]; then rp_init_active_record >/dev/null || fail '已确认接管合同路径或内容不安全'; fi
+}
+active_publish() {
+	# shellcheck disable=SC3043
+	local token record stage item prior source
+	token=$(cat "$WAL/token") || return 1
+	[ "${#token}" = 32 ] || return 1
+	case "$token" in *[!0-9a-f]*) return 1 ;; esac
+	record="$TX/confirmed-$token"; stage="$WAL/confirmed-record"
+	[ ! -L "$record" ] && [ ! -L "$stage" ] && [ ! -L "$TX/active" ] && [ ! -L "$TX/source" ] && [ ! -L "$TX/active.new" ] && [ ! -L "$TX/source.new" ] || return 1
+	if [ ! -e "$record" ]; then
+		[ ! -e "$stage" ] || { [ -d "$stage" ] && [ -z "$(find "$stage" -type l)" ] && rm -rf "$stage"; } || return 1
+		mkdir "$stage" || return 1
+		# Keep the existing field/file provenance, without private UCI deltas or DNS caches.
+		for item in candidate parameters token boot-id count baseline fields policy-active policy-attempted smartdns-enabled smartdns-running dnsmasq-enabled dnsmasq-running routepolicy-enabled smartdns-listeners dnsmasq-listeners dns-file-old dns-file-absent dns90-old dns90-absent dns-active-old dns-boot-pending dns-boot-ready failed-stage; do
+			[ ! -L "$WAL/$item" ] || return 1
+			[ ! -e "$WAL/$item" ] || cp -pR "$WAL/$item" "$stage/$item" || return 1
+		done
+		printf 'confirmed\n' >"$stage/phase" && sync && mv "$stage" "$record" && sync || return 1
+	fi
+	[ -d "$record" ] && [ "$(cat "$record/token")" = "$token" ] && [ "$(cat "$record/phase")" = confirmed ] || return 1
+	if [ ! -e "$TX/source" ]; then
+		printf '%s\n' "$token" >"$TX/source.new" && mv "$TX/source.new" "$TX/source" && sync || return 1
+	fi
+	source=$(cat "$TX/source") || return 1
+	[ "${#source}" = 32 ] || return 1
+	case "$source" in *[!0-9a-f]*) return 1 ;; esac
+	[ -d "$TX/confirmed-$source" ] && [ ! -L "$TX/confirmed-$source" ] && [ ! -L "$TX/confirmed-$source/token" ] && [ ! -L "$TX/confirmed-$source/phase" ] &&
+		[ "$(cat "$TX/confirmed-$source/token")" = "$source" ] && [ "$(cat "$TX/confirmed-$source/phase")" = confirmed ] || return 1
+	if [ ! -f "$WAL/prior-active" ]; then
+		prior=$(cat "$TX/active" 2>/dev/null) || prior=-
+		printf '%s\n' "$prior" >"$WAL/prior-active" && sync || return 1
+	fi
+	# This atomic pointer replacement is the sole durable confirmation commit point.
+	printf '%s\n' "$token" >"$TX/active.new" && mv "$TX/active.new" "$TX/active" && sync && phase confirmed || return 1
+	rm -f "$WAL/dns-boot-pending" || return 1
+	prior=$(cat "$WAL/prior-active") || return 1
+	if [ "$prior" != - ] && [ "$prior" != "$token" ] && [ "$prior" != "$source" ]; then
+		[ "${#prior}" = 32 ] || return 1
+		case "$prior" in *[!0-9a-f]*) return 1 ;; esac
+		if [ -e "$TX/confirmed-$prior" ] || [ -L "$TX/confirmed-$prior" ]; then
+			[ ! -L "$TX/confirmed-$prior" ] && [ "$(cat "$TX/confirmed-$prior/token")" = "$prior" ] && [ "$(cat "$TX/confirmed-$prior/phase")" = confirmed ] || return 1
+			rm -rf "$TX/confirmed-$prior" || return 1
+		fi
+	fi
 }
 uci_layout() {
 	namespace_token=$(cat "$WAL/token") || return 1
@@ -478,9 +535,10 @@ guard_stop_if_inactive() (
 	exec 9>"$TX/lock"
 	flock -n 9 || exit 1
 	case "$(read_phase)" in
-		applying|rolling_back|pending) exit 1 ;;
+		applying|rolling_back|pending|confirming) exit 1 ;;
 		prepared) pending_recovery_due || exit 1 ;;
 	esac
+	! rp_dns_boot_pending || exit 1
 	ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' 9>&- >/dev/null 2>&1
 )
 rollback_fields() {
@@ -619,10 +677,21 @@ status_json() {
 	if [ -s "$WAL/link-error" ]; then printf ',"link_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-error")")"; fi
 	if [ -s "$WAL/link-restore-error" ]; then printf ',"link_restore_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/link-restore-error")")"; fi
 	if [ -s "$WAL/policy-error" ]; then printf ',"policy_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/policy-error")")"; fi
+	if status_active=$(rp_init_active_record); then
+		status_dns=ready
+		status_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || status_boot=-
+		if [ "$(cat "$status_active/boot-id" 2>/dev/null)" != "$status_boot" ] && [ "$(cat "$status_active/dns-boot-ready" 2>/dev/null)" != "$status_boot" ]; then status_dns=waiting_for_boot_recovery; fi
+		if [ -f "$status_active/dns-boot-pending" ]; then status_dns=pending; fi
+		status_failure=$(cat "$status_active/failed-stage" 2>/dev/null) || status_failure=
+		case "$status_failure:$status_dns" in boot-*:pending) status_dns=retrying ;; esac
+		printf ',"active":{"token":"%s","dns_boot_state":"%s","failed_stage":"%s"}' \
+			"$(rp_json_escape "$(cat "$status_active/token")")" "$status_dns" "$(rp_json_escape "$status_failure")"
+	fi
 	printf '}\n'
 }
-boot_dns_locked() {
-	[ "$(read_phase)" = confirmed ] && [ -f "$WAL/dns-boot-pending" ] || return 0
+boot_dns_locked() (
+	WAL=$(rp_init_active_record) || return 0
+	[ -f "$WAL/dns-boot-pending" ] || return 0
 	boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 1
 	[ "$(cat "$WAL/dns-boot-pending")" = "$boot_now" ] && init_dns_managed || return 1
 	load_args && uci_layout && no_pending || return 1
@@ -641,7 +710,17 @@ boot_dns_locked() {
 	}
 	case "$(cat "$WAL/failed-stage" 2>/dev/null || true)" in boot-*) rm -f "$WAL/failed-stage" ;; esac
 	printf '%s\n' "$boot_now" >"$WAL/dns-boot-ready.new" && mv "$WAL/dns-boot-ready.new" "$WAL/dns-boot-ready" && rm -f "$WAL/dns-boot-pending" && sync
-}
+)
+active_boot_early() (
+	WAL=$(rp_init_active_record) || return 0
+	if ! transaction_same_boot && init_dns_managed; then
+		boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 1
+		if [ "$(cat "$WAL/dns-boot-ready" 2>/dev/null || true)" != "$boot_now" ]; then
+			init_dns_coordinate quarantine-boot || return 1
+			printf '%s\n' "$boot_now" >"$WAL/dns-boot-pending" && sync || return 1
+		fi
+	fi
+)
 
 operation=${1:-}; [ "$#" -eq 0 ] || shift
 case "$operation" in
@@ -659,6 +738,7 @@ case "$operation" in
 	prepare)
 		args_valid "$@" || fail '初始化参数非法'
 		lock
+		! rp_dns_boot_pending || fail '已确认接管的启动恢复尚未完成，请稍后重试初始化'
 		case "$(read_phase)" in absent|prepared|confirmed|rolled_back) ;; *) fail '存在未完成事务；请先恢复' ;; esac
 		no_pending || fail '存在外部 UCI pending changes'
 		candidate=$(make_plan "$@") || fail '拓扑预检失败'
@@ -804,23 +884,26 @@ case "$operation" in
 		no_pending && verify_runtime || fail '服务或规则运行证据不满足确认条件'
 		init_dns_coordinate verify || fail 'DNS 组或 TCP/UDP 查询验证失败'
 		policy_verify_runtime || fail 'RoutePolicy 实际出站策略表与选定角色不一致'
-		phase confirmed || fail '不能持久化确认状态'
+		if init_dns_owned; then phase confirming && active_publish || fail '确认提升尚未完成；保留记录供恢复收敛'
+		else phase confirmed || fail '不能持久化确认状态'; fi
 		init_dns_coordinate confirm || fail '确认已保存，但应用临时缓存清理失败'
 		status_json
 		;;
 	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
 	guard-needed)
-		case "$(read_phase)" in prepared|applying|pending|rolling_back) exit 0 ;; *) exit 1 ;; esac
+		rp_dns_boot_pending && exit 0
+		case "$(read_phase)" in prepared|applying|pending|rolling_back|confirming) exit 0 ;; *) exit 1 ;; esac
 		;;
 	boot-dns)
 		[ "$#" = 0 ] || fail 'boot-dns 不接受参数'
-		[ -f "$WAL/dns-boot-pending" ] || exit 0
+		rp_dns_boot_pending || exit 0
 		lock
+		recover_locked || fail '启动事务恢复失败；DNS 保持隔离'
 		boot_dns_locked || fail '启动策略/DNS 验证失败；SmartDNS 保持停用，自有 WAL 已保留'
 		;;
 	recover|recover-startup|recover-auto|recover-early)
 		[ "$#" -eq 0 ] || fail 'recover 不接受参数'
-		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ]; then status_json; exit 0; fi
+		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ] && [ ! -e "$TX/active" ] && [ ! -L "$TX/active" ]; then status_json; exit 0; fi
 		lock
 		if [ "$operation" = recover-early ]; then
 			case "$(read_phase)" in
@@ -832,15 +915,8 @@ case "$operation" in
 				conflict)
 					init_dns_coordinate quarantine-boot || fail '恢复冲突且不能阻止候选 DNS 自启动；保留 WAL'
 					fail '早期恢复存在真实冲突；DNS 自启动已阻止，请先处理并显式recover' ;;
-				confirmed)
-					if ! transaction_same_boot && init_dns_managed; then
-						boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || fail '不能读取当前启动标识'
-						if [ "$(cat "$WAL/dns-boot-ready" 2>/dev/null || true)" != "$boot_now" ]; then
-							init_dns_coordinate quarantine-boot || fail '不能阻止暖 DNS 缓存先于策略集合启动'
-							printf '%s\n' "$boot_now" >"$WAL/dns-boot-pending" && sync || fail '不能记录 DNS 启动等待状态'
-						fi
-					fi ;;
 			esac
+			active_boot_early || fail '不能按已确认接管合同隔离启动 DNS'
 			status_json; exit 0
 		fi
 		if [ "$operation" = recover-startup ] && [ "$(read_phase)" = conflict ]; then fail '启动恢复存在真实冲突；请先处理并显式recover'; fi
@@ -852,8 +928,12 @@ case "$operation" in
 	guard)
 		[ "$#" -eq 0 ] || fail 'guard 不接受参数'
 		while :; do
+			if rp_dns_boot_pending; then
+				"$0" boot-dns >/dev/null 2>&1 || true
+				if rp_dns_boot_pending; then sleep 10; continue; fi
+			fi
 			case "$(read_phase)" in
-				applying|rolling_back) "$0" recover-auto >/dev/null 2>&1 || true ;;
+				applying|rolling_back|confirming) "$0" recover-auto >/dev/null 2>&1 || true ;;
 				pending) if pending_recovery_due; then "$0" recover-auto >/dev/null 2>&1 || true; fi ;;
 				prepared) if pending_recovery_due; then guard_stop_if_inactive && exit 0; fi ;;
 				*) guard_stop_if_inactive && exit 0 ;;

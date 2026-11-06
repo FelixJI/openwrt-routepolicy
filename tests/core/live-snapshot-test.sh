@@ -64,7 +64,7 @@ case "$*" in
 	'list table inet routepolicy')
 		cat <<'TABLE'
 table inet routepolicy {
-	comment "legacy-snapshot"
+	chain prerouting { counter comment "legacy-snapshot"; }
 	set domain_policy4 { type ipv4_addr; flags timeout; elements = { 1.1.1.1 timeout 1h expires 42m30s } }
 	set domain_default4 { type ipv4_addr; flags timeout; elements = { 9.9.9.9 timeout 1h expires 995ms } }
 }

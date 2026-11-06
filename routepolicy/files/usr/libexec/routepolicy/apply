@@ -5,7 +5,7 @@ LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
 
 # A failed boot coordinator must not be bypassed by the later S95 apply.
-if [ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ]; then
+if rp_dns_boot_pending; then
 	ROUTEPOLICY_DNS_DEFER=1
 fi
 

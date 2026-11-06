@@ -102,7 +102,10 @@ init_dns_plan() {
 	roots=$(rp_smartdns_root_sections)
 	[ "$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')" -le 1 ] || fail '多个 SmartDNS 根段，不能安全初始化'
 	root=$(printf '%s\n' "$roots" | sed -n '1p')
-	if [ -z "$root" ]; then root=rp_init; set_value smartdns.rp_init smartdns; fi
+	if [ -z "$root" ]; then
+		[ -z "$(get smartdns.rp_init)" ] || fail 'SmartDNS 保留根段 rp_init 已被用户配置占用'
+		root=rp_init; set_value smartdns.rp_init smartdns
+	fi
 	[ -z "$(get "smartdns.$root.redirect")" ] || fail 'SmartDNS redirect 旧迁移项会修改 DHCP；请先在官方界面完成迁移'
 	roots=$(sections dhcp dnsmasq)
 	[ "$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')" = 1 ] || fail '需要唯一 dnsmasq 实例；多实例请先明确接入归属'
@@ -207,6 +210,7 @@ init_dns_service_state() {
 	local service=$1 output
 	output=$(ubus call service list "{\"name\":\"$service\"}") || return 1
 	case "$output" in \{*\}) ;; *) return 1 ;; esac
+	printf '%s\n' "$output" | jsonfilter -e '@' >/dev/null || return 1
 	if printf '%s\n' "$output" | jsonfilter -e "@.$service.instances.*.running" | grep -Eq '^(true|1)$'; then printf 1; else printf 0; fi
 }
 init_dns_enabled() {
@@ -237,6 +241,51 @@ init_dns_stop() {
 		else present=$?; [ "$present" = 1 ] && return 0; return 1; fi
 		sleep 1; remaining=$((remaining-1))
 	done
+}
+init_dns_original_probe() {
+	local service=$1 mode=$2 endpoints protocol address port answer queried remaining family output configured dns_root
+	endpoints="$WAL/$service-listeners"
+	if [ "$mode" = save ]; then
+		# BusyBox also reports upstream UDP source sockets under the daemon PID.
+		case "$service" in
+			dnsmasq) configured=$(uci -q get 'dhcp.@dnsmasq[0].port') || configured=53 ;;
+			smartdns)
+				dns_root=$(rp_smartdns_single_root) || return 1
+				configured=$(uci -q get "smartdns.$dns_root.port") || configured=53 ;;
+			*) return 1 ;;
+		esac
+		rp_uint_between "$configured" 0 65535 || return 1
+		if [ "$configured" = 0 ]; then : >"$endpoints"; return; fi
+		output=$(timeout 3 netstat -lnptu) || return 1
+		printf '%s\n' "$output" | awk -v service="$service" -v configured="$configured" '
+			$1~/^(tcp|udp)(6)?$/ && $NF~("/" service "$") && $4~/:+[0-9]+$/ {
+				address=$4;sub(/:[0-9]+$/,"",address);port=$4;sub(/^.*:/,"",port)
+				if(port!=configured)next
+				if(address=="0.0.0.0")address="127.0.0.1"
+				if(address=="::")address="::1"
+				print $1 " " address " " port " 0"}' | sort -u >"$endpoints" || return 1
+		: >"$endpoints.new" || return 1
+	fi
+	[ -f "$endpoints" ] || return 0
+	while read -r protocol address port queried; do
+		[ -n "$protocol" ] || continue
+		if [ "$mode" != save ]; then
+			remaining=10
+			until timeout 3 netstat -lnptu | awk -v service="$service" -v protocol="$protocol" -v address="$address" -v port="$port" '
+				$1==protocol && $NF~("/" service "$") && ($4==address ":" port || $4==(index(address,":")?":::" port:"0.0.0.0:" port)) {found=1}END{exit !found}'; do
+				[ "$remaining" -gt 0 ] || return 1
+				sleep 1; remaining=$((remaining-1))
+			done
+		fi
+		if [ "$mode" = save ] || [ "$queried" = 1 ]; then
+			case "$protocol" in tcp|tcp6) answer=+tcp ;; udp|udp6) answer=+notcp ;; *) return 1 ;; esac
+			family=-4; case "$address" in *:*) family=-6 ;; esac
+			if answer=$(timeout 6 dig "$family" "$answer" +time=2 +tries=1 +noall +comments +answer "@$address" -p "$port" routepolicy-init-restore.test A) && printf '%s\n' "$answer" | grep -Eq 'status: (NOERROR|NXDOMAIN),'; then queried=1
+			else [ "$mode" = save ] || return 1; queried=0; fi
+		fi
+		[ "$mode" != save ] || printf '%s %s %s %s\n' "$protocol" "$address" "$port" "$queried" >>"$endpoints.new" || return 1
+	done <"$endpoints"
+	[ "$mode" != save ] || mv "$endpoints.new" "$endpoints"
 }
 init_dns_audit_binds() {
 	local config=$1 depth=$2 port=$3 device=$4 includes include
@@ -291,6 +340,7 @@ init_dns_coordinate() {
 				[ -x "$RP_ROOT/etc/init.d/$service" ] || return 1
 				running=$(init_dns_service_state "$service") && enabled=$(init_dns_enabled "$service") || return 1
 				printf '%s\n' "$running" >"$WAL/$service-running" && printf '%s\n' "$enabled" >"$WAL/$service-enabled" || return 1
+				[ "$running" = 0 ] || init_dns_original_probe "$service" save || return 1
 			 done
 			enabled=$(init_dns_enabled routepolicy) || return 1
 			printf '%s\n' "$enabled" >"$WAL/routepolicy-enabled"
@@ -415,13 +465,23 @@ init_dns_coordinate() {
 			[ ! -L "$temp" ] && [ ! -L "$cache" ] || return 1
 			if [ -f "$temp" ]; then rm -f "$cache" && mv "$temp" "$cache" || return 1
 			elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
+			# An existing confirmed contract owns cold boot DNS admission after rollback.
+			if rp_dns_boot_pending; then init_dns_restore_bookkeeping; return; fi
 			for service in dnsmasq smartdns; do
 				case "$(cat "$WAL/$service-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
 				[ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || init_dns_call "$service" "$enabled" >/dev/null || return 1
 				case "$(cat "$WAL/$service-running")" in 1) running=start ;; 0) running=stop ;; *) return 1 ;; esac
 				if [ "$service:$running" = smartdns:stop ]; then init_dns_stop || return 1
+				elif [ "$running" = start ] && [ -f "$WAL/dns-attempted" ]; then
+					init_dns_call "$service" restart >/dev/null || return 1
 				elif [ "$(init_dns_service_state "$service")" != "$(cat "$WAL/$service-running")" ]; then init_dns_call "$service" "$running" >/dev/null || return 1; fi
+				remaining=10
+				until [ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ]; do
+					[ "$remaining" -gt 0 ] || return 1
+					sleep 1; remaining=$((remaining-1))
+				done
 				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
+				[ "$running" != start ] || init_dns_original_probe "$service" verify || return 1
 			done
 			case "$(cat "$WAL/routepolicy-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
 			init_dns_call routepolicy "$enabled" || return 1

@@ -339,6 +339,8 @@ management_lock() {
 	[ ! -L "$lock_parent/lock" ] || return 1
 	exec 9>"$lock_parent/lock"
 	flock -n 9 || return 1
+	if [ -e "$lock_parent/active" ] || [ -L "$lock_parent/active" ]; then rp_init_active_record >/dev/null || return 1; fi
+	! rp_dns_boot_pending || return 1
 	case "$(cat "$lock_parent/current/phase" 2>/dev/null || printf absent)" in
 		absent|confirmed|rolled_back) return 0 ;; *) return 1 ;;
 	esac

@@ -126,10 +126,13 @@ rp_nft_rebuild() {
 		fi
 	done
 	awk '
-		/^[[:space:]]*set domain_(policy|default)4[[:space:]]*\{/ {line=$0;depth=gsub(/\{/,"",line)-gsub(/}/,"",line);skip=(depth>0);next}
-		skip {line=$0;depth+=gsub(/\{/,"",line)-gsub(/}/,"",line);skip=(depth>0);next}
-		{print}
-		END{if(skip)exit 1}' "$nft_source" >>"$nft_target"
+		BEGIN {chains=" prerouting dns_prerouting output classify source_prerouting source_postrouting ";sets=" static_policy4 static_default4 source_ingress4 source_egress4 "}
+		depth==1 && NF && $1 !~ /^[}#]/ {
+			keep=($1=="chain"&&index(chains," " $2 " "))||($1=="set"&&index(sets," " $2 " "))
+			object=1
+		}
+		{line=$0;depth+=gsub(/\{/,"",line)-gsub(/}/,"",line);if(!object||keep)print;if(depth==1)object=0;if(depth<0)bad=1}
+		END{if(depth||bad)exit 1}' "$nft_source" >>"$nft_target"
 }
 
 rp_smartdns_fragment_loaded() {
@@ -440,4 +443,22 @@ rp_smartdns_init_probes() {
 	printf '%s\n' '# routepolicy initialization probes' \
 		'domain-rules /routepolicy-init-default.test/ -nameserver rp_init_default -speed-check-mode none' \
 		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none'
+}
+
+# A confirmed DNS contract survives replacement of the reviewable candidate WAL.
+rp_init_active_record() {
+	active_tx="$RP_STATE_DIR/init-transaction"
+	[ ! -L "$active_tx" ] && [ -f "$active_tx/active" ] && [ ! -L "$active_tx/active" ] || return 1
+	active_token=$(cat "$active_tx/active") || return 1
+	[ "${#active_token}" = 32 ] || return 1
+	case "$active_token" in *[!0-9a-f]*) return 1 ;; esac
+	active_record="$active_tx/confirmed-$active_token"
+	[ -d "$active_record" ] && [ ! -L "$active_record" ] && [ ! -L "$active_record/token" ] && [ ! -L "$active_record/phase" ] &&
+		[ "$(cat "$active_record/token")" = "$active_token" ] && [ "$(cat "$active_record/phase")" = confirmed ] || return 1
+	printf '%s\n' "$active_record"
+}
+rp_dns_boot_pending() {
+	[ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ] && return 0
+	active_pending=$(rp_init_active_record) || return 1
+	[ -f "$active_pending/dns-boot-pending" ]
 }

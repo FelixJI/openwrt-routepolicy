@@ -3,7 +3,7 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 REAL_LIB="$ROOT/routepolicy/files/usr/libexec/routepolicy"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-dns.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+trap '[ -z "${guard_pid:-}" ] || kill "$guard_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 export TEST_DNS_TMP=$tmp ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 mkdir -p "$tmp/bin" "$tmp/lib" "$tmp/root/etc/config" "$tmp/root/etc/init.d" "$tmp/root/usr/sbin"
 cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$REAL_LIB/init-transaction" "$tmp/lib/"
@@ -93,6 +93,13 @@ esac
 EOF
 cat >"$tmp/bin/sync" <<'EOF'
 #!/bin/sh
+wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+if [ -f "$TEST_DNS_TMP/kill-confirm" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = confirming ]; then
+	point=$(cat "$TEST_DNS_TMP/kill-confirm")
+	if [ "$point" = intent ] || { [ "$point" = pointer ] && [ "$(cat "${wal%/current}/active" 2>/dev/null)" = "$(cat "$wal/token")" ]; }; then
+		rm "$TEST_DNS_TMP/kill-confirm"; kill -KILL "$PPID"
+	fi
+fi
 exit 0
 EOF
 cat >"$tmp/lib/init-topology" <<'EOF'
@@ -132,6 +139,7 @@ case "$2:${3:-}" in
 		running=false; [ "$(cat "$TEST_DNS_TMP/svc/$service.running")" != 1 ] || running=true
 		printf '{"%s":{"instances":{"main":{"running":%s}}}}\n' "$service" "$running" ;;
 	service:delete)
+		case "${4:-}" in *routepolicy-initguard*) exit 0 ;; esac
 		[ ! -f "$TEST_DNS_TMP/delete-fail" ] || exit 1
 		[ ! -f "$TEST_DNS_TMP/svc/smartdns.absent" ] || exit 4
 		printf 0 >"$TEST_DNS_TMP/svc/smartdns.running"
@@ -149,13 +157,29 @@ esac
 EOF
 cat >"$tmp/bin/netstat" <<'EOF'
 #!/bin/sh
-[ "$(cat "$TEST_DNS_TMP/svc/smartdns.running")" = 1 ] || exit 0
-printf '%s\n' 'tcp 0 0 0.0.0.0:53 0.0.0.0:* LISTEN 101/smartdns' 'udp 0 0 0.0.0.0:53 0.0.0.0:* 101/smartdns'
+[ ! -f "$TEST_DNS_TMP/netstat-fail" ] || exit 1
+for service in smartdns dnsmasq; do
+	[ "$(cat "$TEST_DNS_TMP/svc/$service.running")" = 1 ] || continue
+	port=$(cat "$TEST_DNS_TMP/svc/$service.port")
+	[ "$port" != 0 ] || continue
+	printf 'tcp 0 0 0.0.0.0:%s 0.0.0.0:* LISTEN 101/%s\nudp 0 0 0.0.0.0:%s 0.0.0.0:* 101/%s\n' "$port" "$service" "$port" "$service"
+	if [ "$service" = dnsmasq ] && [ "${TEST_DNS_IPV6:-0}" = 1 ]; then
+		printf 'tcp6 0 0 :::%s :::* LISTEN 101/dnsmasq\nudp6 0 0 :::%s :::* 101/dnsmasq\n' "$port" "$port"
+	fi
+done
 EOF
 cat >"$tmp/bin/dig" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_DNS_TMP/queries"
-if [ -f "$TEST_DNS_TMP/query-fail" ]; then printf ';; ->>HEADER<<- status: SERVFAIL, id: 1\n'
+port=53; previous=
+for argument do [ "$previous" != -p ] || port=$argument; previous=$argument; done
+found=0
+for service in smartdns dnsmasq; do
+	[ "$(cat "$TEST_DNS_TMP/svc/$service.running")" != 1 ] || [ "$(cat "$TEST_DNS_TMP/svc/$service.port")" != "$port" ] || found=1
+done
+[ "$found" = 1 ] || exit 9
+if [ -f "$TEST_DNS_TMP/query-fail" ] && [ "$*" != "${*%routepolicy-init-restore.test*}" ]; then printf ';; ->>HEADER<<- status: NOERROR, id: 1\n'
+elif [ -f "$TEST_DNS_TMP/query-fail" ]; then printf ';; ->>HEADER<<- status: SERVFAIL, id: 1\n'
 else printf ';; ->>HEADER<<- status: NOERROR, id: 1\n'; fi
 EOF
 cat >"$tmp/bin/nft" <<'EOF'
@@ -201,7 +225,7 @@ case "$1" in
 	enable) printf 1 >"$TEST_DNS_TMP/svc/$service.enabled"; exit ;;
 	disable) printf 0 >"$TEST_DNS_TMP/svc/$service.enabled"; exit ;;
 	stop) printf 0 >"$TEST_DNS_TMP/svc/$service.running"; exit ;;
-	start|reload) ;;
+	start|reload|restart) ;;
 	*) exit 1 ;;
 esac
 : >"$TEST_DNS_TMP/native-start-called"
@@ -210,6 +234,7 @@ enabled=$(uci -q get 'smartdns.@smartdns[0].enabled' || printf 0)
 printf '%s' "$enabled" >"$TEST_DNS_TMP/svc/$service.running"
 [ "$enabled" = 1 ] || exit 0
 port=$(uci -q get 'smartdns.@smartdns[0].port' || printf 53)
+printf '%s' "$port" >"$TEST_DNS_TMP/svc/smartdns.port"
 auto=$(uci -q get 'smartdns.@smartdns[0].auto_set_dnsmasq' || printf 1)
 uci set "smartdns.@smartdns[0].old_enabled=$enabled"
 uci set "smartdns.@smartdns[0].old_port=$port"
@@ -238,13 +263,20 @@ case "$1" in
 	enable) printf 1 >"$TEST_DNS_TMP/svc/dnsmasq.enabled" ;;
 	disable) printf 0 >"$TEST_DNS_TMP/svc/dnsmasq.enabled" ;;
 	stop) printf 0 >"$TEST_DNS_TMP/svc/dnsmasq.running" ;;
-	start) printf 1 >"$TEST_DNS_TMP/svc/dnsmasq.running" ;;
+	start|restart)
+		printf 1 >"$TEST_DNS_TMP/svc/dnsmasq.running"
+		[ ! -f "$TEST_DNS_TMP/stale-dnsmasq" ] || exit 0
+		uci -q get 'dhcp.@dnsmasq[0].port' >"$TEST_DNS_TMP/svc/dnsmasq.port" ;;
 	*) exit 1 ;;
 esac
 EOF
 cp "$tmp/root/etc/init.d/dnsmasq" "$tmp/root/etc/init.d/routepolicy"
 sed -i 's/dnsmasq/routepolicy/g' "$tmp/root/etc/init.d/routepolicy"
 for service in network firewall odhcpd routepolicy-initguard routepolicy-prerecover; do printf '#!/bin/sh\nexit 0\n' >"$tmp/root/etc/init.d/$service"; done
+cat >"$tmp/root/etc/init.d/network" <<'EOF'
+#!/bin/sh
+if [ "$(cat "$TEST_DNS_TMP/svc/dnsmasq.running")" = 1 ]; then uci -q get 'dhcp.@dnsmasq[0].port' >"$TEST_DNS_TMP/svc/dnsmasq.port"; fi
+EOF
 cp "$tmp/root/etc/init.d/network" "$tmp/root/usr/sbin/smartdns"
 chmod +x "$tmp/bin/"* "$tmp/lib/"* "$tmp/root/etc/init.d/"* "$tmp/root/usr/sbin/smartdns"
 export PATH="$tmp/bin:$PATH"
@@ -258,7 +290,7 @@ canonical() {
 }
 baseline() {
 	rm -rf "$tmp/root/etc/routepolicy" "$tmp/root/tmp/routepolicy" "$tmp/root/etc/smartdns" "$tmp/root/var" "$tmp/svc" "$tmp/external"
-	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called"
+	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called" "$tmp/stale-dnsmasq" "$tmp/kill-confirm"
 	mkdir -p "$tmp/svc" "$tmp/external" "$tmp/root/etc/smartdns/conf.d" "$tmp/root/proc/sys/kernel/random"
 	printf '100.00 0.00\n' >"$tmp/root/proc/uptime"
 	printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
@@ -272,6 +304,7 @@ baseline() {
 	printf 0 >"$tmp/svc/routepolicy.enabled"; printf 0 >"$tmp/svc/routepolicy.running"
 	printf '%s' "$1" >"$tmp/svc/smartdns.enabled"; printf '%s' "$2" >"$tmp/svc/smartdns.running"
 	printf '%s' "$3" >"$tmp/svc/dnsmasq.enabled"; printf '%s' "$4" >"$tmp/svc/dnsmasq.running"
+	printf 6053 >"$tmp/svc/smartdns.port"; printf 53 >"$tmp/svc/dnsmasq.port"
 }
 prepare() {
 	output=$("$TX" prepare lan wan wan2 - - - - - - - - 192.0.2.53 198.51.100.53)
@@ -288,7 +321,7 @@ restored() {
 }
 # Exercise every enabled/running combination for both pre-existing services.
 matrix_count=0
-if [ "${1:-}" != --boot-smoke ] && [ "${1:-}" != --quiesce-smoke ]; then
+if [ "${1:-}" != --boot-smoke ] && [ "${1:-}" != --quiesce-smoke ] && [ "${1:-}" != --lifecycle-smoke ] && [ "${1:-}" != --restore-smoke ]; then
 for se in 0 1; do for sr in 0 1; do for de in 0 1; do for dr in 0 1; do
 	case "${1:-}:$se$sr$de$dr" in --recovery-smoke:0000|--recovery-smoke:0111|--recovery-smoke:1001|--recovery-smoke:1110) ;; --recovery-smoke:*) continue ;; esac
 	baseline "$se" "$sr" "$de" "$dr"; prepare
@@ -328,6 +361,34 @@ fi
 baseline 0 0 1 1; prepare; : >"$tmp/query-fail"
 if "$TX" apply "$token" >/dev/null; then printf 'SERVFAIL was accepted\n' >&2; exit 1; fi
 restored
+baseline 0 0 1 1; : >"$tmp/netstat-fail"
+if "$TX" prepare lan wan wan2 - - - - - - - - 192.0.2.53 198.51.100.53 >"$tmp/listener-error" 2>&1; then exit 1; fi
+grep -Fq 'SmartDNS 协调准备阶段失败' "$tmp/listener-error"
+rm "$tmp/netstat-fail"
+baseline 0 0 1 1; export TEST_DNS_IPV6=1
+prepare; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null; restored
+grep -Fq -- '-6 +tcp' "$tmp/queries"; grep -Fq -- '-6 +notcp' "$tmp/queries"
+unset TEST_DNS_IPV6
+# A successful init-script return cannot hide a dnsmasq process still using port=0.
+baseline 0 0 1 1; prepare; : >"$tmp/query-fail"; : >"$tmp/stale-dnsmasq"
+if "$TX" apply "$token" >/dev/null; then exit 1; fi
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = conflict ]
+grep -Fq smartdns-service "$tmp/root/etc/routepolicy/state/init-transaction/current/conflicts"
+rm "$tmp/stale-dnsmasq" "$tmp/query-fail"; "$TX" recover >/dev/null; restored
+# A running, originally DNS-disabled dnsmasq has no invented port-53 obligation.
+baseline 0 0 1 1
+uci set 'dhcp.@dnsmasq[0].port=0'; uci commit dhcp; printf 0 >"$tmp/svc/dnsmasq.port"
+canonical dhcp >"$tmp/dhcp.before"
+prepare; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null; restored
+# Reserved names are never adopted by replacing an unknown upstream section type.
+baseline 0 0 1 1
+printf "config server 'rp_init'\n\toption ip '192.0.2.88'\n" >"$tmp/root/etc/config/smartdns"
+canonical smartdns >"$tmp/smartdns.before"
+if prepare >"$tmp/reserved-error" 2>&1; then exit 1; fi
+grep -Fq '保留根段 rp_init' "$tmp/reserved-error"
+canonical smartdns >"$tmp/smartdns.after"; cmp "$tmp/smartdns.before" "$tmp/smartdns.after"
+printf '%s\n' 'init DNS restore functionality and reserved-root protection: passed'
+if [ "${1:-}" = --restore-smoke ]; then exit 0; fi
 baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
 printf 'different-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
 printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
@@ -363,6 +424,7 @@ if "$TX" recover-early >/dev/null; then exit 1; fi
 # Confirmed reboot: cold application cache, sets before DNS, and failure stays closed.
 baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
 SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
+active="$tmp/root/etc/routepolicy/state/init-transaction/confirmed-$token"
 rm -rf "$tmp/root/tmp/routepolicy"; rm -f "$tmp/policy-running"
 printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
 printf 'confirmed-reboot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
@@ -375,11 +437,85 @@ rm "$tmp/policy-fail"
 : >"$tmp/query-fail"
 if "$TX" boot-dns >/dev/null; then exit 1; fi
 [ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")" = 00 ]
-[ -f "$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending" ]
+[ -f "$active/dns-boot-pending" ]
 rm "$tmp/query-fail"
 "$TX" boot-dns >/dev/null
 [ -f "$tmp/policy-running" ]
 [ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 1100 ]
 [ "$(cat "$tmp/root/etc/smartdns/user.cache")" = USER-CACHE ]
-[ ! -f "$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending" ]
+[ ! -f "$active/dns-boot-pending" ]
+
+# Drive retries through the real S94 entry and its supervised guard command.
+guard_entry() {
+	guard_pid=
+	ROUTEPOLICY_INIT_TRANSACTION=$TX
+	. "$ROOT/routepolicy/files/etc/init.d/routepolicy-initguard"
+	procd_open_instance() { :; }
+	procd_set_param() { [ "$1" != command ] || guard_command=$2; }
+	procd_close_instance() { "$guard_command" guard >"$tmp/guard.log" 2>&1 & guard_pid=$!; }
+	start_service
+}
+wait_guard() {
+	remaining=20
+	while [ -f "$active/dns-boot-pending" ]; do
+		[ "$remaining" -gt 0 ] || { cat "$tmp/guard.log"; kill "$guard_pid"; return 1; }
+		sleep 1; remaining=$((remaining-1))
+	done
+	[ -z "$guard_pid" ] || wait "$guard_pid"
+}
+reboot_services() {
+	rm -rf "$tmp/root/tmp/routepolicy"; rm -f "$tmp/policy-running"
+	printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
+	printf '%s\n' "$1" >"$tmp/root/proc/sys/kernel/random/boot_id"
+	"$TX" recover-early >/dev/null
+}
+txdir="$tmp/root/etc/routepolicy/state/init-transaction"
+origin=$(cat "$txdir/source"); cp -R "$txdir/confirmed-$origin/fields" "$tmp/origin-fields"
+prepare
+[ "$(cat "$txdir/active")" = "$origin" ]
+reboot_services prepared-after-confirm
+: >"$tmp/policy-fail"; guard_entry
+[ -f "$active/dns-boot-pending" ] && [ "$(cat "$tmp/svc/smartdns.running")" = 0 ]
+"$TX" status >"$tmp/active-status"
+[ "$(jsonfilter -i "$tmp/active-status" -e '@.phase')" = prepared ]
+[ "$(jsonfilter -i "$tmp/active-status" -e '@.active.dns_boot_state')" = retrying ]
+rm "$tmp/policy-fail"; : >"$tmp/query-fail"
+remaining=30
+while [ "$(cat "$active/failed-stage")" != boot-dns-start ]; do
+	[ "$remaining" -gt 0 ] || { cat "$tmp/guard.log"; exit 1; }
+	sleep 1; remaining=$((remaining-1))
+done
+[ -f "$active/dns-boot-pending" ] && [ "$(cat "$tmp/svc/smartdns.running")" = 0 ]
+rm "$tmp/query-fail"; wait_guard
+[ "$(cat "$txdir/current/phase")" = prepared ]
+diff -r "$tmp/origin-fields" "$txdir/confirmed-$origin/fields"
+# A repeated apply rollback keeps the first accepted boot and provenance contract.
+prepare; : >"$tmp/query-fail"
+if "$TX" apply "$token" >/dev/null; then exit 1; fi
+[ "$(cat "$txdir/current/phase")" = rolled_back ]
+rm "$tmp/query-fail"
+reboot_services rollback-after-confirm; guard_entry; wait_guard
+[ "$(cat "$txdir/active")" = "$origin" ]
+# Both sides of the pointer commit converge after a power loss in confirmation.
+mkdir "$txdir/confirmed-foreign"; printf USER >"$txdir/confirmed-foreign/keep"
+for point in intent pointer; do
+	prepare; "$TX" apply "$token" >/dev/null
+	printf '%s\n' "$point" >"$tmp/kill-confirm"
+	if SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null 2>&1; then exit 1; fi
+	[ "$(cat "$txdir/current/phase")" = confirming ]
+	reboot_services "confirm-interrupted-$point"
+	[ "$(cat "$txdir/current/phase")" = confirmed ] && [ "$(cat "$txdir/active")" = "$token" ]
+	active="$txdir/confirmed-$token"; guard_entry; wait_guard
+	[ "$(find "$txdir" -maxdepth 1 -type d -name 'confirmed-????????????????????????????????' | wc -l)" = 2 ]
+	[ "$(cat "$txdir/confirmed-foreign/keep")" = USER ]
+	[ "$(cat "$txdir/source")" = "$origin" ]
+	diff -r "$tmp/origin-fields" "$txdir/confirmed-$origin/fields"
+done
+mv "$txdir/active" "$tmp/active.value"; ln -s "$tmp/active.value" "$txdir/active"
+if "$TX" recover-early >/dev/null; then exit 1; fi
+[ "$(cat "$tmp/active.value")" = "$token" ]
+rm "$txdir/active"; mv "$tmp/active.value" "$txdir/active"
+mv "$active" "$tmp/active.record"; ln -s "$tmp/active.record" "$active"
+if "$TX" recover-early >/dev/null; then exit 1; fi
+rm "$active"; mv "$tmp/active.record" "$active"
 printf 'init DNS native WAL: passed (matrix=%s; distinct UCI flag, kill, conflict, pending and confirmed reboot)\n' "$matrix_count"

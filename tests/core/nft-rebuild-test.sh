@@ -34,6 +34,9 @@ table inet routepolicy {
 EOF
 # A pre-NAT-chain table must migrate without replacing live DNS set objects.
 sed '/chain dns_prerouting {/d' "$RP_NFT_FILE" | nft -f -
+nft add chain inet routepolicy foreign
+nft add rule inet routepolicy foreign counter comment foreign-owner
+nft add set inet routepolicy foreign_set '{ type ipv4_addr; }'
 nft add element inet routepolicy domain_policy4 '{ 192.0.2.1 timeout 45s, 192.0.2.2 timeout 1s }'
 nft add element inet routepolicy domain_default4 '{ 198.51.100.1 timeout 45s }'
 nft list table inet routepolicy >"$tmp/old.nft"
@@ -47,6 +50,8 @@ sleep 2
 nft -c -f "$tmp/rebuild.nft"
 nft -f "$tmp/rebuild.nft"
 nft list chain inet routepolicy dns_prerouting | grep -Fq 'type nat hook prerouting priority dstnat'
+[ "$(nft list chain inet routepolicy foreign | grep -c foreign-owner)" = 1 ]
+nft list set inet routepolicy foreign_set >/dev/null
 nft list set inet routepolicy domain_policy4 >"$tmp/policy"
 grep -Fq '192.0.2.1' "$tmp/policy"
 grep -Fq '192.0.2.3' "$tmp/policy"
@@ -60,6 +65,8 @@ nft add element inet routepolicy domain_policy4 '{ 192.0.2.4 timeout 30s }'
 rp_nft_rebuild "$tmp/old.nft" "$tmp/restore.nft"
 nft -f "$tmp/restore.nft"
 if nft list chain inet routepolicy dns_prerouting >/dev/null 2>&1; then exit 1; fi
+[ "$(nft list chain inet routepolicy foreign | grep -c foreign-owner)" = 1 ]
+nft list set inet routepolicy foreign_set >/dev/null
 nft list set inet routepolicy domain_policy4 >"$tmp/policy"
 grep -Fq '192.0.2.3' "$tmp/policy"
 grep -Fq '192.0.2.4' "$tmp/policy"
