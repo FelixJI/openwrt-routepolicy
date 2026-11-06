@@ -19,7 +19,8 @@ grep -q '^PKG_NAME:=routepolicy$' routepolicy/Makefile || fail '核心包名不�
 grep -q '^PKG_NAME:=luci-app-routepolicy$' luci-app-routepolicy/Makefile || fail 'LuCI 包名不正确'
 grep -q '^PKG_VERSION:=0.3.3$' routepolicy/Makefile || fail '核心包版本未升级到 0.3.3 修复版本'
 grep -q '^PKG_VERSION:=0.3.3$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.3.3 修复版本'
-grep -q '^PKG_RELEASE:=1$' luci-app-routepolicy/Makefile || fail '新的 0.3.3 LuCI 包发布序号必须从 1 开始'
+grep -q '^PKG_RELEASE:=2$' routepolicy/Makefile || fail '生命周期修复包 release 必须为 2'
+grep -q '^PKG_RELEASE:=2$' luci-app-routepolicy/Makefile || fail 'LuCI 包 release 必须与核心同步为 2'
 grep -q "^config main 'main'$" routepolicy/files/etc/config/routepolicy || fail '缺少 main 配置段'
 grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepolicy || fail '安装默认必须禁用'
 rpcd_plugin=luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
@@ -50,7 +51,8 @@ grep -Fq 'files/usr/libexec/routepolicy/init-dns' routepolicy/Makefile || fail '
 grep -Fq 'smartdns-control' routepolicy/Makefile || fail '核心包未安装 SmartDNS 深模块'
 grep -Fq 'files/usr/libexec/routepolicy/observe' routepolicy/Makefile || fail '核心包未安装 observation 深模块'
 grep -Fq '/etc/routepolicy/user.d/local-hosts.list' routepolicy/Makefile || fail '本地主机文件未声明为 conffile'
-grep -Fq '91-routepolicy-smartdns-extra.conf' routepolicy/Makefile || fail '卸载脚本未清理 91 片段登记'
+postrm=$(sed -n '/^define Package\/routepolicy\/postrm$/,/^endef$/p' routepolicy/Makefile)
+if printf '%s\n' "$postrm" | grep -Eq 'uci |reload|restart|rm -f'; then fail '代码删除后 postrm 仍修改或重载 DNS'; fi
 grep -Fq 'routepolicy-*.apk' scripts/ci/prepare-release.sh || fail 'Release 收集必须使用 OpenWrt APK 连字符命名'
 if grep -Fq 'routepolicy_*.apk' scripts/ci/prepare-release.sh; then fail 'Release 收集仍使用旧 IPK 风格下划线命名'; fi
 grep -Fq -- "-name 'packages.adb'" scripts/ci/prepare-release.sh || fail 'OpenWrt 25.12 Release 必须收集 apk packages.adb 索引'

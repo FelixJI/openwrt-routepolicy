@@ -3,8 +3,16 @@
 set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
-[ "$#" = 0 ] || { [ "$#" = 1 ] && [ "$1" = scheduled ]; } || { rp_output_error update '更新参数非法'; exit 1; }
+[ "$#" = 0 ] || { [ "$#" = 1 ] && { [ "$1" = scheduled ] || [ "$1" = init-stage ]; }; } || { rp_output_error update '更新参数非法'; exit 1; }
 rp_writer_enter update || { rp_output_error update '写入门禁忙或初始化尚未完成'; exit 1; }
+init_stage=0
+if [ "${1:-}" = init-stage ]; then
+	init_wal="$RP_STATE_DIR/init-transaction/current"
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned &&
+		[ -n "${ROUTEPOLICY_INIT_GENERATION:-}" ] && [ "$(cat "$init_wal/token" 2>/dev/null)" = "$ROUTEPOLICY_INIT_GENERATION" ] &&
+		[ "$(cat "$init_wal/phase" 2>/dev/null)" = applying ] && [ "$(cat "$init_wal/managed-phase" 2>/dev/null)" = prepared ] || { rp_output_error update 'init-stage 仅接受真实初始化 writer、当前 token 与写前快照'; exit 1; }
+	init_stage=1
+fi
 
 if [ "${1:-}" = scheduled ]; then
 	# Recheck and consume the daily attempt only after acquiring the shared writer gate.
@@ -82,11 +90,17 @@ done
 
 next_previous="$RP_ETC/managed.d/previous.next.$$"
 [ ! -e "$next_previous" ] || { rp_output_error update '内部候选目录冲突'; exit 1; }
+if [ "$init_stage" = 1 ]; then
+	[ ! -e "$init_wal/managed-expected" ] && [ ! -L "$init_wal/managed-expected" ] &&
+		cp -pR "$candidate" "$init_wal/managed-expected" && printf '%s\n' "${next_previous##*/}" >"$init_wal/managed-swap-name" &&
+		rp_managed_phase "$init_wal" publishing || { rp_output_error update '不能持久化初始化清单发布意图'; exit 1; }
+	rp_managed_equal "$RP_MANAGED_CURRENT" "$init_wal/managed-before-current" && rp_managed_equal "$RP_MANAGED_PREVIOUS" "$init_wal/managed-before-previous" || { rp_output_error update '静态清单在发布前被外部修改；未覆盖'; exit 1; }
+fi
 mv "$RP_MANAGED_CURRENT" "$next_previous" || exit 1
 mv "$candidate" "$RP_MANAGED_CURRENT" || { mv "$next_previous" "$RP_MANAGED_CURRENT"; exit 1; }
 candidate=
 
-if [ "$(rp_uci_get main enabled 0)" = 1 ]; then
+if [ "$init_stage" != 1 ] && [ "$(rp_uci_get main enabled 0)" = 1 ]; then
 	if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply" >"$work/apply.log" 2>&1; then
 		failed_current="$RP_ETC/managed.d/failed.$$.tmp"
 		mv "$RP_MANAGED_CURRENT" "$failed_current"
@@ -98,7 +112,10 @@ if [ "$(rp_uci_get main enabled 0)" = 1 ]; then
 		exit 1
 	fi
 fi
-rm -rf "$RP_MANAGED_PREVIOUS"
-mv "$next_previous" "$RP_MANAGED_PREVIOUS"
+if [ "$init_stage" = 1 ]; then
+	rp_managed_equal "$RP_MANAGED_PREVIOUS" "$init_wal/managed-before-previous" || { rp_output_error update 'previous 出现外部修改；保留恢复证据'; exit 1; }
+fi
+rm -rf "$RP_MANAGED_PREVIOUS" && mv "$next_previous" "$RP_MANAGED_PREVIOUS" || { rp_output_error update 'previous 发布中断；保留恢复证据'; exit 1; }
+[ "$init_stage" != 1 ] || rp_managed_phase "$init_wal" published || { rp_output_error update '初始化清单发布尚未收敛'; exit 1; }
 date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-update"
 rp_output_ok update "已更新 $updated 个来源并保留 previous"

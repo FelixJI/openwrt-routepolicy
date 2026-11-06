@@ -15,6 +15,7 @@ export REAL_WRITER_RENDER="${TEST_WRITER_LIBEXEC:-$ROOT/routepolicy/files/usr/li
 mkdir -p "$tmp/bin" "$tmp/root/etc/config" "$tmp/root/etc/init.d" "$tmp/root/etc/routepolicy/user.d" "$tmp/root/etc/routepolicy/managed.d/current" "$tmp/root/etc/routepolicy/managed.d/previous"
 cp -R "${TEST_WRITER_LIBEXEC:-$ROOT/routepolicy/files/usr/libexec/routepolicy}" "$tmp/lib"
 : >"$tmp/root/etc/config/routepolicy"; : >"$tmp/nft.log"; : >"$tmp/native.log"
+printf 'initial.example\n' >"$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
 cat >"$tmp/lib/render" <<'EOF'
 #!/bin/sh
 printf '%s\n' "${ROUTEPOLICY_WRITER_OWNER:-none}" >>"$TEST_WRITER_DIR/render-entered"

@@ -1,0 +1,316 @@
+#!/bin/sh
+# Portable declarations never carry a device's journals or runtime ownership.
+# OpenWrt ash supports function-local variables.
+# shellcheck disable=SC3043
+set -u
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+umask 077
+TAB=$(printf '\t')
+STAGE="$RP_RUN_DIR/restore"
+DECL="$RP_STATE_DIR/init-transaction/declarations"
+MAIN='enabled lan_interface default_interface policy_interface strict_enforcement dns_redirect route_local_traffic source_accounting source_idle_timeout source_max_entries warm_restore route_table rule_priority mark mark_mask smartdns_enabled smartdns_policy_group auto_update update_hour update_minute update_via_policy_interface'
+SOURCE='enabled name url format target min_entries max_shrink_percent update_via_policy_interface'
+fail() { rp_output_error "${operation:-lifecycle}" "$*"; exit 1; }
+read_line() {
+	local maximum=$1 raw newline='
+'
+	raw=$(dd bs=1024 count=$((maximum / 1024 + 1)) 2>/dev/null && printf '.') || fail '读取请求失败'
+	REQUEST_LINE=${raw%.}
+	[ "$(printf '%s' "$REQUEST_LINE" | wc -c)" -le "$((maximum+1))" ] || fail '请求超过长度上限'
+	case "$REQUEST_LINE" in *"$newline") REQUEST_LINE=${REQUEST_LINE%"$newline"} ;; esac
+	[ "$(printf '%s' "$REQUEST_LINE" | wc -c)" -le "$maximum" ] || fail '请求超过长度上限'
+	case "$REQUEST_LINE" in *"$newline"*) fail '请求必须恰好一行' ;; esac
+}
+word_in() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+safe_file() {
+	local path=$1 parent
+	[ -f "$path" ] && [ ! -L "$path" ] || return 1
+	parent=${path%/*}
+	while [ "$parent" != "$RP_ROOT" ] && [ -n "$parent" ] && [ "$parent" != / ]; do
+		[ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+		parent=${parent%/*}
+	done
+}
+no_pending() {
+	local pkg delta
+	for pkg in routepolicy network dhcp firewall smartdns; do
+		delta=$(uci -q changes "$pkg") && [ -z "$delta" ] || return 1
+	done
+}
+schema_admit() {
+	local version
+	version=$(uci -q get routepolicy.main.config_schema) || version=0
+	case "$version" in 0|1) ;; *) fail '配置 schema 高于本程序支持范围；拒绝迁移、恢复或降级执行';; esac
+}
+record() {
+	local text=$3
+	[ "${#text}" -le 4096 ] && ! printf '%s' "$text" | LC_ALL=C grep -q '[[:cntrl:]]' && printf '%s' "$text" | rp_utf8_text || fail '声明含非法 UTF-8、控制字符或过长字段'
+	printf '%s\t%s\t%s\n' "$1" "$2" "$text"
+}
+export_content() {
+	local key value section list params record_path index parameter
+	printf 'routepolicy-config\t1\nsensitive\t1\n'
+	for key in $MAIN; do
+		value=$(uci -q get "routepolicy.main.$key") || continue
+		record main "$key" "$value"
+	done
+	for section in $(rp_source_sections); do
+		rp_is_name "$section" 32 || fail '清单来源段名称非法'
+		for key in $SOURCE; do
+			value=$(uci -q get "routepolicy.$section.$key") || continue
+			record source "$section.$key" "$value"
+		done
+	done
+	for list in domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		[ ! -e "$RP_USER_DIR/$list.list" ] || safe_file "$RP_USER_DIR/$list.list" || fail '人工清单路径不是安全普通文件'
+		[ ! -f "$RP_USER_DIR/$list.list" ] || [ "$(wc -c <"$RP_USER_DIR/$list.list")" -le 262144 ] || fail '人工清单超过 256 KiB'
+		[ ! -f "$RP_USER_DIR/$list.list" ] || while IFS= read -r value || [ -n "$value" ]; do record rule "$list" "$value"; done <"$RP_USER_DIR/$list.list" || return 1
+	done
+	if record_path=$(rp_init_active_record); then
+		safe_file "$record_path/parameters" || fail '初始化声明不是安全普通文件'
+		params=$(cat "$record_path/parameters") || return 1
+		index=0
+		printf '%s\n' "$params" | tr '\t' '\n' | while IFS= read -r parameter; do
+			[ -n "$parameter" ] || continue
+			index=$((index+1)); record binding "$index" "$parameter"
+		done
+	fi
+	# Unknown DNS fields are listed by name only, never silently serialized as code.
+	uci -q show smartdns | sed -n 's/^smartdns\.\([^=]*\)=.*/\1/p' | while IFS= read -r key; do
+		record unportable "smartdns.$key" '需要目标设备管理员核对；portable 不执行原始 SmartDNS UCI'
+	done
+}
+export_config() {
+	local work bytes
+	work=$(mktemp "$RP_RUN_DIR/export.XXXXXX") || fail '不能创建导出文件'
+	if ! export_content >"$work"; then rm -f "$work"; fail '导出声明失败'; fi
+	bytes=$(wc -c <"$work")
+	[ "$bytes" -le 2097152 ] || { rm -f "$work"; fail '导出超过 2 MiB 上限'; }
+	if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
+		printf '{"ok":true,"operation":"config-export","schema":1,"sensitive":true,"format":"routepolicy-config-tsv","content":"%s"}\n' "$(rp_json_escape "$(cat "$work")")"
+	else cat "$work"; fi
+	rm -f "$work"
+}
+stage_config() {
+	local work kind key value rest section option seen='|' name size
+	work=$(mktemp -d "$RP_RUN_DIR/restore.XXXXXX") || fail '不能创建受限导入候选'
+	mkdir "$work/config" "$work/delta" "$work/user.d" || fail '不能准备候选'
+	dd bs=1024 count=2049 of="$work/input" 2>/dev/null || { rm -rf "$work"; fail '读取导入失败'; }
+	size=$(wc -c <"$work/input")
+	if [ "$size" -gt 2097152 ] || ! LC_ALL=C awk 'NR==1{if($0!="routepolicy-config\t1")bad=1;next} NR==2{if($0!="sensitive\t1")bad=1;next} {if(NF!=3)bad=1;line=$0;gsub(/\t/,"",line);if(line~/[[:cntrl:]]/||length($3)>4096)bad=1;print line} END{exit bad||NR<2}' FS='\t' "$work/input" >"$work/text" || ! rp_utf8_text <"$work/text"; then
+		rm -rf "$work"; fail '拒绝未知 schema、二进制、非法类型或超过 2 MiB 的导入'
+	fi
+	: >"$work/config/routepolicy"
+	uci -c "$work/config" -t "$work/delta" set routepolicy.main=main || fail '不能初始化声明候选'
+	while IFS="$TAB" read -r kind key value rest; do
+		case "$kind" in routepolicy-config|sensitive) continue ;; esac
+		[ -z "${rest:-}" ] || { rm -rf "$work"; fail '记录列数非法'; }
+		case "$kind" in
+			main)
+				word_in "$key" "$MAIN" || { rm -rf "$work"; fail '未知主设置字段'; }
+				case "$seen" in *"|main.$key|"*) rm -rf "$work"; fail '重复主设置';; esac; seen="$seen|main.$key|"
+				uci -c "$work/config" -t "$work/delta" set "routepolicy.main.$key=$value" || fail '主设置候选失败' ;;
+			source)
+				section=${key%%.*}; option=${key#*.}
+				(rp_is_name "$section" 32) && [ "$section" != main ] && word_in "$option" "$SOURCE" || { rm -rf "$work"; fail '未知来源或字段'; }
+				case "$seen" in *"|source.$key|"*) rm -rf "$work"; fail '重复来源字段';; esac; seen="$seen|source.$key|"
+				uci -c "$work/config" -t "$work/delta" set "routepolicy.$section=source" && uci -c "$work/config" -t "$work/delta" set "routepolicy.$key=$value" || fail '来源候选失败' ;;
+			rule)
+				word_in "$key" 'domain-policy domain-default ipv4-policy ipv4-default local-hosts' || { rm -rf "$work"; fail '非法人工清单类型或路径'; }
+				printf '%s\n' "$value" >>"$work/user.d/$key.list" || fail '不能保存人工清单候选' ;;
+			binding)
+				rp_uint_between "$key" 1 13 || { rm -rf "$work"; fail '非法旧设备绑定'; }
+				case "$seen" in *"|binding.$key|"*) rm -rf "$work"; fail '重复绑定';; esac; seen="$seen|binding.$key|"
+				printf '%s\t%s\n' "$key" "$value" >>"$work/bindings" ;;
+			unportable)
+				case "$key" in smartdns.*) ;; *) rm -rf "$work"; fail '非法不可移植字段名' ;; esac
+				case "$key" in */*|*..*) rm -rf "$work"; fail '不可移植字段不接受路径' ;; esac
+				[ "${#key}" -le 256 ] || { rm -rf "$work"; fail '不可移植字段名过长'; }
+				printf '%s\n' "$key" >>"$work/unportable" ;;
+			*) rm -rf "$work"; fail '未知记录类型；不接受 archive、路径、journal、锁或 applied' ;;
+		esac
+	done <"$work/input"
+	# Device names and enabled=1 from the source are never admitted as target intent.
+	uci -c "$work/config" -t "$work/delta" set routepolicy.main.enabled=0 && uci -c "$work/config" -t "$work/delta" set routepolicy.main.config_schema=1 && uci -c "$work/config" -t "$work/delta" commit routepolicy || fail '不能持久化候选'
+	if ! ( uci() { command uci -c "$work/config" -t "$work/delta" "$@"; }; rp_validate_main && rp_validate_sources ); then rm -rf "$work"; fail '声明值校验失败'; fi
+	for name in domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		[ -f "$work/user.d/$name.list" ] || : >"$work/user.d/$name.list"
+		[ "$(wc -c <"$work/user.d/$name.list")" -le 262144 ] || { rm -rf "$work"; fail '单份人工清单超过 256 KiB'; }
+		if [ "$name" = local-hosts ]; then
+			rp_normalize_local_hosts <"$work/user.d/$name.list" >"$work/$name.normalized" || { rm -rf "$work"; fail '本地主机格式非法'; }
+		elif [ -s "$work/user.d/$name.list" ]; then
+			case "$name" in domain-*) option=plain-domain ;; *) option=plain-ipv4 ;; esac
+			ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$option" "$work/user.d/$name.list" >"$work/$name.normalized" || { rm -rf "$work"; fail '人工清单校验失败'; }
+		else : >"$work/$name.normalized"; fi
+		mv "$work/$name.normalized" "$work/user.d/$name.list" || fail '不能归一化人工清单'
+	done
+	[ ! -e "$STAGE" ] || { [ -d "$STAGE" ] && [ ! -L "$STAGE" ] && [ -z "$(find "$STAGE" -type l)" ] && rm -rf "$STAGE"; } || fail '旧候选路径不安全'
+	mv "$work" "$STAGE" || fail '不能提升导入候选'
+	status_config
+}
+status_config() {
+	local pending=false unknown=''
+	if safe_file "$STAGE/input"; then pending=true; [ ! -f "$STAGE/unportable" ] || unknown=$(cat "$STAGE/unportable"); fi
+	printf '{"ok":true,"operation":"restore-status","schema":1,"candidate_pending":%s,"declaration_phase":"%s","interface_mapping_required":true,"danger_confirmation_required":true,"unportable_fields":"%s","runtime_imported":false}\n' "$pending" "$(rp_json_escape "$(cat "$DECL/phase" 2>/dev/null || printf absent)")" "$(rp_json_escape "$unknown")"
+}
+declaration_target() {
+	case "$1" in
+		routepolicy) printf '%s\n' "$RP_UCI_CONFIG" ;;
+		domain-policy|domain-default|ipv4-policy|ipv4-default|local-hosts) printf '%s/%s.list\n' "$RP_USER_DIR" "$1" ;;
+		*) return 1 ;;
+	esac
+}
+declaration_phase() {
+	printf '%s\n' "$1" >"$DECL/phase.new" && sync && mv "$DECL/phase.new" "$DECL/phase" && sync
+}
+declaration_matches() {
+	local target=$1 saved=$2
+	if [ -f "$saved.absent" ] && [ ! -L "$saved.absent" ]; then [ ! -e "$target" ] && [ ! -L "$target" ];
+	else safe_file "$target" && safe_file "$saved" && cmp -s "$target" "$saved"; fi
+}
+declaration_replace() {
+	local target=$1 saved=$2 replacement
+	[ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || return 1
+	if [ -f "$saved.absent" ]; then rm -f "$target"; return; fi
+	safe_file "$saved" || return 1
+	replacement=$(mktemp "${target%/*}/.rp-restore.XXXXXX") || return 1
+	if ! { cp "$saved" "$replacement" && chmod 600 "$replacement" && mv -f "$replacement" "$target" && sync; }; then rm -f "$replacement"; return 1; fi
+}
+declaration_prepare() {
+	local key target source phase
+	phase=$(cat "$DECL/phase" 2>/dev/null) || phase=absent
+	case "$phase" in absent|committed|rolled_back) ;; *) fail '旧声明事务尚未恢复';; esac
+	[ ! -L "$DECL" ] && { [ ! -e "$DECL" ] || { [ -d "$DECL" ] && [ -z "$(find "$DECL" -type l)" ] && rm -rf "$DECL"; }; } || fail '声明写前区不安全'
+	mkdir -p "$DECL/before" "$DECL/expected" && chmod 700 "$DECL" "$DECL/before" "$DECL/expected" || fail '不能建立声明写前区'
+	declaration_phase preparing || fail '不能持久化声明准备状态'
+	for key in routepolicy domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		target=$(declaration_target "$key") || fail '声明目标非法'
+		if [ -e "$target" ] || [ -L "$target" ]; then safe_file "$target" && cp -p "$target" "$DECL/before/$key" && chmod 600 "$DECL/before/$key" || fail '不能保存声明原值'
+		else : >"$DECL/before/$key.absent"; fi
+		case "$key" in routepolicy) source="$STAGE/config/routepolicy" ;; *) source="$STAGE/user.d/$key.list" ;; esac
+		safe_file "$source" && cp "$source" "$DECL/expected/$key" && chmod 600 "$DECL/expected/$key" || fail '不能保存声明期望值'
+	done
+	declaration_phase prepared || fail '不能持久化声明写前状态'
+}
+declaration_install() {
+	local key target
+	declaration_phase installing || return 1
+	for key in routepolicy domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		target=$(declaration_target "$key") || return 1
+		declaration_matches "$target" "$DECL/before/$key" && declaration_replace "$target" "$DECL/expected/$key" || return 1
+	done
+	declaration_phase installed
+}
+declaration_recover() {
+	local key target phase conflicts=''
+	[ -d "$DECL" ] && [ ! -L "$DECL" ] && [ -z "$(find "$DECL" -type l)" ] || fail '声明恢复区不安全或不存在'
+	phase=$(cat "$DECL/phase" 2>/dev/null) || phase=preparing
+	case "$phase" in committed|rolled_back) rp_output_ok restore-recover '声明事务已终结'; return ;; preparing) declaration_phase rolled_back && rp_output_ok restore-recover '准备阶段未修改公共声明，已取消候选'; return ;; prepared|installing|installed|recovering) ;; *) fail '声明阶段非法';; esac
+	no_pending || fail '未提交修改阻止声明恢复'
+	case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in applying|pending|rolling_back|confirming|conflict) fail '先使用 init-recover 收敛网络事务，再恢复应用声明' ;; esac
+	for key in routepolicy domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		target=$(declaration_target "$key") || fail '声明目标非法'
+		if ! declaration_matches "$target" "$DECL/before/$key" && ! declaration_matches "$target" "$DECL/expected/$key"; then conflicts="$conflicts $key"; fi
+	done
+	[ -z "$conflicts" ] || fail "声明存在外部修改，未覆盖: $conflicts"
+	declaration_phase recovering || fail '不能持久化恢复意图'
+	for key in routepolicy domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		target=$(declaration_target "$key") || fail '声明目标非法'
+		if declaration_matches "$target" "$DECL/before/$key"; then continue; fi
+		declaration_matches "$target" "$DECL/expected/$key" && declaration_replace "$target" "$DECL/before/$key" || fail '声明恢复中断或出现外部修改，保留原值等待重试'
+	done
+	declaration_phase rolled_back || fail '不能提交声明恢复终态'
+	rp_output_ok restore-recover '应用声明已逐文件恢复；未覆盖外部值'
+}
+restore_prepare() {
+	local access default_if policy new_role device proto address prefix gateway management management_prefix dns_default dns_policy confirm unknown_confirm extra key value name
+	safe_file "$STAGE/input" || fail '请先导入声明候选'
+	# One bounded, fixed-position request; no request text is shell source.
+	read_line 4096
+	IFS="$TAB" read -r access default_if policy new_role device proto address prefix gateway management management_prefix dns_default dns_policy confirm unknown_confirm extra <<EOF
+$REQUEST_LINE
+EOF
+	[ -z "${extra:-}" ] && [ "${confirm:-}" = 1 ] || fail '恢复必须明确接口映射与危险确认'
+	[ ! -s "$STAGE/unportable" ] || [ "${unknown_confirm:-}" = 1 ] || fail '必须明确确认已列出的不可移植 DNS 字段'
+	for value in "$access" "$default_if" "$policy" "$new_role" "$device" "$proto" "$address" "$prefix" "$gateway" "$management" "$management_prefix" "$dns_default" "$dns_policy"; do
+		[ -n "$value" ] && [ "${#value}" -le 256 ] || fail '映射参数非法'
+		case "$value" in *[!A-Za-z0-9_.:/,#-]*) fail '映射参数含非法字符' ;; esac
+	done
+	no_pending || fail '五份配置存在未提交修改'
+	# Preflight target topology before writing even the application's own declarations.
+	"$LIBEXEC/init-topology" plan "$access" "$default_if" "$policy" "$new_role" "$device" "$proto" "$address" "$prefix" "$gateway" "$management" "$management_prefix" "$dns_default" "$dns_policy" >"$STAGE/topology" || fail '目标拓扑预检失败'
+	for name in domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
+		[ ! -e "$RP_USER_DIR/$name.list" ] || safe_file "$RP_USER_DIR/$name.list" || fail '目标人工清单路径不安全'
+	done
+	[ ! -e "$RP_UCI_CONFIG" ] || safe_file "$RP_UCI_CONFIG" || fail '目标 RoutePolicy 配置路径不安全'
+	# Only application declarations are installed here; network/DHCP/DNS await init-apply.
+	for key in lan_interface default_interface policy_interface; do
+		case "$key" in lan_interface) value=$access ;; default_interface) value=$default_if ;; *) value=$policy ;; esac
+		uci -c "$STAGE/config" -t "$STAGE/delta" set "routepolicy.main.$key=$value" || fail '不能保存新映射'
+	done
+	uci -c "$STAGE/config" -t "$STAGE/delta" commit routepolicy || fail '不能提交新映射'
+	declaration_prepare
+	ROUTEPOLICY_DECLARATION_OWNER=1; export ROUTEPOLICY_DECLARATION_OWNER
+	declaration_install || fail '应用声明安装中断；原值与期望值已持久保存，请先 restore-recover'
+	for key in $(rp_source_sections); do
+		[ "$(rp_uci_get "$key" enabled 0)" != 1 ] || printf '1\n' >"$DECL/source-refresh" || fail '不能记录导入来源重验意图'
+	done
+	# New DHCP policy interfaces must exist before their bound source download.
+	# The initialization WAL prepares missing sources before policy activation.
+	ROUTEPOLICY_DECLARATION_OWNER=1 "$LIBEXEC/init-transaction" prepare "$access" "$default_if" "$policy" "$new_role" "$device" "$proto" "$address" "$prefix" "$gateway" "$management" "$management_prefix" "$dns_default" "$dns_policy" >"$DECL/init-result" || fail '恢复候选尚未准备；声明保持停用，请 restore-recover'
+	sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p' "$DECL/init-result" >"$DECL/init-token"
+	[ "$(wc -c <"$DECL/init-token")" = 33 ] && sync || fail '声明与网络候选绑定失败；尚未应用网络'
+	cat "$DECL/init-result"
+}
+operation=${1:-}; [ "$#" = 0 ] || shift
+[ "$#" = 0 ] || fail '生命周期入口不接受文件路径或额外参数'
+case "$operation" in
+	init-apply-request|exit-apply-request)
+		read_line 32; request=$REQUEST_LINE
+		[ "${#request}" = 32 ] || fail 'token 非法'
+		case "$request" in *[!0-9a-f]*) fail 'token 非法' ;; esac
+		case "$operation" in init-apply-request) action=apply ;; *) action=exit-apply ;; esac
+		exec "$LIBEXEC/init-transaction" "$action" "$request" ;;
+esac
+case "$operation" in config-export|config-import|restore-status|restore-prepare|restore-recover|migrate|package-preview|package-check|disable-preview|uninstall) ;; *) fail '未知生命周期操作' ;; esac
+schema_admit
+if [ "$operation" = restore-status ]; then status_config; exit 0; fi
+writer_role=lifecycle
+case "$operation" in restore-prepare|restore-recover) writer_role=init ;; esac
+rp_writer_enter "$writer_role" || fail '写锁忙或初始化恢复尚未完成'
+rp_ensure_dirs
+case "$operation" in
+	config-export) export_config ;;
+	config-import) stage_config ;;
+	restore-status) status_config ;;
+	restore-prepare) restore_prepare ;;
+	restore-recover) declaration_recover ;;
+	migrate)
+		no_pending || fail '迁移前请处理未提交的配置'
+		"$LIBEXEC/validate" >/dev/null || fail '旧配置校验失败；原配置未改变'
+		"$LIBEXEC/init-transaction" archive-migrate >/dev/null || fail '确认归档未能迁移；旧声明与记录保留'
+		uci set routepolicy.main.config_schema=1 && uci commit routepolicy || fail '迁移失败；请保留旧配置'
+		rp_output_ok migrate 'v0.3.3 声明兼容；仅登记 schema，未接管或重启网络' ;;
+	package-check)
+		read_line 128
+		IFS="$TAB" read -r requested_version requested_schema extra <<EOF
+$REQUEST_LINE
+EOF
+		[ -z "${extra:-}" ] && [ "$requested_schema" = 1 ] || fail '目标程序不支持当前 schema；拒绝降级'
+		case "$requested_version" in ''|*[!0-9a-zA-Z_.+-]*) fail '目标包版本非法' ;; esac
+		current_version=$(apk info -a routepolicy 2>/dev/null | sed -n '1s/^routepolicy-\(.*\) description:$/\1/p')
+		[ -n "$current_version" ] || fail '不能核实已安装版本；拒绝版本迁移'
+		comparison=$(apk version -t "$current_version" "$requested_version") || fail '不能比较包版本'
+		[ "$comparison" != '>' ] || fail '不支持降级；请使用兼容原版本与外部备份恢复'
+		rp_output_ok package-check '版本与 schema 准入通过；此检查不安装或重启网络' ;;
+	uninstall)
+		read_line 64; request=$REQUEST_LINE
+		[ "$request" = CONFIRM-REMOVE-ROUTEPOLICY ] || fail '请先查看 package-preview，再输入明确卸载确认'
+		no_pending || fail '未提交配置阻止受支持卸载入口'
+		unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND
+		exec 9>&-
+		exec apk del luci-app-routepolicy routepolicy ;;
+	package-preview|disable-preview)
+		printf '{"ok":true,"operation":"%s","routing_will_stop":true,"takeover_configuration_retained":true,"dhcp_will_not_start":true,"explicit_exit_required":true,"native_apk_can_bypass":true,"warning":"停用或删除程序会失去分流保护；接管的 DHCP/DNS 配置保留。需要原网络时必须先显式退出；原生 APK 强装旧程序不受 schema 入口保护。"}\n' "$operation" ;;
+esac

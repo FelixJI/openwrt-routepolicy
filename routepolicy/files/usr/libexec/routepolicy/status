@@ -37,7 +37,15 @@ blackhole=0; ip -4 route show table "$table" 2>/dev/null | grep -Eq '^blackhole 
 policy_default=0; ip -4 route show table "$table" 2>/dev/null | grep -Eq '^default([[:space:]]|$)' && policy_default=1
 main_default=0; ip -4 route show table main 2>/dev/null | grep -Eq '^default([[:space:]]|$)' && main_default=1
 smartdns_fragment=0; rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" && smartdns_fragment=1
-applied=0; [ -f "$RP_STATE_DIR/applied" ] && applied=1
+applied=0
+status_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || status_boot=
+receipt_boot=$(rp_state_get boot_id 2>/dev/null) || receipt_boot=
+if [ -n "$status_boot" ] && [ "$receipt_boot" = "$status_boot" ] && [ "$table_present:$rule_present" = 1:1 ] &&
+	[ "$(rp_state_get policy_interface 2>/dev/null)" = "$policy_if" ] && rp_config_admit; then
+	if [ "$(rp_uci_get main strict_enforcement 1)" != 1 ] || [ "$blackhole" = 1 ]; then applied=1; fi
+fi
+source_bootstrap=0
+if [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ] || [ -e "$RP_STATE_DIR/init-transaction/current/source-bootstrap" ] || [ -L "$RP_STATE_DIR/init-transaction/current/source-bootstrap" ]; then source_bootstrap=1; applied=0; fi
 service_running=0
 ubus call service list '{"name":"routepolicy"}' 2>/dev/null | jsonfilter -e '@.routepolicy.instances.*.running' 2>/dev/null | grep -Eq '^(true|1)$' && service_running=1
 smartdns_running=0
@@ -74,6 +82,7 @@ if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
 	printf '"interfaces":{"lan":%s,"default":%s,"policy":%s},' "$(interface_object "$lan_if")" "$(interface_object "$default_if")" "$(interface_object "$policy_if")"
 	printf '"sets":{"domain_policy4":%s,"domain_default4":%s,"static_policy4":%s,"static_default4":%s},' "$dpc" "$ddc" "$spc" "$sdc"
 	printf '"timestamps":{"last_apply":"%s","last_update":"%s"},"last_apply":"%s","last_update":"%s","last_error":"%s",' "$(rp_json_escape "$last_apply")" "$(rp_json_escape "$last_update")" "$(rp_json_escape "$last_apply")" "$(rp_json_escape "$last_update")" "$(rp_json_escape "$last_error")"
+	printf '"source_bootstrap":%s,' "$(bool_json "$source_bootstrap")"
 	printf '"enabled":%s,"applied":%s,"nft_table":%s,"policy_default":%s,"blackhole_default":%s}\n' "$(bool_json "$enabled")" "$(bool_json "$applied")" "$(bool_json "$table_present")" "$(bool_json "$policy_default")" "$(bool_json "$blackhole")"
 else
 	printf 'versions luci_app_routepolicy=%s smartdns=%s\n' "$luci_app_version" "$smartdns_version"

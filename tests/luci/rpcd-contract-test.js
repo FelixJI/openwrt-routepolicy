@@ -11,11 +11,14 @@ const converterPath = path.join(root, 'routepolicy', 'files', 'usr', 'libexec', 
 const legacyPath = path.join(root, 'luci-app-routepolicy', 'root', 'usr', 'libexec', 'rpcd', 'routepolicy');
 const expectedMethods = [
 	'apply', 'diagnose', 'import_legacy', 'read_local_hosts', 'read_user_list', 'reload', 'rollback',
+	'config_export', 'config_import', 'restore_status', 'restore_prepare', 'restore_recover', 'init_status', 'init_apply', 'init_confirm', 'init_recover', 'init_repair',
+	'exit_preview', 'exit_prepare', 'exit_apply', 'package_preview', 'disable_preview',
 	'observe_interfaces', 'observe_query', 'observe_sets',
 	'smartdns_apply', 'smartdns_discard_candidate', 'smartdns_save', 'smartdns_status', 'smartdns_validate',
 	'status', 'update', 'validate', 'write_local_hosts', 'write_user_list'
 ];
 const fixedCommands = new Set([
+	...['config-export', 'config-import', 'restore-status', 'restore-prepare', 'restore-recover', 'init-status', 'init-recover', 'init-repair', 'exit-preview', 'exit-prepare', 'package-preview', 'disable-preview', 'init-apply-request', 'exit-apply-request'].map(name => `/usr/sbin/routepolicyctl ${name} --json`),
 	'/usr/sbin/routepolicyctl status --json',
 	'/usr/sbin/routepolicyctl validate --json',
 	'/etc/init.d/routepolicy restart',
@@ -298,6 +301,24 @@ assert.strictEqual(
 	'RPC lifecycle response must preserve the concrete init-script result'
 );
 assert.strictEqual(routepolicy.reload.call({ args: {} }).ok, true, 'reload must use the same fixed lifecycle command');
+for (const name of ['init_apply', 'exit_apply']) {
+	const before = calls.length;
+	assert.strictEqual(routepolicy[name].call({ args: { token: 'a; reboot' } }).ok, false);
+	assert.strictEqual(calls.length, before, 'invalid lifecycle token must not start a process');
+	assert.strictEqual(routepolicy[name].call({ args: { token: 'a'.repeat(32) } }).ok, true);
+}
+const beforeHttpConfirm = calls.length;
+const httpConfirm = routepolicy.init_confirm.call({ args: { token: 'a'.repeat(32), address: '192.0.2.1' } });
+assert.strictEqual(httpConfirm.ok, false);
+assert.strictEqual(httpConfirm.confirmation_transport, 'trusted-ssh');
+assert.strictEqual(httpConfirm.http_confirmation_ready, false);
+assert.strictEqual(calls.length, beforeHttpConfirm, 'untrusted HTTP fields cannot construct an SSH confirmation');
+const dangerousBody = 'routepolicy-config\t1\nsensitive\t1\nsource\tfeed.name\t$(reboot)\n';
+assert.strictEqual(routepolicy.config_import.call({ args: { content: dangerousBody } }).ok, true);
+assert.ok(calls.some(call => call.command === '/usr/sbin/routepolicyctl config-import --json' && call.content === dangerousBody),
+	'dynamic declaration content must travel only through stdin');
+assert.strictEqual(routepolicy.config_import.call({ args: { content: 'partial-write' } }).ok, false);
+assert.strictEqual(routepolicy.config_import.call({ args: { content: 'x'.repeat(2097153) } }).ok, false);
 assert.ok(calls.length > 0, 'contract must exercise the process adapter');
 for (const call of calls) {
 	assert.strictEqual(typeof call.command, 'string', 'OpenWrt 25.12 popen command must be a string');

@@ -296,7 +296,7 @@ init_dns_restore_admit() {
 	for package in $packages; do
 		pending=$(uci -q changes "$package") && [ -z "$pending" ] && uci_committed export "$package" >/dev/null || return 1
 	done
-	row=$(cat "$WAL/count") && rp_uint_between "$row" 1 256 || return 1
+	row=$(cat "$WAL/count") && rp_uint_between "$row" 1 2048 || return 1
 	while [ "$row" -gt 0 ]; do
 		entry="$WAL/fields/$row"; row=$((row-1))
 		[ ! -L "$entry" ] && [ -d "$entry" ] || return 1

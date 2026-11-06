@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=routepolicy
 PKG_VERSION:=0.3.3
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=RoutePolicy contributors
 
@@ -55,6 +55,7 @@ define Package/routepolicy/install
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-dns $(1)/usr/libexec/routepolicy/init-dns
 	$(INSTALL_DATA) ./files/usr/libexec/routepolicy/init-policy-runtime $(1)/usr/libexec/routepolicy/init-policy-runtime
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-topology $(1)/usr/libexec/routepolicy/init-topology
+	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/lifecycle $(1)/usr/libexec/routepolicy/lifecycle
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/observe $(1)/usr/libexec/routepolicy/observe
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/render $(1)/usr/libexec/routepolicy/render
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/rollback $(1)/usr/libexec/routepolicy/rollback
@@ -73,13 +74,7 @@ endef
 define Package/routepolicy/postrm
 #!/bin/sh
 [ "$${PKG_UPGRADE:-0}" = 1 ] && exit 0
-for section in $$(uci -q show smartdns 2>/dev/null | sed -n 's/^smartdns\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=smartdns$$/\1/p'); do
-	uci -q del_list "smartdns.$$section.conf_files=/etc/smartdns/conf.d/90-routepolicy.conf" >/dev/null 2>&1 || true
-	uci -q del_list "smartdns.$$section.conf_files=/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf" >/dev/null 2>&1 || true
-done
-uci commit smartdns >/dev/null 2>&1 || true
-rm -f /etc/smartdns/conf.d/90-routepolicy.conf /etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf
-[ ! -x /etc/init.d/smartdns ] || /etc/init.d/smartdns reload >/dev/null 2>&1 || true
+echo 'RoutePolicy 程序已移除；接管的 DHCP/DNS 配置及用户声明保留。分流保护不可用，请先重装恢复或在卸载前显式退出。' >&2
 exit 0
 endef
 

@@ -102,6 +102,8 @@ LUCI_ASSET="${LUCI_URL##*/}"
 cd /tmp
 wget -O routepolicy-latest.apk "${LATEST_DOWNLOAD}/${CORE_ASSET}"
 wget -O luci-app-routepolicy-latest.apk "${LATEST_DOWNLOAD}/${LUCI_ASSET}"
+# 旧 r1 回执未绑定 boot；先使用旧程序显式撤下旧运行态。
+/etc/init.d/routepolicy stop
 apk add --allow-untrusted \
   ./routepolicy-latest.apk \
   ./luci-app-routepolicy-latest.apk
@@ -116,6 +118,47 @@ ubus call routepolicy status '{}'
 每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
 
 规则重建保留两个 SmartDNS 动态业务 set 的内核对象及剩余 TTL，已有 DNS 缓存对应的地址不会因规则替换而丢失。源 IP 归因统计允许在完整重建时归零。遇到不兼容的旧集合结构会明确报错，保留现场供处理。升级不会自动开启本机分流或按源 IP 统计。
+
+### 声明备份与固件升级后恢复
+
+本轮核心与 LuCI 包均为 `0.3.3-r2`。从旧 `0.3.3-r1` 升级时，先使用旧程序显式停止分流，再安装 r2 并重建。缺少当前 boot 授权的旧回执不能认领同名运行对象；遇到对象时新程序保留并拒绝操作，不能用强制重装冒充版本升级。
+
+`routepolicyctl migrate --json` 校验兼容的 v0.3.3 配置并登记 schema 1、迁移确认记录目录；它不接管或重启网络。新程序拒绝更高的配置 schema。受支持的包迁移入口为 `printf '目标APK版本\t1\n' | routepolicyctl package-check --json`：不支持的 schema 或较旧版本会实际拒绝。该准入不能阻止管理员绕过入口、用原生 APK 强装不认识新 schema 的旧程序；这种降级不受支持。
+
+固件升级前，在单人维护窗口和带外控制台中完成：
+
+```sh
+umask 077
+routepolicyctl migrate --json
+routepolicyctl config-export > /tmp/routepolicy.rpconf
+sysupgrade -l
+sysupgrade -b /tmp/before-firmware.tar.gz
+```
+
+核对备份包含 `/etc/config/routepolicy`、人工清单、静态 `managed.d/current` 清单，以及 `state/init-transaction/active`、`source` 和 `confirmed/` 中完整的确认记录／累计退出原值。SmartDNS、network、dhcp、firewall 的原有未知字段由系统自己的配置备份保存。临时锁、未提交 WAL、applied 回执、warm 动态集合和官方 init／二进制不属于应用保留清单。恢复入口会重新建立 0700 目录和 0600 记录。
+
+把系统备份、portable 声明、上一个可用版本和待安装版本的两个 APK、依赖说明及已有发布校验材料复制到路由器之外，再按 OpenWrt 官方流程升级。普通 sysupgrade 和公共 ASU 不会自动保留本项目的自定义 APK。应用缺失期间没有分流规则与 strict 保护；SmartDNS 缺失时也可能没有 DNS，接入 DHCP 仍保持关闭。先保留带外管理与离线安装材料，避免依赖待恢复的 DNS 下载应用。
+
+升级完成后从控制台重新安装受支持的两个 APK 及依赖，再执行 `routepolicyctl init-repair --json`、`routepolicyctl diagnose --json` 和 `ubus call routepolicy status '{}'`。恢复根据声明重新检查当前接口、受管字段、依赖和内核对象，先建立策略规则再启动 DNS；旧启动的 applied 不能认领新内核的同名资源。缺失依赖、静态清单或所有权冲突会保留现场并报错，不能把空规则或陈旧回执当作 strict 成功。实际固件升级只在隔离环境验收，本命令不会代替管理员执行 sysupgrade。
+
+### 在另一台设备导入
+
+portable 使用 `routepolicy-config` schema 1 的 UTF-8 文本记录，最多 2 MiB、每份人工清单最多 256 KiB。它保存应用设置、来源、人工规则和初始化绑定提示；不接受 archive、任意文件路径、journal、applied 或动态集合。来源 URL、本地主机、接口与 DNS 地址可能敏感，备份必须私下保存。
+
+```sh
+routepolicyctl config-import --json < /tmp/routepolicy.rpconf
+routepolicyctl restore-status --json
+```
+
+这两步只建立候选，不接管目标设备。schema 1 的 DNS 可移植意图限于初始化的默认／策略两组上游提示；其他 SmartDNS UCI 字段和用户上游会逐项列为 `unportable_fields`，目标设备不执行原始配置文本。请在目标设备核对这些设置；本机包升级和标准系统备份继续保留它们。
+
+`restore-prepare` 从 stdin 接收恰好一行、15 列 Tab 分隔的参数：接入、默认出口、策略出口，新出口角色、网卡、协议、IPv4、前缀、网关，新管理地址、前缀，两组 DNS，危险确认 `1`，不可移植字段确认 `1`。前 13 列与 `init-prepare` 相同，保留项填 `-`；必须重新明确目标设备接口与 DNS，旧设备绑定不自动生效。导入的启用来源重新下载，缺少快照的来源也必须准备齐全；初始化事务先建立新出口，再按原意图绑定出口下载，验证清单后才建立策略和确认。不会暗中通过默认出口下载或以空规则成功；下载或后续应用失败会恢复原 `current/previous` 清单，外部冲突保留并报告。
+
+需要 DNS 解析才能下载时，同一未确认事务先建立受管策略对象和 DNS，引导时优先沿用已验证的旧静态集合；缺少规则的部分仍是待准备状态。此时 `source_bootstrap=true`、`applied=false`，诊断和确认入口都会拒绝把它当成完成。下载、最终策略与 DNS 校验完成后才能清除引导状态；整个过程共用原 120 秒窗口、首次写前意图和逐字段回滚，不另外启动临时 DNS 程序。
+
+预检通过后只安装应用自己的声明，网络仍待确认；保存返回的 token，按 `init-apply TOKEN` → 连接目标管理地址 → `init-confirm TOKEN` 完成现有事务。声明六个固定文件有同一共享写锁下的写前记录；安装、预检、下载或确认失败时先检查 `init-status`／`restore-status`，网络事务用 `init-recover` 收敛，再用 `restore-recover` 逐文件恢复旧应用声明。外部已改的值不会被覆盖。
+
+恢复 RPC 提供同一候选、应用和状态合同；本轮确认传输为 `confirmation_transport=trusted-ssh`。`init_confirm` RPC 明确返回需要可信确认，不会把浏览器自报地址写成 `SSH_CONNECTION`。实际确认必须从新管理入口的 LAN SSH 连接执行；浏览器的可信 HTTP 重连确认适配属于后续 #20，本轮不宣称浏览器闭环已完成。
 
 ## SmartDNS 管理
 
@@ -158,14 +201,22 @@ routepolicyctl render
 
 ## 卸载与回退
 
-先停用服务，确认默认网络仍可访问，再移除包：
+停用分流、退出旁路由模式和卸载是三种不同操作。`disable-preview` 显示停用影响；关闭 `routepolicy.main.enabled` 后重载服务会撤掉应用分流，但保留接入 DHCP 关闭与 DNS 接管配置，不能把它当作恢复原网络。
+
+如需恢复最初的接入地址、DHCP/DNS 配置和服务启动／运行状态，请先从带外控制台显式退出：
 
 ```sh
-/etc/init.d/routepolicy stop
-apk del luci-app-routepolicy routepolicy
+routepolicyctl exit-preview --json
+routepolicyctl exit-prepare --json
+# 核对预览并保存返回的 token；退出可能改变管理地址与 DHCP 服务。
+routepolicyctl exit-apply TOKEN
 ```
 
-卸载只移除 90/91 的 `conf_files` 登记和 RoutePolicy 自有运行片段，不删除 `/etc/config/smartdns`、用户上游、未知字段或保留的本地主机 conffile，也不删除旧方案文件。若此预期不成立，请停止操作并保留现场信息后按 [安全策略](SECURITY.md) 报告。
+退出只恢复有累计来源且仍符合预期的字段。旧版本多次初始化后缺少中间原值、外部编辑或未知子字段会在预览中列出并阻止猜测恢复；不会整份覆盖配置。成功退出后原用户上游和未知字段仍保留。
+
+确认默认网络和 DNS 可用后，再运行 `routepolicyctl package-preview --json`，用 `printf 'CONFIRM-REMOVE-ROUTEPOLICY\n' | routepolicyctl uninstall` 明确删除两个包。也可以明确选择保留接管配置后删除程序，但此时分流保护和应用管理都不可用，应安排重装或外部维护。
+
+原生 `apk del` 不等于退出，APK 的 pre-deinstall 失败也不能阻止删除。卸载只撤销自有分流和 90 适配登记，不启动 DHCP，不在程序删除后重载 DNS；91、用户 SmartDNS 上游、未知 `conf_files` 和用户声明保留。下次 SmartDNS 重启不再引用已撤下的 90 片段。没有新增 purge，也不删除旧方案文件。
 
 ## 安全边界
 

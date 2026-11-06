@@ -4,8 +4,10 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-status-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-mkdir -p "$tmp/etc/config" "$tmp/etc/routepolicy/state" "$tmp/etc/smartdns/conf.d"
-: >"$tmp/etc/config/routepolicy"; : >"$tmp/etc/routepolicy/state/applied"; : >"$tmp/etc/smartdns/conf.d/90-routepolicy.conf"
+mkdir -p "$tmp/etc/config" "$tmp/etc/routepolicy/state" "$tmp/etc/smartdns/conf.d" "$tmp/proc/sys/kernel/random"
+: >"$tmp/etc/config/routepolicy"; : >"$tmp/etc/smartdns/conf.d/90-routepolicy.conf"
+printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/proc/sys/kernel/random/boot_id"
+printf 'boot_id=00000000-0000-4000-8000-000000000001\npolicy_interface=usbwan\n' >"$tmp/etc/routepolicy/state/applied"
 PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
 	ROUTEPOLICY_OUTPUT=json "$ROOT/routepolicy/files/usr/libexec/routepolicy/status" >"$tmp/status.json"
 for fragment in \
@@ -30,4 +32,14 @@ TEST_BAD_CONFIG=1 PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" RO
 	ROUTEPOLICY_OUTPUT=json "$ROOT/routepolicy/files/usr/libexec/routepolicy/status" >"$tmp/status-bad.json"
 grep -Fq '"enabled":false' "$tmp/status-bad.json" || { cat "$tmp/status-bad.json" >&2; exit 1; }
 grep -Fq '"table":200' "$tmp/status-bad.json" || { cat "$tmp/status-bad.json" >&2; exit 1; }
+printf 'source_bootstrap=1\n' >>"$tmp/etc/routepolicy/state/applied"
+PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	ROUTEPOLICY_OUTPUT=json "$ROOT/routepolicy/files/usr/libexec/routepolicy/status" >"$tmp/status-bootstrap.json"
+grep -Fq '"source_bootstrap":true' "$tmp/status-bootstrap.json"
+grep -Fq '"applied":false' "$tmp/status-bootstrap.json"
+printf 'boot_id=00000000-0000-4000-8000-000000000001\npolicy_interface=usbwan\n' >"$tmp/etc/routepolicy/state/applied"
+printf '00000000-0000-4000-8000-000000000002\n' >"$tmp/proc/sys/kernel/random/boot_id"
+PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	ROUTEPOLICY_OUTPUT=json "$ROOT/routepolicy/files/usr/libexec/routepolicy/status" >"$tmp/status-stale.json"
+grep -Fq '"applied":false' "$tmp/status-stale.json" || { printf 'stale boot receipt was reported applied\n' >&2; exit 1; }
 printf 'status contract tests: passed\n'

@@ -65,7 +65,10 @@ reload_service() {
 }
 
 stop_service() {
-	"$ROUTEPOLICY_APPLY" teardown
+	if [ "${APK_SCRIPT:-}" = pre-deinstall ]; then
+		# APK's default_prerm runs before package prerm; never reload native DNS here.
+		ROUTEPOLICY_UNINSTALL=1 "$ROUTEPOLICY_APPLY" teardown
+	else "$ROUTEPOLICY_APPLY" teardown; fi
 }
 
 service_triggers() {

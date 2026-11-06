@@ -33,13 +33,22 @@ grep -Fxq reload "$log"
 grep -Fq 'del_list smartdns.main.conf_files=/etc/smartdns/conf.d/90-routepolicy.conf' "$tmp/uci.log"
 
 : >"$log"; : >"$tmp/ip.log"; : >"$tmp/nft.log"
-printf '%s\n' 'active fragment' >"$tmp/etc/smartdns/conf.d/90-routepolicy.conf"
+PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" sh -c '. "$ROUTEPOLICY_LIBEXEC/common"; LIBEXEC=$ROUTEPOLICY_LIBEXEC; rp_render_smartdns90 "$RP_SMARTDNS_FILE"'
 TEST_SMARTDNS_LOG="$log" TEST_UCI_LOG="$tmp/uci.log" TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" PATH="$ROOT/tests/core/stubs:$PATH" \
 	ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$LIBEXEC/apply" teardown >/dev/null
 [ ! -e "$tmp/etc/smartdns/conf.d/90-routepolicy.conf" ]
 grep -Fxq reload "$log"
 
 : >"$log"; : >"$tmp/ip.log"; : >"$tmp/nft.log"
+PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" sh -c '. "$ROUTEPOLICY_LIBEXEC/common"; LIBEXEC=$ROUTEPOLICY_LIBEXEC; rp_render_smartdns90 "$RP_SMARTDNS_FILE"'
+cp "$tmp/etc/smartdns/conf.d/90-routepolicy.conf" "$tmp/fragment-before"
+if TEST_SMARTDNS_RELOAD_FAIL=1 TEST_SMARTDNS_LOG="$log" TEST_UCI_LOG="$tmp/uci.log" TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" PATH="$ROOT/tests/core/stubs:$PATH" \
+	ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$LIBEXEC/apply" teardown >/dev/null 2>&1; then
+	printf 'teardown ignored native reload failure\n' >&2; exit 1
+fi
+cmp "$tmp/fragment-before" "$tmp/etc/smartdns/conf.d/90-routepolicy.conf"
+grep -Fxq reload "$log"
+
 printf '%s\n' 'must survive' >"$tmp/etc/smartdns/conf.d/90-routepolicy.conf"
 if TEST_SMARTDNS_RELOAD_FAIL=1 TEST_SMARTDNS_LOG="$log" TEST_UCI_LOG="$tmp/uci.log" TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" PATH="$ROOT/tests/core/stubs:$PATH" \
 	ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$LIBEXEC/apply" teardown >/dev/null 2>&1; then

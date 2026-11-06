@@ -102,7 +102,7 @@ exec target-rc "$F22_ROOT/source/smartdns" "$@"
         write(root/'etc/config'/package, data)
         (root/'etc/config'/('f22_'+package)).symlink_to(package)
     boot = root/'proc/sys/kernel/random/boot_id'; write(boot, '00000000-0000-4000-8000-000000000001\n')
-    tx = root/'etc/routepolicy/state/init-transaction'; current = tx/'current'; active = tx/('confirmed-'+'a'*32)
+    tx = root/'etc/routepolicy/state/init-transaction'; current = tx/'current'; active = tx/'confirmed'/('a'*32)
     for path in [current, active]: path.mkdir(parents=True)
     for name, value in {'phase':'prepared', 'token':'b'*32, 'prepared-boot-id':boot.read_text(), 'candidate':''}.items(): write(current/name, value)
     for name, value in {'phase':'confirmed', 'token':'a'*32, 'boot-id':boot.read_text(), 'policy-active':'0', 'parameters':'lan\twan\twan2\t-\t-\t-\t-\t-\t-\t-\t-\t192.0.2.53\t198.51.100.53\n'}.items(): write(active/name, value)

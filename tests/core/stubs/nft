@@ -3,13 +3,18 @@
 case "$*" in
 	'list table inet routepolicy')
 		[ "${TEST_NFT_ABSENT:-0}" != 1 ] || exit 1
+		[ -f "${ROUTEPOLICY_ROOT:-}/etc/routepolicy/state/applied" ] || [ "${TEST_NFT_PRESENT:-0}" = 1 ] || exit 1
 		if [ "${TEST_NFT_DELETE_FAIL:-0}" = 1 ] || [ -z "${TEST_NFT_LOG:-}" ] || ! grep -Fxq 'delete table inet routepolicy' "$TEST_NFT_LOG"; then
 			echo 'table inet routepolicy { }'
 		else
 			exit 1
 		fi
 		;;
-	'list tables') exit 0 ;;
+	'list tables')
+		[ "${TEST_NFT_ABSENT:-0}" != 1 ] || exit 0
+		if [ -f "${ROUTEPOLICY_ROOT:-}/etc/routepolicy/state/applied" ] || [ "${TEST_NFT_PRESENT:-0}" = 1 ]; then
+			if [ "${TEST_NFT_DELETE_FAIL:-0}" = 1 ] || [ -z "${TEST_NFT_LOG:-}" ] || ! grep -Fxq 'delete table inet routepolicy' "$TEST_NFT_LOG"; then printf 'table inet routepolicy\n'; fi
+		fi ;;
 	'delete table inet routepolicy') [ "${TEST_NFT_DELETE_FAIL:-0}" != 1 ] ;;
 	'list set inet routepolicy '*) printf 'set x {\n type ipv4_addr\n flags timeout\n elements = { 8.8.8.8, 1.1.1.1 }\n}\n' ;;
 	'list chain inet routepolicy classify') echo 'udp dport 53 redirect to :53' ;;

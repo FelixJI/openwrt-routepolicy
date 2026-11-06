@@ -271,6 +271,7 @@ policy_interface=wanold
 policy_device=eth0
 policy_cidr=10.17.1.0/24
 EOF
+  printf 'boot_id=%s\n' "$(cat "$wal/boot-id")" >>"$state/applied"
   if [ "${TEST_MARK:-0x100}" != 0x100 ]; then
    sed -i "s/mark=0x100/mark=$TEST_MARK/;s/mark_mask=0x100/mark_mask=$TEST_MARK/" "$state/applied"
   fi
@@ -284,6 +285,81 @@ run_owner() {
 recovery_wrote_nothing() {
  if grep -Eq '^ip -4 (rule (add|del)|route (add|del|replace|flush))|^nft (-f|delete)' "$tmp/commands"; then cat "$tmp/commands" >&2; exit 1; fi
 }
+if [ "${1:-}" = --bootstrap ]; then
+	. "$ROUTEPOLICY_LIBEXEC/common"
+	cat >"$tmp/owner" <<'SH'
+#!/bin/sh
+set -eu
+. "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_enter init
+wal="$RP_STATE_DIR/init-transaction/current"
+export ROUTEPOLICY_INIT_GENERATION="$(cat "$wal/token")"
+printf '%s\n' "$ROUTEPOLICY_INIT_GENERATION" >"$wal/source-bootstrap"
+ROUTEPOLICY_SOURCE_BOOTSTRAP=1 "$ROUTEPOLICY_LIBEXEC/apply" >"$TEST_INTERRUPTION_DIR/bootstrap-result" 2>&1
+[ -f "$wal/policy-runtime-intent" ] && [ "$(rp_state_get source_bootstrap)" = 1 ]
+cp "$wal/policy-runtime-intent" "$TEST_INTERRUPTION_DIR/bootstrap-intent"
+scenario=$(cat "$TEST_INTERRUPTION_DIR/scenario")
+if [ "$scenario" = source-published ]; then
+	rp_managed_prepare "$wal"
+	mkdir "$wal/managed-expected"; printf 'new.example\n' >"$wal/managed-expected/feed.domain-policy.list"
+	printf 'previous.next.123\n' >"$wal/managed-swap-name"; rp_managed_phase "$wal" publishing
+	mv "$RP_MANAGED_CURRENT" "$RP_ETC/managed.d/previous.next.123"
+	cp -pR "$wal/managed-expected" "$RP_MANAGED_CURRENT"
+	rm -rf "$RP_MANAGED_PREVIOUS"; mv "$RP_ETC/managed.d/previous.next.123" "$RP_MANAGED_PREVIOUS"
+	rp_managed_phase "$wal" published
+fi
+if [ "$scenario" = final-failure ] || [ "$scenario" = success ]; then
+	[ "$scenario" != final-failure ] || : >"$TEST_INTERRUPTION_DIR/fail-applied-publish"
+	set +e
+	ROUTEPOLICY_SOURCE_BOOTSTRAP=0 "$ROUTEPOLICY_LIBEXEC/apply" >"$TEST_INTERRUPTION_DIR/final-result" 2>&1
+	result=$?
+	set -e
+	if [ "$scenario" = success ]; then
+		[ "$result" = 0 ] && [ ! -e "$wal/policy-runtime-intent" ] && [ "$(rp_state_get source_bootstrap)" = 0 ]
+		exit 0
+	fi
+	[ "$result" != 0 ] && cmp "$wal/policy-runtime-intent" "$TEST_INTERRUPTION_DIR/bootstrap-intent"
+fi
+kill -KILL "$$"
+SH
+	cat >"$tmp/bootstrap-recover" <<'SH'
+#!/bin/sh
+set -eu
+. "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_enter init
+wal="$RP_STATE_DIR/init-transaction/current"
+printf 'rolling_back\n' >"$wal/phase"
+rp_managed_restore "$wal"
+mode=teardown
+if [ "$(cat "$wal/policy-active")" = 1 ]; then printf 'wanold\n' >"$TEST_INTERRUPTION_DIR/current-if"; mode=apply; fi
+rm -f "$TEST_INTERRUPTION_DIR/fail-applied-publish"
+ROUTEPOLICY_INIT_RESTORE=1 ROUTEPOLICY_INIT_GENERATION="$(cat "$wal/token")" "$ROUTEPOLICY_LIBEXEC/apply" "$mode" >"$TEST_INTERRUPTION_DIR/recover-result" 2>&1
+SH
+	for active in 0 1; do
+		for boundary in bootstrap-published source-published final-failure success; do
+			reset "$active" never
+			printf '100.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"; printf '10000\n' >"$wal/uptime-start-cs"
+			printf '%s\n' "$boundary" >"$tmp/scenario"
+			mkdir -p "$RP_MANAGED_CURRENT" "$RP_MANAGED_PREVIOUS"
+			printf 'old.example\n' >"$RP_MANAGED_CURRENT/feed.domain-policy.list"
+			printf 'unknown\n' >"$RP_MANAGED_CURRENT/unknown.keep"
+			if run_owner >"$tmp/bootstrap-owner.log" 2>&1; then rc=0; else rc=$?; fi
+			if [ "$boundary" = success ]; then
+				[ "$rc" = 0 ] || { cat "$tmp/bootstrap-owner.log" "$tmp/bootstrap-result" "$tmp/final-result"; exit 1; }
+			else
+				[ "$rc" = 137 ] || { cat "$tmp/bootstrap-owner.log" "$tmp/bootstrap-result" "$tmp/final-result" 2>/dev/null; exit 1; }
+				sh "$tmp/bootstrap-recover" || { cat "$tmp/recover-result"; exit 1; }
+				[ ! -e "$wal/policy-runtime-intent" ]
+				grep -Fxq old.example "$RP_MANAGED_CURRENT/feed.domain-policy.list"
+				grep -Fxq unknown "$RP_MANAGED_CURRENT/unknown.keep"
+				if [ "$active" = 0 ]; then [ ! -s "$tmp/routes" ] && [ ! -e "$tmp/rule" ] && [ ! -e "$tmp/nft" ];
+				else grep -Fq 'default via 10.17.1.2 dev eth0' "$tmp/routes"; [ -f "$tmp/rule" ] && [ -f "$tmp/nft" ]; fi
+			fi
+		done
+	done
+	printf '%s\n' 'bootstrap typed intent: passed (active0/1; post-bootstrap/source kill, final write failure, unchanged first intent, final retirement)'
+	exit 0
+fi
 count=0
 for active in 0 1; do
  for point in nft rule blackhole connected default catalog before-applied published; do

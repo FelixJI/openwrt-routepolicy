@@ -9,6 +9,8 @@ ipr_context() {
 	IPR_WAL="$RP_STATE_DIR/init-transaction/current"
 	IPR_INTENT="$IPR_WAL/policy-runtime-intent"
 	IPR_CONTEXT=0; IPR_ERROR=; IPR_TOKEN=; IPR_ENABLED=0; IPR_CROSSBOOT_EMPTY=0
+	IPR_CONTINUING=0
+	IPR_PLANNED_ROUTES=; IPR_BEFORE_ROUTES=
 	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] || return 0
 	rp_writer_owned || return 1
 	if [ -z "${ROUTEPOLICY_INIT_GENERATION:-}" ] && [ ! -e "$IPR_WAL" ] && [ ! -L "$IPR_WAL" ]; then return 0; fi
@@ -30,7 +32,7 @@ ipr_context() {
 				return 1 ;;
 			esac
 		fi
-		case "$IPR_PHASE" in applying|rolling_back|pending|confirming|confirmed|rolled_back|expired|prepared) return 0 ;; *) return 1 ;; esac
+		case "$IPR_PHASE" in applying|rolling_back|pending|confirming|confirmed|rolled_back|expired|prepared|exited) return 0 ;; *) return 1 ;; esac
 	fi
 	for IPR_NAME in token boot-id phase policy-active policy-attempted; do
 		[ -f "$IPR_WAL/$IPR_NAME" ] && [ ! -L "$IPR_WAL/$IPR_NAME" ] || return 1
@@ -50,6 +52,21 @@ ipr_context() {
 		return 1
 	fi
 	IPR_CONTEXT=1
+}
+
+ipr_continue() {
+	[ "$IPR_CONTEXT" = 1 ] && [ "$IPR_PHASE" = applying ] && [ -f "$IPR_INTENT" ] && [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" != 1 ] || return 0
+	[ ! -L "$IPR_INTENT" ] || return 1
+	[ -f "$IPR_WAL/source-bootstrap" ] && [ ! -L "$IPR_WAL/source-bootstrap" ] && [ "$(cat "$IPR_WAL/source-bootstrap")" = "$IPR_TOKEN" ] || return 0
+	rp_init_window_open "$IPR_WAL" || return 1
+	ipr_validate_rows || return 1
+	local version token boot wal_boot active policy_if write_mode
+	IFS="$(printf '\t')" read -r version token boot wal_boot active IPR_TABLE IPR_PRIORITY IPR_MARK IPR_MASK policy_if write_mode <"$IPR_INTENT" || return 1
+	[ "$version" = routepolicy-init-runtime-v1 ] && [ "$token" = "$IPR_TOKEN" ] && [ "$boot" = "$IPR_BOOT" ] && [ "$wal_boot" = "$IPR_WAL_BOOT" ] && [ "$active" = "$IPR_ACTIVE" ] && [ "$write_mode" = forward ] || return 1
+	rp_init_routing_id_between "$IPR_TABLE" 1 252 && rp_init_routing_id_between "$IPR_PRIORITY" 1 32765 && rp_is_mark_bit "$IPR_MARK" && [ "$IPR_MASK" = "$IPR_MARK" ] || return 1
+	[ "$(rp_state_get source_bootstrap)" = 1 ] && [ "$(rp_state_get init_generation)" = "$IPR_TOKEN" ] && [ "$(rp_state_get boot_id)" = "$IPR_BOOT" ] && [ "$(rp_state_get policy_interface)" = "$policy_if" ] || return 1
+	[ "$(rp_uci_get main policy_interface '')" = "$policy_if" ] || return 1
+	IPR_CONTINUING=1
 }
 
 # Normalize only the three route forms written by apply. Unknown attributes or
@@ -189,6 +206,7 @@ ipr_delete_route() {
 
 ipr_recover() {
 	IPR_RECOVERED=0; IPR_STALE=0
+	[ "$IPR_CONTINUING" != 1 ] || return 0
 	[ -e "$IPR_INTENT" ] || [ -L "$IPR_INTENT" ] || return 0
 	[ "$IPR_CONTEXT" = 1 ] && [ "$IPR_PHASE" = rolling_back ] && [ -f "$IPR_INTENT" ] && [ ! -L "$IPR_INTENT" ] || return 1
 	ipr_validate_rows || return 1
@@ -262,7 +280,8 @@ EOF
 ipr_prepare() {
 	IPR_ENABLED=0
 	[ "$IPR_CONTEXT" = 1 ] || return 0
-	local stage="$IPR_INTENT.new" before catalog generation old_device old_cidr applied_before applied_if_before before_nft
+	local stage="$IPR_INTENT.new" before catalog generation old_device old_cidr applied_before applied_if_before before_nft retained_plan
+	retained_plan=$IPR_PLANNED_ROUTES
 	if ! rp_init_routing_id_between "$table" 1 252 || ! rp_init_routing_id_between "$priority" 1 32765; then
 		IPR_ERROR='初始化 route_table/rule_priority 必须为无前导零的十进制整数；未执行内核写入'
 		return 1
@@ -282,7 +301,9 @@ ipr_prepare() {
 	if [ "$before_nft" = 1 ]; then
 		[ "$incremental" = 1 ] || [ "$live_snapshot" = retained ] || return 1
 	else [ "$incremental" = 0 ] && [ -z "$live_snapshot" ] || return 1; fi
-	if [ "$IPR_RECOVERED" = 1 ]; then ipr_matches_plan || return 1
+	if [ "$IPR_CONTINUING" = 1 ]; then
+		[ "$IPR_APPLIED_NOW" = 1 ] && [ "$before_nft" = 1 ] && [ "$IPR_RULE_NOW" = 1 ] && [ "$catalog" = 1 ] && [ "$generation" = "$IPR_TOKEN" ] && ipr_matches_plan || return 1
+	elif [ "$IPR_RECOVERED" = 1 ]; then ipr_matches_plan || return 1
 	elif [ "${IPR_CROSSBOOT_EMPTY:-0}" = 1 ]; then [ "$IPR_RULE_NOW" = 0 ] && [ -z "$IPR_ROUTES_NOW" ] && [ "$before_nft" = 0 ] || return 1
 	elif [ "$IPR_ACTIVE" = 0 ]; then
 		[ "$IPR_RULE_NOW" = 0 ] && [ -z "$IPR_ROUTES_NOW" ] && [ "$before_nft" = 0 ] || return 1
@@ -314,6 +335,12 @@ ipr_prepare() {
 		fi
 	)
 	IPR_WRITE_MODE=forward; [ "${ROUTEPOLICY_INIT_RESTORE:-0}" != 1 ] || IPR_WRITE_MODE=restore
+	if [ "$IPR_CONTINUING" = 1 ]; then
+		# The retained first-write intent permits only the exact same route objects.
+		[ "$IPR_PLANNED_ROUTES" = "$retained_plan" ] && [ "$(rp_state_get route_table)" = "$table" ] && [ "$(rp_state_get rule_priority)" = "$priority" ] && [ "$(rp_state_get mark)" = "$mark" ] && [ "$(rp_state_get mark_mask)" = "$mask" ] || return 1
+		IPR_ENABLED=1
+		return 0
+	fi
 	[ ! -L "$stage" ] && { [ ! -e "$stage" ] || [ -f "$stage" ]; } && rm -f "$stage" || return 1
 	[ ! -L "$IPR_INTENT" ] && { [ ! -e "$IPR_INTENT" ] || [ "$IPR_RECOVERED" = 1 ] || [ "$IPR_STALE" = 1 ]; } || return 1
 	(
@@ -357,6 +384,7 @@ ipr_legacy_empty() {
 
 ipr_finish() {
 	[ "$IPR_CONTEXT" = 1 ] || return 0
+	[ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" != 1 ] || return 0
 	[ "${IPR_ENABLED:-0}" = 1 ] || [ "$IPR_RECOVERED" = 1 ] || [ "$IPR_STALE" = 1 ] || return 0
 	[ -f "$IPR_INTENT" ] && [ ! -L "$IPR_INTENT" ] || return 1
 	rm "$IPR_INTENT" && [ ! -e "$IPR_INTENT" ] && [ ! -L "$IPR_INTENT" ] && sync

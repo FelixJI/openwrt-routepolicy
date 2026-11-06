@@ -4,13 +4,13 @@
     "read": {
       "uci": [ "routepolicy" ],
       "ubus": {
-        "routepolicy": [ "status", "observe_interfaces", "observe_sets", "observe_query", "validate", "diagnose", "read_user_list", "smartdns_status", "smartdns_validate", "read_local_hosts" ]
+        "routepolicy": [ "status", "observe_interfaces", "observe_sets", "observe_query", "validate", "diagnose", "read_user_list", "smartdns_status", "smartdns_validate", "read_local_hosts", "restore_status", "init_status", "exit_preview", "package_preview", "disable_preview" ]
       }
     },
     "write": {
       "uci": [ "routepolicy" ],
       "ubus": {
-        "routepolicy": [ "apply", "reload", "update", "rollback", "import_legacy", "write_user_list", "smartdns_save", "smartdns_apply", "smartdns_discard_candidate", "write_local_hosts" ]
+        "routepolicy": [ "apply", "reload", "update", "rollback", "import_legacy", "write_user_list", "smartdns_save", "smartdns_apply", "smartdns_discard_candidate", "write_local_hosts", "config_export", "config_import", "restore_prepare", "restore_recover", "init_apply", "init_confirm", "init_recover", "init_repair", "exit_prepare", "exit_apply" ]
       }
     }
   }

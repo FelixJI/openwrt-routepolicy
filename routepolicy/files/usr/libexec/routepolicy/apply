@@ -126,8 +126,33 @@ retire_crossboot_metadata() {
 	[ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] || return 2
 }
 
+# Persistent applied state is a boot-scoped receipt, not ownership on a new kernel.
+current_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || { rp_output_error apply '启动身份不可读，拒绝生成运行回执'; exit 1; }
+admit_applied_boot() {
+	# A current typed initialization compensation is independent ownership evidence.
+	[ "${IPR_RECOVERED:-0}" != 1 ] || return 0
+	if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ]; then
+		[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] && [ "$(rp_state_get schema)" = 1 ] || { rp_output_error apply '旧运行回执类型或 schema 非法；保留对象'; exit 1; }
+		applied_boot=$(rp_state_get boot_id 2>/dev/null) || applied_boot=
+		[ "$applied_boot" != "$current_boot" ] || return 0
+		stale_table=$(rp_state_get route_table) && stale_priority=$(rp_state_get rule_priority) || { rp_output_error apply '旧运行回执不完整'; exit 1; }
+	else
+		stale_table=$(rp_uci_get main route_table 200); stale_priority=$(rp_uci_get main rule_priority 12000)
+	fi
+		rp_uint_between "$stale_table" 1 252 && rp_uint_between "$stale_priority" 1 32765 || { rp_output_error apply '旧运行回执标识非法'; exit 1; }
+		stale_tables=$(nft list tables) && stale_rules=$(ip -4 -N rule show) && read_policy_routes "$stale_table" || { rp_output_error apply '不能证明新内核中的运行态为空'; exit 1; }
+		printf '%s\n' "$stale_tables" | awk 'NF&&(NF!=3||$1!="table"){bad=1}END{exit bad}' &&
+			printf '%s\n' "$stale_rules" | awk 'NF&&$1!~/^[0-9]+:$/{bad=1}END{exit bad}' || { rp_output_error apply '新启动运行态查询结构不可信，保留旧回执'; exit 1; }
+		if [ -n "$policy_routes" ] || nft list table inet routepolicy >/dev/null 2>&1 || printf '%s\n' "$stale_tables" | grep -Eq '^table [^ ]+ routepolicy$' ||
+			printf '%s\n' "$stale_rules" | awk -v p="$stale_priority:" -v t="$stale_table" '$1==p{found=1}{for(i=1;i<NF;i++)if(($i=="table"||$i=="lookup")&&$(i+1)==t)found=1}END{exit !found}'; then
+			rp_output_error apply '旧启动 applied 不能认领当前内核对象；保留对象等待显式检查'; exit 1
+		fi
+		[ ! -f "$RP_STATE_DIR/applied" ] || rm "$RP_STATE_DIR/applied" || { rp_output_error apply '不能退休旧启动运行回执'; exit 1; }
+}
+
 . "$LIBEXEC/init-policy-runtime"
 ipr_context || { rp_output_error apply "${IPR_ERROR:-初始化运行态意图的门禁或 WAL 身份无效}"; exit 1; }
+ipr_continue || { rp_output_error apply 'bootstrap continuation 的 token、时限、回执或写前意图不匹配'; exit 1; }
 ipr_recover || { rp_output_error apply "${IPR_ERROR:-初始化运行态与写前意图不一致；已保留未知对象和恢复证据}"; exit 1; }
 if retire_crossboot_metadata; then
 	# Consumed by the private runtime-intent helper before its first write.
@@ -146,6 +171,7 @@ else
 	fi
 	[ "$restore_result" -eq 1 ] || { rp_output_error apply '跨启动恢复归属或空运行态无法证明；已保留全部对象与 applied 状态'; exit 1; }
 fi
+admit_applied_boot
 
 if [ "$mode" = teardown ]; then
 	if [ "$IPR_CONTEXT" = 1 ] && [ "$IPR_ACTIVE" = 0 ] && [ ! -e "$IPR_INTENT" ] && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ]; then
@@ -175,12 +201,23 @@ if [ "$mode" = teardown ]; then
 		! rp_is_mark_bit "$mark" || ! rp_is_mark_bit "$mask" || [ "$mark" != "$mask" ]; then
 		have_applied=0
 	fi
+	if [ "$nft_present" = 1 ] && [ "$have_applied" = 0 ] && [ "$IPR_RECOVERED" != 1 ]; then
+		rp_output_error apply '没有当前启动回执或写前意图证明 nft 表归属；保留同名对象，未执行 teardown'
+		exit 1
+	fi
 	smartdns_backup="$RP_SMARTDNS_FILE.teardown.$$"
 	smartdns_uci_backup="$RP_RUN_DIR/smartdns.teardown.$$.uci"
 	uci -q export smartdns >"$smartdns_uci_backup" 2>/dev/null || : >"$smartdns_uci_backup"
 	if [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ "${ROUTEPOLICY_INIT_RESTORE:-0}" != 1 ] && [ -e "$RP_SMARTDNS_FILE" ]; then
 		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
+		teardown_expected=$(mktemp "$RP_RUN_DIR/teardown-expected.XXXXXX") || exit 1
+		if ! rp_render_smartdns90 "$teardown_expected" || ! cmp -s "$RP_SMARTDNS_FILE" "$teardown_expected"; then
+			rm -f "$teardown_expected"
+			rp_output_error apply '90 片段不符合当前声明；保留未知文件和规则，未执行 teardown'
+			exit 1
+		fi
+		rm -f "$teardown_expected"
 		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
 		mv "$RP_SMARTDNS_FILE" "$smartdns_backup" || { rp_output_error apply '无法暂存 SmartDNS 片段'; exit 1; }
 		if ! rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 0; then
@@ -189,14 +226,14 @@ if [ "$mode" = teardown ]; then
 			rp_output_error apply '无法移除 SmartDNS 片段登记；已恢复原片段'
 			exit 1
 		fi
-		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! rp_native_service smartdns reload >/dev/null 2>&1; then
+		if [ "${ROUTEPOLICY_UNINSTALL:-0}" != 1 ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! rp_native_service smartdns reload >/dev/null 2>&1; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
 			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
 			rp_native_service smartdns reload >/dev/null 2>&1 || true
 			rp_output_error apply 'SmartDNS 重载失败；已恢复原片段且未拆除策略规则'
 			exit 1
 		fi
-		if rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+		if [ "${ROUTEPOLICY_UNINSTALL:-0}" != 1 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
 			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
 			rp_native_service smartdns reload >/dev/null 2>&1 || true
@@ -222,7 +259,7 @@ if [ "$mode" = teardown ]; then
 			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法验证策略路由表是否已清空"
 		fi
 	fi
-	if ! nft delete table inet routepolicy >/dev/null 2>&1; then
+	if [ "$nft_present" = 1 ] && ! nft delete table inet routepolicy >/dev/null 2>&1; then
 		if nft list table inet routepolicy >/dev/null 2>&1; then
 			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法删除 routepolicy nft 表"
 		elif ! nft list tables >/dev/null 2>&1; then
@@ -263,6 +300,13 @@ fi
 
 [ ! -L "$RP_STATE_DIR/applied" ] && { [ ! -e "$RP_STATE_DIR/applied" ] || [ -f "$RP_STATE_DIR/applied" ]; } || { rp_output_error apply 'applied 不是安全普通文件；未执行内核写入'; exit 1; }
 validation=$(ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" 2>&1)
+source_bootstrap=0
+if [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" = 1 ]; then
+	[ "$IPR_CONTEXT" = 1 ] && [ "$IPR_PHASE" = applying ] && rp_writer_owned && rp_init_window_open "$IPR_WAL" &&
+		[ -f "$IPR_WAL/source-bootstrap" ] && [ ! -L "$IPR_WAL/source-bootstrap" ] && [ "$(cat "$IPR_WAL/source-bootstrap")" = "$IPR_TOKEN" ] || { rp_output_error apply 'bootstrap 仅允许当前真实初始化 token 与窗口'; exit 1; }
+	source_bootstrap=1
+fi
+if [ "$source_bootstrap" != 1 ]; then rp_sources_ready || { rp_output_error apply '启用来源的静态快照缺失或无效；未执行网络写入，不能把空规则视为 strict 恢复成功'; exit 1; }; fi
 if [ "$?" -ne 0 ]; then
 	rp_output_error apply "应用前校验失败: $validation"
 	exit 1
@@ -561,6 +605,9 @@ umask 077
 applied_new=$(mktemp "$RP_STATE_DIR/applied.XXXXXX") || { rp_output_error apply '无法创建 applied 发布候选；未报告成功'; exit 1; }
 cat >"$applied_new" <<EOF
 schema=$RP_SCHEMA_VERSION
+boot_id=$current_boot
+init_generation=${IPR_TOKEN:-}
+source_bootstrap=$source_bootstrap
 route_table=$table
 rule_priority=$priority
 mark=$mark

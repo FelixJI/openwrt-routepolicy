@@ -125,6 +125,7 @@ set_value() { printf 'set\t%s\t%s\n' "$1" "$2"; }
 . "$TEST_DNS_TMP/ownership"
 operation=$1
 access=lan default_if=wan policy=wan2 access_device=br-lan default_device=eth1 policy_device=eth2
+[ ! -f "$TEST_DNS_TMP/source-new-policy" ] || policy=rp_init_policy
 dns_default=${13:--} dns_policy=${14:--}
 case "$1" in
 	plan)
@@ -135,7 +136,15 @@ case "$1" in
 		set_value firewall.rp_init_dns.target ACCEPT
 		set_value firewall.rp_init_dns.dest_port 53
 		set_value routepolicy.main.enabled 1
-		set_value routepolicy.main.policy_interface wan2
+		set_value routepolicy.main.policy_interface "$policy"
+		if [ -f "$TEST_DNS_TMP/source-new-policy" ]; then
+			set_value network.rp_init_policy interface
+			set_value network.rp_init_policy.proto static
+			set_value network.rp_init_policy.device eth2
+			set_value network.rp_init_policy.ipaddr 198.51.100.2
+			set_value network.rp_init_policy.netmask 255.255.255.0
+			set_value network.rp_init_policy.gateway 198.51.100.1
+		fi
 		init_ipv4_plan
 		init_dns_plan ;;
 	link-plan) printf 'required\t0\n' ;;
@@ -166,6 +175,9 @@ case "$2:${3:-}" in
 			wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
 			rm "$TEST_DNS_TMP/quiesce-fault" "$wal/dns-file-new"; mkdir "$wal/dns-file-new"
 		fi ;;
+	network.interface.rp_init_policy:status)
+		[ "$(uci -q get network.rp_init_policy.proto 2>/dev/null)" = static ] || { printf '{"up":false}\n'; exit 0; }
+		printf '{"up":true,"l3_device":"eth2","dns-server":["198.51.100.53"],"route":[{"target":"0.0.0.0","nexthop":"198.51.100.1"}]}\n' ;;
 	network.interface.wan:status|network.interface.wan2:status)
 		if [ "$2" = network.interface.wan2 ] && [ -f "$TEST_DNS_TMP/policy-down" ]; then printf '{"up":false}\n'; exit 0; fi
 		device=eth1; [ "$2" != network.interface.wan2 ] || device=eth2
@@ -218,12 +230,14 @@ cat >"$tmp/lib/apply" <<'EOF'
 #!/bin/sh
 set -eu
 case "${1:-}" in event|reconcile-event) exec "$TEST_DNS_REAL_APPLY" "$@" ;; esac
+LIBEXEC=$ROUTEPOLICY_LIBEXEC
 . "$ROUTEPOLICY_LIBEXEC/common"
 rp_writer_enter apply
 rp_local_lock "$RP_RUN_DIR/apply.lock" || exit 1
 trap 'rp_local_unlock "$RP_RUN_DIR/apply.lock"' EXIT
 if [ -f "$TEST_DNS_TMP/kill-policy" ]; then rm "$TEST_DNS_TMP/kill-policy"; kill -KILL "$$"; fi
 [ ! -f "$TEST_DNS_TMP/policy-fail" ] || exit 1
+if [ -f "$TEST_DNS_TMP/policy-fail-once" ] && [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" != 1 ]; then rm "$TEST_DNS_TMP/policy-fail-once"; exit 1; fi
 if [ "${1:-}" = teardown ]; then
 	[ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ]
 	rm -f "$TEST_DNS_TMP/policy-running" "$RP_STATE_DIR/applied"
@@ -235,7 +249,7 @@ mkdir -p "$RP_ACTIVE_DIR"
 printf '%s\n' "${ROUTEPOLICY_INIT_GENERATION:-boot}" >"$RP_ACTIVE_DIR/generation"
 rp_render_smartdns90 "$RP_SMARTDNS_FILE"
 [ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1
-printf 'policy_interface=wan2\npolicy_device=eth2\nroute_table=200\n' >"$RP_STATE_DIR/applied"
+printf 'policy_interface=%s\npolicy_device=eth2\nroute_table=200\n' "$(uci -q get routepolicy.main.policy_interface)" >"$RP_STATE_DIR/applied"
 : >"$TEST_DNS_TMP/policy-running"
 [ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_native_service smartdns reload
 EOF
@@ -411,7 +425,104 @@ prepare_dns() {
 	token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
 	[ "${#token}" = 32 ]
 }
-confirm_dns() { "$TX" apply "$token" >/dev/null; SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null; }
+confirm_dns() {
+	"$TX" apply "$token" >/dev/null
+	if ! SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >"$tmp/confirm-result"; then cat "$tmp/confirm-result" >&2; return 1; fi
+}
+if [ "${1:-}" = --lifecycle ]; then
+	baseline 0 0 1 1
+	prepare_dns 192.0.2.53; confirm_dns
+	prepare_dns 192.0.2.53,192.0.2.54; confirm_dns
+	prepare_dns 192.0.2.53; confirm_dns
+	active=$(rp_init_active_record)
+	# A crash between network confirmation and declaration commit must converge.
+	decl="$tmp/root/etc/routepolicy/state/init-transaction/declarations"
+	mkdir "$decl"; printf 'installed\n' >"$decl/phase"; printf '%s\n' "$token" >"$decl/init-token"
+	"$TX" recover >/dev/null; [ "$(cat "$decl/phase")" = committed ]
+	rm "$tmp/policy-running"
+	"$TX" repair >/dev/null; [ -f "$tmp/policy-running" ]
+	entry=$(find "$active/origin/fields" -name key -exec grep -lFx smartdns.rp_init_default_2.ip '{}' ';')
+	[ -n "$entry" ] && [ "$(cat "${entry%/key}/existed")" = 0 ] && [ "$(cat "${entry%/key}/expected")" = 192.0.2.54 ]
+	"$TX" exit-preview >"$tmp/exit-preview"
+	output=$("$TX" exit-prepare)
+	exit_token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+	"$TX" exit-apply "$exit_token" >"$tmp/exit-result"
+	grep -Fq '"phase":"exited"' "$tmp/exit-result"
+	restored
+	[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 11 ]
+	[ ! -e "$tmp/root/etc/routepolicy/state/init-transaction/active" ]
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	uci set smartdns.rp_init_default_1.user_note=KEEP; uci commit smartdns
+	canonical smartdns >"$tmp/exit-before"
+	if "$TX" exit-preview >"$tmp/exit-conflict"; then printf 'exit adopted unknown child\n' >&2; exit 1; fi
+	grep -Fq 'unknown-child:smartdns.rp_init_default_1.user_note' "$tmp/exit-conflict"
+	canonical smartdns >"$tmp/exit-after"; cmp "$tmp/exit-before" "$tmp/exit-after"
+	active=$(rp_init_active_record); printf 'legacy-confirmation-history\n' >"$active/origin/incomplete"
+	if "$TX" exit-prepare >"$tmp/exit-incomplete"; then printf 'exit guessed incomplete history\n' >&2; exit 1; fi
+	printf '%s\n' 'native lifecycle: passed (1 -> 2 -> 1 cumulative origin, actual reversible exit, service state, unknown child, incomplete legacy)'
+	exit 0
+fi
+if [ "${1:-}" = --sources ]; then
+	cp "$REAL_LIB/update" "$REAL_LIB/validate" "$REAL_LIB/converter-lib" "$tmp/lib/"
+	cat >"$tmp/bin/curl" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_DNS_TMP/source-curl"
+[ "$(uci -q get network.rp_init_policy.proto)" = static ] || exit 91
+case " $* " in *' --interface if!eth2 '*) ;; *) exit 92 ;; esac
+[ ! -f "$TEST_DNS_TMP/source-download-fail" ] || exit 22
+output=
+while [ "$#" -gt 0 ]; do if [ "$1" = --output ]; then output=$2; shift; fi; shift; done
+[ -n "$output" ] || exit 93
+printf 'new.example\n' >"$output"
+SH
+	chmod +x "$tmp/bin/curl" "$tmp/lib/update" "$tmp/lib/validate"
+	for source_case in download-failure later-policy-failure success; do
+		baseline 0 0 1 1
+		: >"$tmp/source-new-policy"; rm -f "$tmp/source-curl" "$tmp/source-download-fail"
+		while read -r field value; do uci set "routepolicy.main.$field=$value"; done <<'EOF'
+strict_enforcement 1
+dns_redirect 1
+warm_restore 1
+auto_update 1
+update_via_policy_interface 1
+rule_priority 12000
+mark 0x100
+mark_mask 0x100
+smartdns_enabled 1
+smartdns_policy_group policy
+update_hour 4
+update_minute 17
+EOF
+		uci set routepolicy.feed=source
+		for item in enabled:1 url:https://example.invalid/new format:plain-domain target:domain-policy min_entries:1 max_shrink_percent:100 update_via_policy_interface:1; do uci set "routepolicy.feed.${item%%:*}=${item#*:}"; done
+		uci commit routepolicy
+		mkdir -p "$tmp/root/etc/routepolicy/managed.d/current" "$tmp/root/etc/routepolicy/managed.d/previous"
+		printf 'old.example\n' >"$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
+		printf 'unknown-current\n' >"$tmp/root/etc/routepolicy/managed.d/current/unknown.keep"
+		printf 'unknown-previous\n' >"$tmp/root/etc/routepolicy/managed.d/previous/previous.keep"
+		cp -R "$tmp/root/etc/routepolicy/managed.d" "$tmp/managed-$source_case"
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.before"; done
+		output=$("$TX" prepare lan wan rp_init_policy policy eth2 static 198.51.100.2 24 198.51.100.1 - - 192.0.2.53 198.51.100.53)
+		token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+		decl="$tmp/root/etc/routepolicy/state/init-transaction/declarations"; mkdir "$decl"
+		printf 'installed\n' >"$decl/phase"; printf '%s\n' "$token" >"$decl/init-token"; : >"$decl/source-refresh"
+		case "$source_case" in download-failure) : >"$tmp/source-download-fail" ;; later-policy-failure) : >"$tmp/policy-fail-once" ;; esac
+		if [ "$source_case" = success ]; then
+			confirm_dns
+			grep -Fxq new.example "$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
+			[ "$(uci -q get network.rp_init_policy.proto)" = static ]
+		else
+			if "$TX" apply "$token" >"$tmp/source-result"; then printf 'source failure confirmed success: %s\n' "$source_case" >&2; exit 1; fi
+			[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = rolled_back ] || { cat "$tmp/source-result"; exit 1; }
+			diff -r "$tmp/managed-$source_case" "$tmp/root/etc/routepolicy/managed.d"
+			restored
+		fi
+		grep -Fq -- '--interface if!eth2' "$tmp/source-curl"
+	done
+	if "$REAL_LIB/update" init-stage >/dev/null 2>&1; then printf 'unauthenticated init-stage accepted\n' >&2; exit 1; fi
+	printf '%s\n' 'native staged sources: passed (new policy before bound download, forced same-name refresh, HTTPS failure, later policy failure, exact current/previous rollback, unknown files, authentication)'
+	exit 0
+fi
 native_auto_defaults_test() {
 	# The official start callback destroys an uncoordinated list even without native stop.
 	baseline 1 1 1 1
@@ -983,7 +1094,7 @@ if "$TX" recover-early >/dev/null; then exit 1; fi
 # Confirmed reboot: cold application cache, sets before DNS, and failure stays closed.
 baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
 SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
-active="$tmp/root/etc/routepolicy/state/init-transaction/confirmed-$token"
+active="$tmp/root/etc/routepolicy/state/init-transaction/confirmed/$token"
 canonical dhcp >"$tmp/shutdown-dhcp.before"
 "$TX" shutdown-dns >/dev/null
 [ "$(cat "$tmp/svc/smartdns.enabled")" = 0 ]
@@ -1076,7 +1187,7 @@ reboot_services policy-with-adapter; "$TX" boot-dns >/dev/null
 grep -Fq "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/root/var/etc/smartdns/smartdns.conf"
 printf 'DNS ownership/policy switches: passed (DNS-only with policy down, both adapter values, no policy apply/90/watch, policy enabled unchanged)\n'
 txdir="$tmp/root/etc/routepolicy/state/init-transaction"
-origin=$(cat "$txdir/source"); cp -R "$txdir/confirmed-$origin/fields" "$tmp/origin-fields"
+origin=$(cat "$txdir/source"); cp -R "$txdir/confirmed/$origin/fields" "$tmp/origin-fields"
 prepare
 [ "$(cat "$txdir/active")" = "$origin" ]
 reboot_services prepared-after-confirm
@@ -1098,7 +1209,7 @@ rm "$tmp/query-fail"; wait_guard
 [ "$(cat "$txdir/current/phase")" = expired ]
 if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
 "$TX" status | grep -Fq '"prepared_expired_reason":"boot-changed"'
-diff -r "$tmp/origin-fields" "$txdir/confirmed-$origin/fields"
+diff -r "$tmp/origin-fields" "$txdir/confirmed/$origin/fields"
 # A repeated apply rollback keeps the first accepted boot and provenance contract.
 prepare; : >"$tmp/query-fail"
 if "$TX" apply "$token" >/dev/null; then exit 1; fi
@@ -1115,11 +1226,11 @@ for point in intent pointer; do
 	[ "$(cat "$txdir/current/phase")" = confirming ]
 	reboot_services "confirm-interrupted-$point"
 	[ "$(cat "$txdir/current/phase")" = confirmed ] && [ "$(cat "$txdir/active")" = "$token" ]
-	active="$txdir/confirmed-$token"; guard_entry; wait_guard
-	[ "$(find "$txdir" -maxdepth 1 -type d -name 'confirmed-????????????????????????????????' | wc -l)" = 2 ]
+	active="$txdir/confirmed/$token"; guard_entry; wait_guard
+	[ "$(find "$txdir/confirmed" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 2 ]
 	[ "$(cat "$txdir/confirmed-foreign/keep")" = USER ]
 	[ "$(cat "$txdir/source")" = "$origin" ]
-	diff -r "$tmp/origin-fields" "$txdir/confirmed-$origin/fields"
+	diff -r "$tmp/origin-fields" "$txdir/confirmed/$origin/fields"
 done
 mv "$txdir/active" "$tmp/active.value"; ln -s "$tmp/active.value" "$txdir/active"
 if "$TX" recover-early >/dev/null; then exit 1; fi
