@@ -13,15 +13,22 @@ ROUTEPOLICY_APPLY=${ROUTEPOLICY_APPLY:-/usr/libexec/routepolicy/apply}
 ROUTEPOLICY_WATCH=${ROUTEPOLICY_WATCH:-/usr/libexec/routepolicy/watch}
 ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routepolicy/init-transaction}
 
+# rc.common sources this file before procd.sh acquires the service lock.
+# Recovery may call native enable, so it must finish before taking that lock.
+case "${action:-}" in
+	start|boot|restart)
+		if [ "$action" != start ] || [ "${1:-}" != init-confirmed ]; then
+			if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
+				"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || exit $?
+			fi
+		fi
+		;;
+esac
+
 start_service() {
 	if [ "${1:-}" = init-confirmed ]; then
 		# Only the live confirmation writer may register watch without applying again.
 		"$ROUTEPOLICY_INIT_TRANSACTION" watch-ready >/dev/null || return 1
-	else
-		# Startup is the reboot boundary; restore unfinished mutations before normal policy apply.
-		if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
-			"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || return 1
-		fi
 	fi
 	config_load routepolicy
 	enabled=0

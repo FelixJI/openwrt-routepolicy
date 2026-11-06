@@ -27,6 +27,111 @@ remove_owned_rule() {
 	ip -4 rule del priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || true
 }
 
+# ip-full reports an absent IPv4 FIB as RC 2, rather than a successful empty dump.
+# Other failures, including the same text with a different RC, remain failures.
+read_policy_routes() {
+	policy_routes=$(LC_ALL=C ip -4 route show table "$1" 2>&1)
+	policy_routes_rc=$?
+	[ "$policy_routes_rc" -ne 0 ] || return 0
+	[ "$policy_routes_rc" -eq 2 ] &&
+		printf '%s\n' "$policy_routes" | grep -Fxq 'Error: ipv4: FIB table does not exist.' &&
+		printf '%s\n' "$policy_routes" | awk '$0!="Error: ipv4: FIB table does not exist."&&$0!="Dump terminated"&&$0!="Dump terminated."{exit 1}' || return 1
+	policy_routes=
+}
+
+# An old boot's schema-1 record cannot authorize deletion of this boot's objects.
+# Only the authenticated initialization rollback may retire its stale metadata,
+# after independent successful reads prove that all relevant kernel objects vanished.
+retire_crossboot_metadata() {
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && [ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ] || return 1
+	restore_wal="$RP_STATE_DIR/init-transaction/current"
+	[ -e "$restore_wal" ] || [ -L "$restore_wal" ] || return 1
+	for restore_path in "$RP_STATE_DIR/init-transaction" "$restore_wal"; do
+		[ -d "$restore_path" ] && [ ! -L "$restore_path" ] || return 2
+	done
+	[ -f "$restore_wal/boot-id" ] && [ ! -L "$restore_wal/boot-id" ] || return 2
+	restore_boot=$(cat "$restore_wal/boot-id") && running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 2
+	for restore_id in "$restore_boot" "$running_boot"; do
+		printf '%s\n' "$restore_id" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || return 2
+	done
+	[ "$restore_boot" != "$running_boot" ] || return 1
+	rp_writer_owned || return 2
+	for restore_file in phase policy-active policy-attempted token candidate; do
+		[ -f "$restore_wal/$restore_file" ] && [ ! -L "$restore_wal/$restore_file" ] || return 2
+	done
+	[ "$(cat "$restore_wal/phase")" = rolling_back ] || return 2
+	restore_required=$(cat "$restore_wal/policy-active") || return 2
+	case "$restore_required:$mode" in 0:teardown|1:apply) ;; *) return 2 ;; esac
+	restore_token=$(cat "$restore_wal/token") || return 2
+	[ "${#restore_token}" -eq 32 ] || return 2
+	case "$restore_token" in *[!0-9a-f]*) return 2 ;; esac
+	[ "$mode" != apply ] || [ "${ROUTEPOLICY_INIT_GENERATION:-}" = "$restore_token" ] || return 2
+	table=$(rp_uci_get main route_table 200); priority=$(rp_uci_get main rule_priority 12000)
+	mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
+	rp_uint_between "$table" 1 252 && rp_uint_between "$priority" 1 32765 &&
+		rp_is_mark_bit "$mark" && [ "$mark" = "$mask" ] || return 2
+	if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ]; then
+		[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] || return 2
+		awk -F= '$1~/^(schema|route_table|rule_priority|mark|mark_mask|policy_interface)$/{if(NF!=2||seen[$1]++)bad=1;n++} END{exit bad||n!=6}' "$RP_STATE_DIR/applied" || return 2
+		[ "$(rp_state_get schema)" = 1 ] && [ "$(rp_state_get route_table)" = "$table" ] &&
+			[ "$(rp_state_get rule_priority)" = "$priority" ] && [ "$(rp_state_get mark)" = "$mark" ] &&
+			[ "$(rp_state_get mark_mask)" = "$mask" ] || return 2
+		restore_interface=$(awk -F '\t' '$1=="set"&&$2=="routepolicy.main.policy_interface"&&NF==3{print $3}' "$restore_wal/candidate") || return 2
+		rp_is_name "$restore_interface" 32 || return 2
+		if [ "$(rp_state_get policy_interface)" != "$restore_interface" ]; then
+			# An earlier rollback may already have restored the original enabled policy.
+			[ "$restore_required" = 1 ] && [ "$(rp_state_get policy_interface)" = "$(rp_uci_get main policy_interface '')" ] || return 2
+		fi
+	fi
+	# A catalog restored from the old WAL belongs to the original DNS configuration.
+	# Preserve that exact copy; an unknown publication may belong to this boot.
+	if [ -e "$RP_ACTIVE_DIR" ] || [ -L "$RP_ACTIVE_DIR" ]; then
+		[ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ] || return 2
+		restore_entries=$(find "$RP_ACTIVE_DIR" -mindepth 1 ! -type f) && [ -z "$restore_entries" ] || return 2
+		restore_entries=$(find "$RP_ACTIVE_DIR" -mindepth 1 ! -name generation ! -name domain-policy.list ! -name domain-default.list) && [ -z "$restore_entries" ] || return 2
+		for restore_file in generation domain-policy.list domain-default.list; do
+			[ -f "$RP_ACTIVE_DIR/$restore_file" ] && [ ! -L "$RP_ACTIVE_DIR/$restore_file" ] || return 2
+		done
+		if [ "$restore_required" = 1 ] && [ "$(cat "$RP_ACTIVE_DIR/generation")" = "$restore_token" ]; then
+			# /tmp is cleared by cold boot. This token publication is this recovery's
+			# commit, unlike persistent policy-restore-result from a previous boot.
+			[ "$(rp_state_get policy_interface)" = "$(rp_uci_get main policy_interface '')" ] || return 2
+			[ ! -L "$restore_wal/dns-active-old" ] || return 2
+			if [ -e "$restore_wal/dns-active-old" ]; then
+				[ -d "$restore_wal/dns-active-old" ] && [ -f "$restore_wal/dns-active-old/generation" ] && [ ! -L "$restore_wal/dns-active-old/generation" ] || return 2
+				restore_old_generation=$(cat "$restore_wal/dns-active-old/generation") || return 2
+				case "$restore_old_generation" in ''|*[!A-Za-z0-9_.-]*|?????????????????????????????????????????????????????????????????*) return 2 ;; esac
+				[ "$restore_old_generation" != "$restore_token" ] || return 2
+			fi
+			# policy_sync still verifies the live policy; do not reapply or clean it.
+			return 3
+		fi
+		for restore_path in "$RP_ACTIVE_DIR" "$restore_wal/dns-active-old"; do
+			[ -d "$restore_path" ] && [ ! -L "$restore_path" ] || return 2
+			restore_entries=$(find "$restore_path" -mindepth 1 ! -type f) && [ -z "$restore_entries" ] || return 2
+			restore_entries=$(find "$restore_path" -mindepth 1 ! -name generation ! -name domain-policy.list ! -name domain-default.list) && [ -z "$restore_entries" ] || return 2
+		done
+		for restore_file in generation domain-policy.list domain-default.list; do
+			cmp -s "$RP_ACTIVE_DIR/$restore_file" "$restore_wal/dns-active-old/$restore_file" || return 2
+		done
+	fi
+	restore_rules=$(ip -4 -N rule show) || return 2
+	printf '%s\n' "$restore_rules" | awk -v p="$priority:" -v t="$table" 'NF&&$1!~/^[0-9]+:$/{bad=1}$1==p{bad=1}{for(i=1;i<NF;i++)if(($i=="lookup"||$i=="table")&&$(i+1)==t)bad=1}END{exit bad}' || return 2
+	read_policy_routes "$table" && [ -z "$policy_routes" ] || return 2
+	restore_tables=$(nft list tables) || return 2
+	printf '%s\n' "$restore_tables" | awk 'NF&&(NF!=3||$1!="table"||$3=="routepolicy"){bad=1}END{exit bad}' || return 2
+	rm -f "$RP_STATE_DIR/applied" || return 2
+	[ "$mode" != teardown ] || rp_output_ok apply '跨启动恢复：内核运行态已消失，仅移除旧 applied 记录'
+}
+
+if retire_crossboot_metadata; then
+	[ "$mode" != teardown ] || exit 0
+else
+	restore_result=$?
+	if [ "$restore_result" -eq 3 ]; then rp_output_ok apply '本启动已发布原策略；保留运行态供恢复校验'; exit 0; fi
+	[ "$restore_result" -eq 1 ] || { rp_output_error apply '跨启动恢复归属或空运行态无法证明；已保留全部对象与 applied 状态'; exit 1; }
+fi
+
 if [ "$mode" = teardown ]; then
 	rp_ensure_dirs
 	nft_present=0
@@ -93,8 +198,8 @@ if [ "$mode" = teardown ]; then
 			cleanup_failed='无法验证策略 ip rule 是否已删除'
 		fi
 		ip -4 route flush table "$table" >/dev/null 2>&1 || true
-		if routes_after=$(ip -4 route show table "$table" 2>/dev/null); then
-			[ -z "$routes_after" ] || cleanup_failed="${cleanup_failed:+$cleanup_failed；}策略路由表仍有残留"
+		if read_policy_routes "$table"; then
+			[ -z "$policy_routes" ] || cleanup_failed="${cleanup_failed:+$cleanup_failed；}策略路由表仍有残留"
 		else
 			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法验证策略路由表是否已清空"
 		fi

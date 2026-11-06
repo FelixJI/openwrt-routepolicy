@@ -25,6 +25,10 @@ chmod +x "$tmp/init-transaction"
 
 run_start() (
 	TEST_ENABLED=$1
+	start_arg=${2:-}
+	action=${TEST_START_ACTION-start}
+	# rc.common has already shifted the script and action before dot-sourcing init.
+	set -- "$start_arg"
 	export TEST_ENABLED TEST_LIFECYCLE_LOG="$tmp/lifecycle.log"
 	ROUTEPOLICY_CTL="$tmp/routepolicyctl"
 	ROUTEPOLICY_WATCH="$tmp/watch"
@@ -43,7 +47,7 @@ run_start() (
 	procd_open_instance() { printf '%s\n' open >>"$TEST_LIFECYCLE_LOG"; }
 	procd_set_param() { printf '%s\n' "$*" >>"$TEST_LIFECYCLE_LOG"; }
 	procd_close_instance() { printf '%s\n' close >>"$TEST_LIFECYCLE_LOG"; }
-	start_service "${2:-}"
+	case "$action" in start|boot|restart) start_service "$start_arg" ;; esac
 )
 
 : >"$tmp/lifecycle.log"
@@ -95,4 +99,25 @@ TEST_WATCH_READY=1 run_start 1 init-confirmed >/dev/null
 grep -Fxq "command $tmp/watch" "$tmp/lifecycle.log"
 if grep -Fxq apply "$tmp/lifecycle.log" || [ -s "$tmp/recovery.log" ]; then printf 'confirmation repeated recovery/apply\n' >&2; exit 1; fi
 
+for action in start boot restart; do
+	: >"$tmp/recovery.log"; : >"$tmp/lifecycle.log"
+	TEST_START_ACTION=$action run_start 1 >/dev/null
+	[ "$(cat "$tmp/recovery.log")" = recover-startup ]
+	grep -Fxq apply "$tmp/lifecycle.log"
+	: >"$tmp/recovery.log"; : >"$tmp/lifecycle.log"
+	if TEST_START_ACTION=$action TEST_RECOVERY_FAIL=1 run_start 1 >/dev/null 2>&1; then printf 'failed pre-procd recovery dispatched %s\n' "$action" >&2; exit 1; fi
+	[ ! -s "$tmp/lifecycle.log" ]
+done
+for action in enable disable enabled reload stop status ''; do
+	: >"$tmp/recovery.log"; : >"$tmp/lifecycle.log"
+	TEST_START_ACTION=$action run_start 1 >/dev/null
+	[ ! -s "$tmp/recovery.log" ] && [ ! -s "$tmp/lifecycle.log" ]
+done
+for action in boot restart; do
+	: >"$tmp/recovery.log"
+	if TEST_START_ACTION=$action run_start 1 init-confirmed >/dev/null 2>&1; then printf '%s bypassed pre-recovery/admission\n' "$action" >&2; exit 1; fi
+	[ "$(cat "$tmp/recovery.log")" = recover-startup ]
+done
+
 printf '%s\n' 'init lifecycle tests: passed'
+sh "$ROOT/tests/core/init-native-lock-test.sh"
