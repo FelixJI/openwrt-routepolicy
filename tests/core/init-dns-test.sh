@@ -107,6 +107,13 @@ if [ -f "$TEST_DNS_TMP/kill-confirm" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = 
 		rm "$TEST_DNS_TMP/kill-confirm"; kill -KILL "$PPID"
 	fi
 fi
+if [ -f "$TEST_DNS_TMP/kill-exit-identity" ]; then
+	for stage in "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/"exit-preparing.*; do
+		if [ "$(cat "$stage/token" 2>/dev/null)" = "${TEST_EXIT_TOKEN:-}" ] && [ "$(cat "$stage/kind" 2>/dev/null)" = exit ]; then
+			rm "$TEST_DNS_TMP/kill-exit-identity"; kill -KILL "$PPID"
+		fi
+	done
+fi
 exit 0
 EOF
 # Keep the real planner ownership decision at the transaction/service fixture seam.
@@ -435,6 +442,97 @@ confirm_dns() {
 	"$TX" apply "$token" >/dev/null
 	if ! SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >"$tmp/confirm-result"; then cat "$tmp/confirm-result" >&2; return 1; fi
 }
+if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
+	cp "$REAL_LIB/lifecycle" "$REAL_LIB/validate" "$REAL_LIB/converter-lib" "$tmp/lib/"
+	for restore_case in success failure; do
+		baseline 0 0 1 1
+		cp "$ROOT/routepolicy/files/etc/config/routepolicy" "$tmp/root/etc/config/routepolicy"
+		uci set routepolicy.main.policy_interface=wan2; uci commit routepolicy
+		mkdir -p "$RP_USER_DIR" "$RP_MANAGED_CURRENT" "$RP_MANAGED_PREVIOUS"
+		cp "$ROOT/routepolicy/files/etc/routepolicy/user.d/"*.list "$RP_USER_DIR/"
+		printf 'stale.example\n' >"$RP_MANAGED_CURRENT/old.domain-policy.list"
+		printf 'unknown\n' >"$RP_MANAGED_CURRENT/user.keep"
+		printf 'previous\n' >"$RP_MANAGED_PREVIOUS/old.keep"
+		cp -pR "$tmp/root/etc/routepolicy/managed.d" "$tmp/restore-before-$restore_case"
+		ROUTEPOLICY_OUTPUT=text "$tmp/lib/lifecycle" config-export >"$tmp/restore-export"
+		"$tmp/lib/lifecycle" config-import <"$tmp/restore-export" >/dev/null
+		mapping=$(printf 'lan\twan\twan2\t-\t-\t-\t-\t-\t-\t-\t-\t192.0.2.53\t198.51.100.53\t1\t1\n')
+		output=$(printf '%s\n' "$mapping" | "$tmp/lib/lifecycle" restore-prepare)
+		token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+		decl="$tmp/root/etc/routepolicy/state/init-transaction/declarations"
+		if [ "${1:-}" = --restore-confirmed ]; then
+			confirm_dns
+			# Durable network commit exists; declaration phase publication was interrupted.
+			printf 'installed\n' >"$decl/phase"
+			cp "$RP_UCI_CONFIG" "$tmp/confirmed-app"
+			"$tmp/lib/lifecycle" restore-recover >"$tmp/confirmed-recover"
+			cmp "$RP_UCI_CONFIG" "$tmp/confirmed-app"
+			[ "$(cat "$decl/phase")" = committed ]
+			printf 'installed\n' >"$decl/phase"; printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$decl/init-token"
+			if "$tmp/lib/lifecycle" restore-recover >/dev/null 2>&1; then printf 'mismatched confirmed token recovered declarations\n' >&2; exit 1; fi
+			cmp "$RP_UCI_CONFIG" "$tmp/confirmed-app"
+			printf '%s\n' 'confirmed declaration recovery: passed (commit gap converged; mismatched token preserves declarations)'
+			exit 0
+		fi
+		if [ "$restore_case" = failure ]; then
+			: >"$tmp/query-fail"
+			if "$TX" apply "$token" >"$tmp/restore-failure"; then printf 'restore DNS failure accepted\n' >&2; exit 1; fi
+			diff -r "$tmp/restore-before-$restore_case" "$tmp/root/etc/routepolicy/managed.d"
+			"$tmp/lib/lifecycle" restore-recover >/dev/null
+		else
+			confirm_dns
+			[ -z "$(find "$RP_MANAGED_CURRENT" -mindepth 1)" ] || { printf 'source-free restore retained old snapshots\n' >&2; exit 1; }
+			rp_merge_lists domain-policy "$tmp/restored-merged"
+			[ ! -s "$tmp/restored-merged" ]
+		fi
+	done
+	printf '%s\n' 'source-free restore: passed (empty published snapshot; failure restores current/previous and unknown files)'
+	exit 0
+fi
+if [ "${1:-}" = --exit-stage ]; then
+	TEST_EXIT_CP=$(command -v cp); export TEST_EXIT_CP
+	cat >"$tmp/bin/cp" <<'SH'
+#!/bin/sh
+"$TEST_EXIT_CP" "$@" || exit $?
+for argument do
+	case "$argument" in */origin/.)
+		if [ -f "$TEST_DNS_TMP/kill-exit-copy" ]; then rm "$TEST_DNS_TMP/kill-exit-copy"; kill -KILL "$PPID"; fi ;;
+		*/candidate)
+		if [ -f "$TEST_DNS_TMP/kill-exit-candidate" ]; then rm "$TEST_DNS_TMP/kill-exit-candidate"; kill -KILL "$PPID"; fi ;;
+	esac
+done
+SH
+	TEST_EXIT_MV=$(command -v mv); export TEST_EXIT_MV
+	cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+"$TEST_EXIT_MV" "$@" || exit $?
+for target do :; done
+if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/previous" ] && [ -f "$TEST_DNS_TMP/kill-exit-promotion" ]; then
+	rm "$TEST_DNS_TMP/kill-exit-promotion"; kill -KILL "$PPID"
+fi
+SH
+	chmod +x "$tmp/bin/cp"
+	chmod +x "$tmp/bin/mv"
+	for boundary in identity copy candidate promotion; do
+		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+		txroot="$tmp/root/etc/routepolicy/state/init-transaction"
+		mkdir "$txroot/exiting"; printf 'unknown legacy stage\n' >"$txroot/exiting/user.keep"
+		output=$("$TX" exit-prepare); exit_token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+		TEST_EXIT_TOKEN=$exit_token; export TEST_EXIT_TOKEN
+		: >"$tmp/kill-exit-$boundary"
+		if "$TX" exit-apply "$exit_token" >"$tmp/exit-killed" 2>&1; then printf 'exit kill not reached: %s\n' "$boundary" >&2; exit 1; fi
+		if [ "$boundary" = copy ]; then
+			printf 'external\n' >"$txroot/exiting-$exit_token/user.keep"
+			if "$TX" exit-apply "$exit_token" >/dev/null 2>&1; then printf 'exit deleted unknown stage child\n' >&2; exit 1; fi
+			grep -Fxq external "$txroot/exiting-$exit_token/user.keep"
+			rm "$txroot/exiting-$exit_token/user.keep"
+		fi
+		"$TX" exit-apply "$exit_token" >"$tmp/exit-retry" || { printf 'exit stage retry blocked at %s\n' "$boundary" >&2; exit 1; }
+		[ ! -e "$txroot/active" ]; grep -Fxq 'unknown legacy stage' "$txroot/exiting/user.keep"
+	done
+	printf '%s\n' 'exit stage recovery: passed (identity/copy/candidate/promotion kill retry; unknown stages preserved)'
+	exit 0
+fi
 if [ "${1:-}" = --lifecycle ]; then
 	baseline 0 0 1 1
 	prepare_dns 192.0.2.53; confirm_dns

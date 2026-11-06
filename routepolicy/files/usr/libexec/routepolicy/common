@@ -399,6 +399,20 @@ rp_managed_prepare() {
 }
 
 # shellcheck disable=SC3043
+rp_managed_publish() {
+	local wal=$1 candidate=$2 swap="$RP_ETC/managed.d/previous.next.$$"
+	case "$candidate" in "$RP_ETC/managed.d/candidate."*) ;; *) return 1 ;; esac
+	[ -d "$candidate" ] && [ ! -L "$candidate" ] && [ -z "$(find "$candidate" -mindepth 1 ! -type f)" ] || return 1
+	[ ! -e "$wal/managed-expected" ] && [ ! -L "$wal/managed-expected" ] && [ ! -e "$swap" ] && [ ! -L "$swap" ] || return 1
+	rp_init_window_open "$wal" && cp -pR "$candidate" "$wal/managed-expected" &&
+		printf '%s\n' "${swap##*/}" >"$wal/managed-swap-name" && rp_managed_phase "$wal" publishing || return 1
+	rp_managed_equal "$RP_MANAGED_CURRENT" "$wal/managed-before-current" && rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" && rp_init_window_open "$wal" || return 1
+	mv "$RP_MANAGED_CURRENT" "$swap" && mv "$candidate" "$RP_MANAGED_CURRENT" || return 1
+	rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" && rm -rf "$RP_MANAGED_PREVIOUS" && mv "$swap" "$RP_MANAGED_PREVIOUS" || return 1
+	rp_managed_phase "$wal" published
+}
+
+# shellcheck disable=SC3043
 rp_managed_restore() {
 	local wal=$1 state name target before expected displaced replacement swap swap_name
 	if [ ! -e "$wal/managed-phase" ] && [ ! -L "$wal/managed-phase" ]; then return 0; fi

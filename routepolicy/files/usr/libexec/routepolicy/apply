@@ -173,6 +173,28 @@ else
 fi
 admit_applied_boot
 
+smartdns_receipt_content() {
+	# Exact installed bytes belong to the existing atomic receipt, never new UCI.
+	[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] && [ "$(wc -c <"$RP_STATE_DIR/applied")" -le 2097152 ] || return 1
+	awk -v boot="$current_boot" '
+		/^smartdns90:/ {n++;bytes+=length($0)-10;if(length($0)>4108||bytes>1048576)bad=1;sub(/^smartdns90:/,"");print;next}
+		{
+			if(length($0)>4096||$0!~/^[a-z_0-9]+=/||$0~/[[:cntrl:]]/) {bad=1;next}
+			key=$0;sub(/=.*/,"",key);value=substr($0,length(key)+2)
+			if(seen[key]++)bad=1
+			if(index("|schema|boot_id|init_generation|source_bootstrap|route_table|rule_priority|mark|mark_mask|policy_interface|policy_device|policy_cidr|source_accounting|source_idle_timeout|source_max_entries|managed_devices|smartdns90_present|","|" key "|")==0)bad=1
+			if(key=="schema"&&value!="1")bad=1
+			if(key=="boot_id"&&value!=boot)bad=1
+			if(key=="smartdns90_present"){present=value;if(value!~/^[01]$/)bad=1}
+		}
+		END {
+			if(bad||!seen["schema"]||!seen["boot_id"]||!seen["route_table"]||!seen["rule_priority"]||!seen["mark"]||!seen["mark_mask"])exit 1
+			if(!seen["smartdns90_present"]){if(n)exit 1;exit 2}
+			if((present==1&&!n)||(present==0&&n))exit 1
+			if(present!=1)exit 1
+		}' "$RP_STATE_DIR/applied"
+}
+
 if [ "$mode" = teardown ]; then
 	if [ "$IPR_CONTEXT" = 1 ] && [ "$IPR_ACTIVE" = 0 ] && [ ! -e "$IPR_INTENT" ] && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ]; then
 		ipr_legacy_empty || { rp_output_error apply '旧初始化缺少运行态归属证据，无法证明零残留；已保留现场，未猜测清理'; exit 1; }
@@ -212,9 +234,19 @@ if [ "$mode" = teardown ]; then
 		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		teardown_expected=$(mktemp "$RP_RUN_DIR/teardown-expected.XXXXXX") || exit 1
-		if ! rp_render_smartdns90 "$teardown_expected" || ! cmp -s "$RP_SMARTDNS_FILE" "$teardown_expected"; then
+		if smartdns_receipt_content >"$teardown_expected"; then receipt_rc=0; else receipt_rc=$?; fi
+		if [ "$receipt_rc" = 2 ]; then
+			# Same-boot confirmed initialization can supply older receipts missing content.
+			receipt_generation=$(rp_state_get init_generation)
+			if receipt_record=$(rp_init_active_record) && [ "${#receipt_generation}" = 32 ] &&
+				[ "$(cat "$receipt_record/token")" = "$receipt_generation" ] && [ "$(cat "$receipt_record/boot-id")" = "$current_boot" ] &&
+				[ -d "$receipt_record/origin" ] && [ ! -L "$receipt_record/origin" ] && [ -f "$receipt_record/origin/dns90-new" ] && [ ! -L "$receipt_record/origin/dns90-new" ] && [ "$(wc -c <"$receipt_record/origin/dns90-new")" -le 1048576 ]; then
+				cp "$receipt_record/origin/dns90-new" "$teardown_expected" && receipt_rc=0
+			fi
+		fi
+		if [ "$receipt_rc" != 0 ] || ! cmp -s "$RP_SMARTDNS_FILE" "$teardown_expected"; then
 			rm -f "$teardown_expected"
-			rp_output_error apply '90 片段不符合当前声明；保留未知文件和规则，未执行 teardown'
+			rp_output_error apply '90 片段与已应用内容不符或旧回执缺少归属证据；保留文件和规则，未执行 teardown'
 			exit 1
 		fi
 		rm -f "$teardown_expected"
@@ -621,6 +653,12 @@ source_max_entries=$source_max_entries
 managed_devices=$managed_devices
 EOF
 applied_write_rc=$?
+if [ "$applied_write_rc" = 0 ]; then
+	if [ "$smartdns_enabled" = 1 ]; then
+		[ -f "$RP_RUN_DIR/90-routepolicy.conf" ] && [ ! -L "$RP_RUN_DIR/90-routepolicy.conf" ] && [ "$(wc -c <"$RP_RUN_DIR/90-routepolicy.conf")" -le 1048576 ] &&
+			printf 'smartdns90_present=1\n' >>"$applied_new" && sed 's/^/smartdns90:/' "$RP_RUN_DIR/90-routepolicy.conf" >>"$applied_new" || applied_write_rc=1
+	else printf 'smartdns90_present=0\n' >>"$applied_new" || applied_write_rc=1; fi
+fi
 if [ "$applied_write_rc" -ne 0 ] || ! {
 chmod 600 "$applied_new" && sync &&
 [ ! -L "$RP_STATE_DIR/applied" ] && { [ ! -e "$RP_STATE_DIR/applied" ] || [ -f "$RP_STATE_DIR/applied" ]; } &&

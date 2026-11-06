@@ -223,12 +223,28 @@ exit_apply() {
 	local record=$1 supplied=$2 item stage original
 	[ "${#supplied}" = 32 ] && [ "$(cat "$TX/exit-token" 2>/dev/null)" = "$supplied" ] || return 1
 	uci_layout && exit_check "$record" || return 1
-	stage="$TX/exiting"; safe_dir "$stage"
-	if [ -n "$(find "$stage" -mindepth 1)" ]; then
+	stage="$TX/exiting-$supplied"
+	if [ -e "$stage" ] || [ -L "$stage" ]; then
 		# This private stage cannot have written public fields before WAL promotion.
-		[ -z "$(find "$stage" -type l)" ] && [ "$(cat "$stage/token" 2>/dev/null)" = "$supplied" ] && [ "$(cat "$stage/kind" 2>/dev/null)" = exit ] || return 1
-		rm -rf "$stage" && mkdir "$stage" || return 1
+		[ -d "$stage" ] && [ ! -L "$stage" ] && [ -z "$(find "$stage" -type l)" ] && [ "$(cat "$stage/token" 2>/dev/null)" = "$supplied" ] && [ "$(cat "$stage/kind" 2>/dev/null)" = exit ] || return 1
+		local unknown_stage
+		unknown_stage=$(find "$stage" -mindepth 1 -exec sh -c '
+			base=$1; origin=$2; shift 2
+			for path do
+				relative=${path#"$base"/}
+				case "$relative" in
+					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted) [ -f "$path" ] || printf "unknown\n" ;;
+					delta) [ -d "$path" ] || printf "unknown\n" ;;
+					*) if [ -d "$path" ]; then [ -d "$origin/$relative" ] || printf "unknown\n"; else [ -f "$path" ] && [ -f "$origin/$relative" ] || printf "unknown\n"; fi ;;
+				esac
+			done' routepolicy-exit-stage "$stage" "$record/origin" '{}' +) || return 1
+		[ -z "$unknown_stage" ] || return 1
+		rm -rf "$stage" || return 1
 	fi
+	# Publish identity before any origin copy. Killed unpublished directories stay private.
+	local staging
+	staging=$(mktemp -d "$TX/exit-preparing.XXXXXX") || return 1
+	printf '%s\n' "$supplied" >"$staging/token" && printf 'exit\n' >"$staging/kind" && sync && mv "$staging" "$stage" && sync || return 1
 	cp -pR "$record/origin/." "$stage/" || return 1
 	for item in candidate parameters; do cp "$record/$item" "$stage/$item" || return 1; done
 	printf '%s\n' "$supplied" >"$stage/token"; printf 'exit\n' >"$stage/kind"
@@ -1107,6 +1123,18 @@ case "$operation" in
 		if init_dns_owned; then [ -n "$failed_stage" ] || { init_dns_coordinate handoff || failed_stage='dns-handoff'; }; fi
 		source_refresh=0
 		if [ -f "$TX/declarations/source-refresh" ] && [ "$(cat "$TX/declarations/init-token" 2>/dev/null)" = "$(cat "$WAL/token")" ]; then source_refresh=1; fi
+		source_enabled=0
+		for source_section in $(rp_source_sections); do [ "$(rp_uci_get "$source_section" enabled 0)" != 1 ] || source_enabled=1; done
+		if [ -z "$failed_stage" ] && [ "$source_refresh:$source_enabled" = 1:0 ]; then
+			# No enabled feed means an intentionally empty snapshot, not the target's old cache.
+			printf '%s\n' source-empty-publication >"$WAL/stage"
+			empty_candidate=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX") || failed_stage='source-empty-candidate'
+			if [ -z "$failed_stage" ]; then
+				rp_managed_prepare "$WAL" && rp_managed_publish "$WAL" "$empty_candidate" || failed_stage='source-empty-publication'
+				[ ! -d "$empty_candidate" ] || rmdir "$empty_candidate" || failed_stage='source-empty-cleanup'
+			fi
+			source_refresh=0
+		fi
 		if [ -z "$failed_stage" ] && { [ "$source_refresh" = 1 ] || ! rp_sources_ready; }; then
 			printf '%s\n' source-preparation >"$WAL/stage"
 			if rp_init_window_open "$WAL" && rp_managed_prepare "$WAL"; then

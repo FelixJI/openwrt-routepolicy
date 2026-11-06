@@ -50,4 +50,31 @@ for external in current previous; do
 	grep -Fxq external "$RP_ETC/managed.d/$external/external.keep"
 	grep -Fxq new.example "$RP_MANAGED_CURRENT/feed.domain-policy.list"
 done
+TEST_MANAGED_MV=$(command -v mv); export TEST_MANAGED_MV
+mkdir "$tmp/bin"
+cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+"$TEST_MANAGED_MV" "$@" || exit $?
+for target do :; done
+if [ -f "$TEST_MANAGED_KILL" ]; then
+	case "$(cat "$TEST_MANAGED_KILL"):$target" in
+		swap:*/previous.next.*|current:*/current|previous:*/previous) rm "$TEST_MANAGED_KILL"; kill -KILL "$PPID" ;;
+	esac
+fi
+SH
+chmod +x "$tmp/bin/mv"
+export PATH="$tmp/bin:$PATH" TEST_MANAGED_KILL="$tmp/kill" ROUTEPOLICY_LIBEXEC="$LIBEXEC"
+for boundary in swap current previous; do
+	reset
+	rm -rf "$wal/managed-expected"; rm "$wal/managed-swap-name"
+	mkdir -p "$ROUTEPOLICY_ROOT/proc"
+	printf '100.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"; printf '10000\n' >"$wal/uptime-start-cs"
+	empty=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX")
+	printf '%s\n' "$boundary" >"$TEST_MANAGED_KILL"
+	if sh -c '. "$ROUTEPOLICY_LIBEXEC/common"; rp_managed_publish "$1" "$2"' routepolicy-empty-publication "$wal" "$empty"; then
+		printf 'empty publication kill not reached: %s\n' "$boundary" >&2; exit 1
+	fi
+	[ ! -e "$TEST_MANAGED_KILL" ]; restored
+done
 printf '%s\n' 'managed WAL recovery: passed (publication/restore rename gaps, idempotence, exact bytes, unknown names, external conflicts)'
+printf '%s\n' 'empty snapshot publication: passed (actual publisher killed after all three renames; original bytes restored)'
