@@ -471,6 +471,14 @@ rp_ensure_dirs() {
 	mkdir -p "$RP_USER_DIR" "$RP_MANAGED_CURRENT" "$RP_MANAGED_PREVIOUS" "$RP_STATE_DIR" "$RP_RUN_DIR/lists"
 }
 
+rp_user_list_has_content() {
+	LC_ALL=C awk '
+		/^[[:space:]]*($|[#;])/ { next }
+		{ found = 1; exit }
+		END { exit found ? 0 : 1 }
+	' "$1"
+}
+
 rp_merge_lists() {
 	target=$1
 	output=$2

@@ -252,6 +252,9 @@ rp_render_smartdns90 "$RP_SMARTDNS_FILE"
 printf 'policy_interface=%s\npolicy_device=eth2\nroute_table=200\n' "$(uci -q get routepolicy.main.policy_interface)" >"$RP_STATE_DIR/applied"
 : >"$TEST_DNS_TMP/policy-running"
 [ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_native_service smartdns reload
+if [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" = 1 ] && [ -f "$TEST_DNS_TMP/source-bootstrap-clock" ]; then
+	cat "$TEST_DNS_TMP/source-bootstrap-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"; rm "$TEST_DNS_TMP/source-bootstrap-clock"
+fi
 EOF
 # FelixJI/smartdns c27671b set_main_dns; relocate its service path and tolerate absent
 # options under this fixture set -e (the native script runs without errexit).
@@ -331,6 +334,9 @@ mkdir -p "$ROUTEPOLICY_ROOT/var/etc/smartdns"
 	case " $(uci -q get 'smartdns.@smartdns[0].conf_files') " in *' /etc/smartdns/conf.d/90-routepolicy.conf '*) printf "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'\n" ;; esac
 	printf "conf-file '/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n"
 } >"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
+if [ -f "$TEST_DNS_TMP/source-dns-clock" ]; then
+	cat "$TEST_DNS_TMP/source-dns-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"; rm "$TEST_DNS_TMP/source-dns-clock"
+fi
 EOF
 cat >"$tmp/root/etc/init.d/dnsmasq" <<'EOF'
 #!/bin/sh
@@ -464,21 +470,28 @@ if [ "${1:-}" = --lifecycle ]; then
 fi
 if [ "${1:-}" = --sources ]; then
 	cp "$REAL_LIB/update" "$REAL_LIB/validate" "$REAL_LIB/converter-lib" "$tmp/lib/"
+	cat >"$tmp/bin/timeout" <<'SH'
+#!/bin/sh
+case "$*" in *routepolicy-init-sources*) printf '%s\n' "$*" >>"$TEST_DNS_TMP/source-budget" ;; esac
+exec /usr/bin/timeout "$@"
+SH
 	cat >"$tmp/bin/curl" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_DNS_TMP/source-curl"
 [ "$(uci -q get network.rp_init_policy.proto)" = static ] || exit 91
 case " $* " in *' --interface if!eth2 '*) ;; *) exit 92 ;; esac
 [ ! -f "$TEST_DNS_TMP/source-download-fail" ] || exit 22
+[ ! -f "$TEST_DNS_TMP/source-download-slow" ] || sleep 2
+if [ -f "$TEST_DNS_TMP/source-download-clock" ]; then cat "$TEST_DNS_TMP/source-download-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"; fi
 output=
 while [ "$#" -gt 0 ]; do if [ "$1" = --output ]; then output=$2; shift; fi; shift; done
 [ -n "$output" ] || exit 93
 printf 'new.example\n' >"$output"
 SH
-	chmod +x "$tmp/bin/curl" "$tmp/lib/update" "$tmp/lib/validate"
-	for source_case in download-failure later-policy-failure success; do
+	chmod +x "$tmp/bin/curl" "$tmp/bin/timeout" "$tmp/lib/update" "$tmp/lib/validate"
+	for source_case in download-failure later-policy-failure success budget-success expired-bootstrap expired-dns expired-download slow-download-timeout; do
 		baseline 0 0 1 1
-		: >"$tmp/source-new-policy"; rm -f "$tmp/source-curl" "$tmp/source-download-fail"
+		: >"$tmp/source-new-policy"; rm -f "$tmp/source-curl" "$tmp/source-download-fail" "$tmp/source-bootstrap-clock" "$tmp/source-dns-clock" "$tmp/source-download-clock" "$tmp/source-download-slow" "$tmp/source-budget"
 		while read -r field value; do uci set "routepolicy.main.$field=$value"; done <<'EOF'
 strict_enforcement 1
 dns_redirect 1
@@ -507,20 +520,43 @@ EOF
 		decl="$tmp/root/etc/routepolicy/state/init-transaction/declarations"; mkdir "$decl"
 		printf 'installed\n' >"$decl/phase"; printf '%s\n' "$token" >"$decl/init-token"; : >"$decl/source-refresh"
 		case "$source_case" in download-failure) : >"$tmp/source-download-fail" ;; later-policy-failure) : >"$tmp/policy-fail-once" ;; esac
-		if [ "$source_case" = success ]; then
+		case "$source_case" in
+			budget-success|expired-dns|expired-download)
+				printf '120.00 0.00\n' >"$tmp/source-bootstrap-clock"; printf '130.00 0.00\n' >"$tmp/source-dns-clock" ;;
+			expired-bootstrap) printf '221.00 0.00\n' >"$tmp/source-bootstrap-clock" ;;
+			slow-download-timeout) printf '209.00 0.00\n' >"$tmp/source-bootstrap-clock"; : >"$tmp/source-download-slow" ;;
+		esac
+		case "$source_case" in expired-dns) printf '221.00 0.00\n' >"$tmp/source-dns-clock" ;; expired-download) printf '221.00 0.00\n' >"$tmp/source-download-clock" ;; esac
+		if [ "$source_case" = success ] || [ "$source_case" = budget-success ]; then
 			confirm_dns
 			grep -Fxq new.example "$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
 			[ "$(uci -q get network.rp_init_policy.proto)" = static ]
 		else
 			if "$TX" apply "$token" >"$tmp/source-result"; then printf 'source failure confirmed success: %s\n' "$source_case" >&2; exit 1; fi
 			[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = rolled_back ] || { cat "$tmp/source-result"; exit 1; }
-			diff -r "$tmp/managed-$source_case" "$tmp/root/etc/routepolicy/managed.d"
+			for snapshot in current previous; do diff -r "$tmp/managed-$source_case/$snapshot" "$tmp/root/etc/routepolicy/managed.d/$snapshot"; done
+			if [ "$source_case" = slow-download-timeout ]; then
+				unpublished=$(find "$tmp/root/etc/routepolicy/managed.d" -mindepth 1 -maxdepth 1 ! -name current ! -name previous)
+				case "$unpublished" in "$tmp/root/etc/routepolicy/managed.d/candidate."*) ;; *) printf 'unexpected timeout artifact\n' >&2; exit 1 ;; esac
+				[ -d "$unpublished" ] && [ ! -L "$unpublished" ] && [ "$(stat -c %a "$unpublished")" = 700 ] && [ -z "$(find "$unpublished" -mindepth 1)" ]
+				grep -Fxq old.example "$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
+				rp_sources_ready
+				printf '%s\n' 'source timeout artifact: one private empty unpublished candidate; current/previous remain authoritative'
+			else diff -r "$tmp/managed-$source_case" "$tmp/root/etc/routepolicy/managed.d"; fi
 			restored
 		fi
-		grep -Fq -- '--interface if!eth2' "$tmp/source-curl"
+		case "$source_case" in
+			expired-bootstrap|expired-dns) [ ! -e "$tmp/source-curl" ] && [ ! -e "$tmp/source-budget" ] ;;
+			*) grep -Fq -- '--interface if!eth2' "$tmp/source-curl" ;;
+		esac
+		case "$source_case" in
+			budget-success|expired-download) grep -Fq -- '-s KILL 80 ' "$tmp/source-budget" || { cat "$tmp/source-budget"; printf 'bootstrap/DNS time was not deducted\n' >&2; exit 1; } ;;
+			slow-download-timeout) grep -Fq -- '-s KILL 1 ' "$tmp/source-budget" || { cat "$tmp/source-budget"; printf 'slow download exceeded remaining budget\n' >&2; exit 1; } ;;
+		esac
 	done
 	if "$REAL_LIB/update" init-stage >/dev/null 2>&1; then printf 'unauthenticated init-stage accepted\n' >&2; exit 1; fi
 	printf '%s\n' 'native staged sources: passed (new policy before bound download, forced same-name refresh, HTTPS failure, later policy failure, exact current/previous rollback, unknown files, authentication)'
+	printf '%s\n' 'native source deadline: passed (bootstrap + DNS budget deducted; expired stages skip download; expired conversion cannot publish; slow download killed in remaining budget)'
 	exit 0
 fi
 native_auto_defaults_test() {

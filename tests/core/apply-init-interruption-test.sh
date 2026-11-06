@@ -335,6 +335,20 @@ if [ "$(cat "$wal/policy-active")" = 1 ]; then printf 'wanold\n' >"$TEST_INTERRU
 rm -f "$TEST_INTERRUPTION_DIR/fail-applied-publish"
 ROUTEPOLICY_INIT_RESTORE=1 ROUTEPOLICY_INIT_GENERATION="$(cat "$wal/token")" "$ROUTEPOLICY_LIBEXEC/apply" "$mode" >"$TEST_INTERRUPTION_DIR/recover-result" 2>&1
 SH
+	# Authenticated bootstrap has no exemption from configuration validation.
+	for active in 0 1; do
+		reset "$active" never
+		cp "$tmp/routes" "$tmp/invalid-routes.before"
+		[ "$active" = 0 ] || cp "$state/applied" "$tmp/invalid-applied.before"
+		printf '100.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"; printf '10000\n' >"$wal/uptime-start-cs"
+		if TEST_STRICT=broken run_owner >"$tmp/invalid-bootstrap.log" 2>&1; then
+			printf 'bootstrap ignored invalid strict_enforcement\n' >&2; exit 1
+		fi
+		grep -Fq 'strict_enforcement' "$tmp/bootstrap-result" || { printf 'bootstrap bypassed configuration validation\n' >&2; exit 1; }
+		recovery_wrote_nothing
+		[ ! -e "$wal/policy-runtime-intent" ]; cmp "$tmp/routes" "$tmp/invalid-routes.before"
+		if [ "$active" = 0 ]; then [ ! -e "$state/applied" ]; else cmp "$state/applied" "$tmp/invalid-applied.before"; fi
+	done
 	for active in 0 1; do
 		for boundary in bootstrap-published source-published final-failure success; do
 			reset "$active" never

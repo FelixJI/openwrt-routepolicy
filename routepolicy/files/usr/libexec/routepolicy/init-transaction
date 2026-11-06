@@ -1109,12 +1109,17 @@ case "$operation" in
 		if [ -f "$TX/declarations/source-refresh" ] && [ "$(cat "$TX/declarations/init-token" 2>/dev/null)" = "$(cat "$WAL/token")" ]; then source_refresh=1; fi
 		if [ -z "$failed_stage" ] && { [ "$source_refresh" = 1 ] || ! rp_sources_ready; }; then
 			printf '%s\n' source-preparation >"$WAL/stage"
-			source_now=0; source_started=0
-			source_now=$(monotonic_now) && source_started=$(cat "$WAL/uptime-start-cs") || failed_stage='source-clock'
-			source_remaining=$(( (source_started + 12000 - source_now) / 100 - 10 ))
-			if [ -z "$failed_stage" ] && [ "$source_remaining" -gt 0 ] && rp_managed_prepare "$WAL"; then
+			if rp_init_window_open "$WAL" && rp_managed_prepare "$WAL"; then
 				printf '%s\n' "$(cat "$WAL/token")" >"$WAL/source-bootstrap" && sync || failed_stage='source-bootstrap-intent'
 				[ -n "$failed_stage" ] || { policy_sync bootstrap && init_dns_coordinate start || failed_stage='source-bootstrap'; }
+				# Bootstrap and DNS startup consume the same original monotonic window.
+				source_now=0; source_started=0; source_remaining=0
+				if [ -z "$failed_stage" ]; then
+					if rp_init_window_open "$WAL" && source_now=$(monotonic_now) && source_started=$(cat "$WAL/uptime-start-cs"); then
+						source_remaining=$(( (source_started + 12000 - source_now) / 100 - 10 ))
+						[ "$source_remaining" -gt 0 ] || failed_stage='source-timeout'
+					else failed_stage='source-timeout'; fi
+				fi
 				if [ -z "$failed_stage" ]; then
 					ROUTEPOLICY_INIT_GENERATION="$(cat "$WAL/token")" timeout -s KILL "$source_remaining" sh -c 'exec "$1" init-stage' routepolicy-init-sources "$LIBEXEC/update" >"$WAL/source-result" 2>"$WAL/source-error" && rp_sources_ready || failed_stage='source-preparation'
 				fi

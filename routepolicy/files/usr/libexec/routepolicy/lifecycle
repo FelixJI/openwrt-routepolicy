@@ -139,7 +139,7 @@ stage_config() {
 		[ "$(wc -c <"$work/user.d/$name.list")" -le 262144 ] || { rm -rf "$work"; fail '单份人工清单超过 256 KiB'; }
 		if [ "$name" = local-hosts ]; then
 			rp_normalize_local_hosts <"$work/user.d/$name.list" >"$work/$name.normalized" || { rm -rf "$work"; fail '本地主机格式非法'; }
-		elif [ -s "$work/user.d/$name.list" ]; then
+		elif rp_user_list_has_content "$work/user.d/$name.list"; then
 			case "$name" in domain-*) option=plain-domain ;; *) option=plain-ipv4 ;; esac
 			ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$option" "$work/user.d/$name.list" >"$work/$name.normalized" || { rm -rf "$work"; fail '人工清单校验失败'; }
 		else : >"$work/$name.normalized"; fi

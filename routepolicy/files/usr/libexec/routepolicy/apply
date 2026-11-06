@@ -300,6 +300,10 @@ fi
 
 [ ! -L "$RP_STATE_DIR/applied" ] && { [ ! -e "$RP_STATE_DIR/applied" ] || [ -f "$RP_STATE_DIR/applied" ]; } || { rp_output_error apply 'applied 不是安全普通文件；未执行内核写入'; exit 1; }
 validation=$(ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" 2>&1)
+if [ "$?" -ne 0 ]; then
+	rp_output_error apply "应用前校验失败: $validation"
+	exit 1
+fi
 source_bootstrap=0
 if [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" = 1 ]; then
 	[ "$IPR_CONTEXT" = 1 ] && [ "$IPR_PHASE" = applying ] && rp_writer_owned && rp_init_window_open "$IPR_WAL" &&
@@ -307,10 +311,6 @@ if [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" = 1 ]; then
 	source_bootstrap=1
 fi
 if [ "$source_bootstrap" != 1 ]; then rp_sources_ready || { rp_output_error apply '启用来源的静态快照缺失或无效；未执行网络写入，不能把空规则视为 strict 恢复成功'; exit 1; }; fi
-if [ "$?" -ne 0 ]; then
-	rp_output_error apply "应用前校验失败: $validation"
-	exit 1
-fi
 
 enabled=$(rp_uci_get main enabled 0)
 if [ "$enabled" != 1 ]; then

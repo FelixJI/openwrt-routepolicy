@@ -3,7 +3,7 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-lifecycle.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-export ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" ROUTEPOLICY_OUTPUT=json
+export ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="${TEST_LIFECYCLE_LIBEXEC:-$ROOT/routepolicy/files/usr/libexec/routepolicy}" ROUTEPOLICY_OUTPUT=json
 mkdir -p "$tmp/bin" "$tmp/root/etc/config" "$tmp/root/etc/routepolicy/user.d" "$tmp/root/proc/sys/kernel/random"
 printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
 cat >"$tmp/bin/uci" <<'PY'
@@ -51,14 +51,31 @@ for package in ('network','dhcp','firewall','smartdns'): (root/'etc/config'/pack
 PY
 tool="$ROUTEPOLICY_LIBEXEC/lifecycle"
 export ROUTEPOLICY_OUTPUT=text
+# The four packaged manual lists contain a newline, not zero bytes.
+cp "$ROOT/routepolicy/files/etc/routepolicy/user.d/"*.list "$tmp/root/etc/routepolicy/user.d/"
 sh "$tool" config-export >"$tmp/export"
 grep -Fq '中文来源' "$tmp/export"
 grep -Fq 'unportable	smartdns.main.unknown' "$tmp/export"
 sh "$tool" config-import <"$tmp/export" >"$tmp/import-status"
 grep -Fq '"candidate_pending":true' "$tmp/import-status"
 [ "$(uci -c "$tmp/root/tmp/routepolicy/restore/config" get routepolicy.feed.name)" = 中文来源 ]
+for name in domain-policy domain-default ipv4-policy ipv4-default; do
+	[ ! -s "$tmp/root/tmp/routepolicy/restore/user.d/$name.list" ]
+	printf '  # comment\n ; another comment\n   \n' >"$tmp/root/etc/routepolicy/user.d/$name.list"
+done
+sh "$tool" config-export >"$tmp/comments-export"
+sh "$tool" config-import <"$tmp/comments-export" >/dev/null
+for name in domain-policy domain-default ipv4-policy ipv4-default; do [ ! -s "$tmp/root/tmp/routepolicy/restore/user.d/$name.list" ]; done
+for name in domain-policy domain-default; do printf '# heading\n  EXAMPLE.COM. # inline\n\n' >"$tmp/root/etc/routepolicy/user.d/$name.list"; done
+for name in ipv4-policy ipv4-default; do printf '; heading\n1.1.1.1\n\n' >"$tmp/root/etc/routepolicy/user.d/$name.list"; done
+sh "$tool" config-export >"$tmp/mixed-export"
+sh "$tool" config-import <"$tmp/mixed-export" >/dev/null
+for name in domain-policy domain-default; do grep -Fxq example.com "$tmp/root/tmp/routepolicy/restore/user.d/$name.list"; done
+for name in ipv4-policy ipv4-default; do grep -Fxq 1.1.1.1 "$tmp/root/tmp/routepolicy/restore/user.d/$name.list"; done
 for package in network dhcp firewall smartdns; do [ "$(cat "$tmp/root/etc/config/$package")" = "unchanged $package" ]; done
 reject() { if sh "$tool" config-import <"$1" >/dev/null 2>&1; then printf 'accepted malicious declaration: %s\n' "$1" >&2; exit 1; fi; }
+{ cat "$tmp/export"; printf 'rule\tdomain-policy\tinvalid-domain\n'; } >"$tmp/invalid-domain"; reject "$tmp/invalid-domain"
+{ cat "$tmp/mixed-export"; printf 'rule\tipv4-policy\t999.1.1.1\n'; } >"$tmp/invalid-ip"; reject "$tmp/invalid-ip"
 printf 'routepolicy-config\t2\nsensitive\t1\n' >"$tmp/future"; reject "$tmp/future"
 for payload in 'file	../../etc/config/network	anything' 'rule	../network	anything' 'journal	current	confirmed' 'main	enabled	1
 main	enabled	0'; do
