@@ -71,12 +71,73 @@ rp_is_smartdns_server_ref() {
 	printf '%s\n' "$value" | LC_ALL=C grep -Eq '^@server\[[0-9]+\]$'
 }
 
+# Decode libuci's quoted export without evaluating configuration as shell code.
+# Lists use | internally; ambiguous/control-containing values fail before any write.
+rp_uci_field_data() {
+	awk -v section="$1" -v option="$2" '
+		function unquote(s, out,i,c) {
+			if(substr(s,1,1)!=q || substr(s,length(s),1)!=q){bad=1;return ""}
+			s=substr(s,2,length(s)-2);out=""
+			for(i=1;i<=length(s);i++) {
+				c=substr(s,i,1)
+				if(c==q) {if(substr(s,i,4)!=q "\\" q q){bad=1;return ""}i+=3}
+				out=out c
+			}
+			if(out~/[[:cntrl:]|]/){bad=1;return ""}return out
+		}
+		BEGIN{q=sprintf("%c",39)}
+		$1=="config" {
+			type=$2;gsub(q,"",type);name=$3;gsub(q,"",name)
+			ref="@" type "[" count[type]++ "]";selected=(section==name||section==ref)
+		}
+		selected && ($1=="option"||$1=="list") {
+			name=$2;gsub(q,"",name);if(name!=option)next
+			line=$0;sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/,"",line)
+			value=unquote(line)
+			if(n && (kind!="list"||$1!="list"))bad=1
+			data=data (n?"|":"") value;kind=$1;n++
+		}
+		END{if(bad||!n||length(data)>4096)exit 1;print (kind=="list"?"list":"scalar") "\t" data}'
+}
+
+# Rebuild rules atomically while retaining the two DNS producer set objects.
+# Their live members and kernel expiry times survive concurrent DNS answers.
+rp_nft_rebuild() {
+	nft_source=$1 nft_target=$2
+	for nft_name in domain_policy4 domain_default4; do
+		nft_schema=$(nft list set inet routepolicy "$nft_name") || return 1
+		printf '%s\n' "$nft_schema" | grep -Eq 'type ipv4_addr([ ;]|$)' &&
+			printf '%s\n' "$nft_schema" | grep -Eq 'flags timeout([ ;]|$)|^[[:space:]]*timeout [1-9][0-9]*(ms|[smhd])' || return 1
+	done
+	: >"$nft_target" || return 1
+	for nft_name in prerouting output classify source_prerouting source_postrouting; do
+		if nft list chain inet routepolicy "$nft_name" >/dev/null 2>&1; then
+			printf 'flush chain inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
+		fi
+	done
+	for nft_name in prerouting output classify source_prerouting source_postrouting; do
+		if nft list chain inet routepolicy "$nft_name" >/dev/null 2>&1; then
+			printf 'delete chain inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
+		fi
+	done
+	for nft_name in static_policy4 static_default4 source_ingress4 source_egress4; do
+		if nft list set inet routepolicy "$nft_name" >/dev/null 2>&1; then
+			printf 'delete set inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
+		fi
+	done
+	awk '
+		/^[[:space:]]*set domain_(policy|default)4[[:space:]]*\{/ {line=$0;depth=gsub(/\{/,"",line)-gsub(/}/,"",line);skip=(depth>0);next}
+		skip {line=$0;depth+=gsub(/\{/,"",line)-gsub(/}/,"",line);skip=(depth>0);next}
+		{print}
+		END{if(skip)exit 1}' "$nft_source" >>"$nft_target"
+}
+
 rp_smartdns_fragment_loaded() {
 	fragment=$1
 	configured_fragment=${fragment#"$RP_ROOT"}
 	[ -f "$RP_SMARTDNS_GENERATED" ] && [ ! -L "$RP_SMARTDNS_GENERATED" ] || return 1
 	awk -v wanted="$configured_fragment" '
-		$1 == "conf-file" || $1 == "conf_file" { if ($2 == wanted) found=1 }
+		$1 == "conf-file" || $1 == "conf_file" { path=$2; q=sprintf("%c",39); if(substr(path,1,1)==q&&substr(path,length(path),1)==q)path=substr(path,2,length(path)-2); if (path == wanted) found=1 }
 		$1 == "conf-file=" wanted || $1 == "conf_file=" wanted { found=1 }
 		END { exit !found }
 	' "$RP_SMARTDNS_GENERATED"
@@ -373,4 +434,10 @@ rp_output_error() {
 	else
 		rp_err "$message"
 	fi
+}
+
+rp_smartdns_init_probes() {
+	printf '%s\n' '# routepolicy initialization probes' \
+		'domain-rules /routepolicy-init-default.test/ -nameserver rp_init_default -speed-check-mode none' \
+		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none'
 }

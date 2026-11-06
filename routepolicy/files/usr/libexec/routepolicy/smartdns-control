@@ -330,6 +330,20 @@ restore_file() {
 	fi
 }
 
+management_lock() {
+	lock_parent="$RP_STATE_DIR/init-transaction"
+	for path in "$RP_ETC" "$RP_STATE_DIR" "$lock_parent"; do
+		[ ! -L "$path" ] && { [ ! -e "$path" ] || [ -d "$path" ]; } || return 1
+	done
+	mkdir -p "$lock_parent" && chmod 700 "$lock_parent" || return 1
+	[ ! -L "$lock_parent/lock" ] || return 1
+	exec 9>"$lock_parent/lock"
+	flock -n 9 || return 1
+	case "$(cat "$lock_parent/current/phase" 2>/dev/null || printf absent)" in
+		absent|confirmed|rolled_back) return 0 ;; *) return 1 ;;
+	esac
+}
+
 render_extra_fragment() {
 	file=$1 output=$2
 	: >"$output"
@@ -344,6 +358,10 @@ render_extra_fragment() {
 	case "$dashboard_enabled" in 1) printf '%s\n' 'smartdns-ui.enable yes' >>"$output" ;; 0) printf '%s\n' 'smartdns-ui.enable no' >>"$output" ;; esac
 	[ -z "$dashboard_port" ] || printf 'smartdns-ui.port %s\n' "$dashboard_port" >>"$output"
 	[ -z "$dashboard_data_dir" ] || printf 'smartdns-ui.data-dir %s\n' "$dashboard_data_dir" >>"$output"
+	probe_root=$(rp_smartdns_single_root) || probe_root=
+	if [ -n "$probe_root" ] && [ "$(rp_uci_config_get smartdns "$probe_root" server_flags '')" = '-group rp_init_default' ]; then
+		rp_smartdns_init_probes >>"$output"
+	fi
 	[ -z "$dashboard_retention" ] || printf 'smartdns-ui.max-query-log-age %s\n' "$((dashboard_retention * 86400))" >>"$output"
 }
 
@@ -542,6 +560,11 @@ smartdns_read_local_hosts() {
 	printf '{"ok":true,"operation":"smartdns-read-local-hosts","content":"%s","dynamic":"%s"}\n' \
 		"$(rp_json_escape "$content")" "$(rp_json_escape "$dynamic")"
 }
+
+case "${1:-}" in
+	save|apply|discard|write-local-hosts)
+		management_lock || { rp_output_error "smartdns-${1:-write}" '初始化事务占用写锁或尚未完成，请先确认/恢复'; exit 1; } ;;
+esac
 
 case "${1:-}" in
 	status) smartdns_status ;;

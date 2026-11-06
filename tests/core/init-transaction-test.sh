@@ -45,7 +45,7 @@ if [ "${1:-}" = --native-uci ]; then
 	exit 0
 fi
 mkdir -p "$tmp/bin" "$tmp/lib" "$tmp/root/etc/init.d" "$tmp/db"
-cp "$REAL_LIB/common" "$REAL_LIB/init-transaction" "$tmp/lib/"
+cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$REAL_LIB/init-transaction" "$tmp/lib/"
 chmod +x "$tmp/lib/init-transaction"
 export TEST_TX_DIR="$tmp" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
@@ -377,7 +377,7 @@ reset() {
 	rm -f "$tmp/"auto-*
 	rm -f "$tmp/"dhcp-* "$tmp/"policy-* "$tmp/runtime-policy"
 	mkdir -p "$tmp/root/etc/config"
-	for config_package in network dhcp firewall routepolicy; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
+	for config_package in network dhcp firewall routepolicy smartdns; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
 	rm -f "$tmp/root/sys/class/net/eth9/device"
 	ln -s "$tmp/physical/eth9" "$tmp/root/sys/class/net/eth9/device"

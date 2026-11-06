@@ -9,6 +9,7 @@ USE_PROCD=1
 ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routepolicy/init-transaction}
 
 start_service() {
+	"$ROUTEPOLICY_INIT_TRANSACTION" boot-dns >/dev/null || return 1
 	"$ROUTEPOLICY_INIT_TRANSACTION" guard-needed || return 0
 	procd_open_instance guard
 	procd_set_param command "$ROUTEPOLICY_INIT_TRANSACTION" guard

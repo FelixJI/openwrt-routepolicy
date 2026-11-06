@@ -84,7 +84,8 @@ return view.extend({
 				_('未找到 SmartDNS 根配置段；首次验证并应用时会在明确确认后创建最小根段。'));
 		return E('div', { class: 'cbi-map' }, [
 			E('h2', {}, _('SmartDNS 管理')),
-			E('p', {}, _('SmartDNS 候选与 RoutePolicy 路由应用完全独立。继承表示删除对应 option；页面不会在打开时物化默认值。')),
+			E('p', {}, _('此页单独管理 SmartDNS 候选。继承表示删除对应 option；页面不会在打开时物化默认值。')),
+			E('p', {}, _('初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙、RoutePolicy 或 SmartDNS 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。已有暂存和可检测的配置变化仍会触发冲突检查。')),
 			E('div', { class: 'alert-message ' + (this.status.ambiguous ? 'error' : 'notice') }, statusText),
 			E('h3', {}, _('服务、缓存与 TTL、全局 DNS 行为')),
 			E('div', {}, FIELDS.map(function(spec) { return fieldRow(spec, this.status.settings || {}); }, this)),

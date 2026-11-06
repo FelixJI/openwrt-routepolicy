@@ -3,15 +3,20 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-topology.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-mkdir -p "$tmp/bin" "$tmp/root/proc/sys/net/ipv4/conf" "$tmp/root/sys/class/net/eth3/device"
+mkdir -p "$tmp/bin" "$tmp/root/proc/sys/net/ipv4/conf" "$tmp/root/sys/class/net/eth3/device" "$tmp/root/etc/init.d" "$tmp/root/usr/sbin"
 export TEST_TOPOLOGY_DIR=$tmp ROUTEPOLICY_ROOT="$tmp/root"
 export ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy"
 export PATH="$tmp/bin:$PATH"
 tool="$ROUTEPOLICY_LIBEXEC/init-topology"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/root/etc/init.d/smartdns"
+cp "$tmp/root/etc/init.d/smartdns" "$tmp/root/usr/sbin/smartdns"
+chmod +x "$tmp/root/etc/init.d/smartdns" "$tmp/root/usr/sbin/smartdns"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/bin/dig"
 cat >"$tmp/bin/uci" <<'EOF'
 #!/bin/sh
 [ "${1:-}" != -q ] || shift
 case "$1" in
+	export) exit 0 ;;
 	get) awk -F '\t' -v key="$2" '$1==key{print $2;found=1}END{exit !found}' "$TEST_TOPOLOGY_DIR/config" ;;
 	show) awk -F '\t' -v p="$2." 'index($1,p)==1{if($1 ~ /\.[^.]+\./)printf "%s=\047%s\047\n",$1,$2;else printf "%s=%s\n",$1,$2}' "$TEST_TOPOLOGY_DIR/config" ;;
 	*) printf 'unexpected UCI write: %s\n' "$*" >>"$TEST_TOPOLOGY_DIR/writes"; exit 1 ;;
@@ -29,6 +34,7 @@ case "$*" in
 	'call network.interface dump') echo '{"interface":[{"interface":"lan","proto":"static"}]}' ;;
 	'call network.device status') echo '{"eth3":{"present":true}}' ;;
 	'call service list') echo services ;;
+	'call service list {"name":"smartdns"}') echo '{"smartdns":{"instances":{"main":{"running":false}}}}' ;;
 	*) exit 1 ;;
 esac
 EOF
@@ -37,6 +43,7 @@ cat >"$tmp/bin/jsonfilter" <<'EOF'
 read -r data
 case "$data:$2" in
 	*:'@.up') echo true ;;
+	*:'@["dns-server"][*]') [ "${TEST_NO_UPSTREAM:-0}" = 1 ] || echo 192.0.2.53 ;;
 	'lan:@.l3_device') echo br-lan ;;
 	'wan:@.l3_device') echo eth1 ;;
 	'policy:@.l3_device') echo eth2 ;;
@@ -151,12 +158,13 @@ network.wan.device	eth1
 network.policy	interface
 network.policy.proto	dhcp
 network.policy.device	eth2
+dhcp.@dnsmasq[0]	dnsmasq
 dhcp.lan	dhcp
 dhcp.lan.interface	lan
 dhcp.lan.ignore	0
 dhcp.other	dhcp
 dhcp.other.interface	other
-dhcp.other.ignore	0
+dhcp.other.ignore	1
 firewall.@zone[0]	zone
 firewall.@zone[0].name	lan
 firewall.@zone[0].network	lan
@@ -761,5 +769,34 @@ reject env TEST_MANAGEMENT_IP=192.168.1.2 TEST_ACCESS_PREFIX=30 TEST_LOCAL_ADDRE
 grep -Fq 'EVIDENCE_MISSING' "$tmp/error"
 baseline
 TEST_MANAGEMENT_IP=10.17.1.1 TEST_ACCESS_PREFIX=1 TEST_LOCAL_ADDRESS_LINES='2: br-lan inet 10.17.1.1/1 scope global' TEST_ACCESS_GATEWAY=10.17.1.2 TEST_POLICY_ADDRESS=203.0.113.2 TEST_POLICY_GATEWAY=203.0.113.1 TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=10.17.1.2 TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=1.0.0.0 "$tool" plan lan lan policy >"$tmp/wide-source"
+# The direct DNS/IPv4-only plan is explicit and refuses unrelated duties.
+baseline
+"$tool" plan lan wan policy >"$tmp/dns-direct"
+grep -Fq 'set	dhcp.@dnsmasq[0].port	0' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.port	53' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.bind_device_name	br-lan' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.force_aaaa_soa	1' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.cache_file	/tmp/routepolicy/smartdns.cache' "$tmp/dns-direct"
+reject env TEST_NO_UPSTREAM=1 "$tool" plan lan wan policy
+TEST_NO_UPSTREAM=1 "$tool" plan lan wan policy - - - - - - - - '192.0.2.53#5353,192.0.2.54' '198.51.100.53#53' >"$tmp/dns-explicit"
+grep -Fq 'set	smartdns.rp_init_default_1.port	5353' "$tmp/dns-explicit"
+for invalid in '127.0.0.1' '224.0.0.1' '192.0.2.53#0' '192.0.2.53#65536' '192.0.2.53,,192.0.2.54'; do
+	reject "$tool" plan lan wan policy - - - - - - - - "$invalid" 198.51.100.53
+done
+printf 'network.wan6	interface\nnetwork.wan6.proto	dhcpv6\nnetwork.wan6.device	@wan\n' >>"$tmp/config"
+"$tool" plan lan wan policy >"$tmp/ipv4-only"
+grep -Fq 'set	network.wan6.disabled	1' "$tmp/ipv4-only"
+grep -Fq 'set	network.wan6.auto	0' "$tmp/ipv4-only"
+baseline
+printf 'network.foreign	interface\nnetwork.foreign.proto	static\nnetwork.foreign.device	eth1\n' >>"$tmp/config"
+reject "$tool" plan lan wan policy
+baseline
+sed 's/dhcp.other.ignore	1/dhcp.other.ignore	0/' "$tmp/config" >"$tmp/config.new"; mv "$tmp/config.new" "$tmp/config"
+reject "$tool" plan lan wan policy
+grep -Fq '其他 DHCP' "$tmp/error"
+baseline
+printf 'dhcp.@dnsmasq[0].enable_tftp	1\n' >>"$tmp/config"
+reject "$tool" plan lan wan policy
+baseline
 [ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
 printf '%s\n' 'init topology tests: passed'

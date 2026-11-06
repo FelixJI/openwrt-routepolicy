@@ -1,0 +1,390 @@
+#!/bin/sh
+# Sourced by the topology planner and its existing five-package transaction.
+# Variables belong to the two sourcing entry points.
+# shellcheck disable=SC3043,SC2154
+
+init_dns_values() {
+	local input=$1 logical=$2 raw item address port count=0 seen=''
+	if [ "$input" = - ]; then
+		raw=$(rp_interface_json "$logical") || return 1
+		input=$(field "$raw" '@["dns-server"][*]' | awk '/^[0-9.]+$/' | tr '\n' ',')
+		input=${input%,}
+	fi
+	[ -n "$input" ] || { rp_err "接口 $logical 没有可继承的 IPv4 DNS，请明确填写 DNS 来源"; return 1; }
+	case "$input" in ,*|*,|*,,*|*[!0-9.,#]*) return 1 ;; esac
+	for item in $(printf '%s' "$input" | tr ',' ' '); do
+		address=${item%%#*}; port=53
+		[ "$item" = "$address" ] || port=${item#*#}
+		rp_is_ipv4 "$address" && rp_uint_between "$port" 1 65535 || return 1
+		case "$address" in 0.*|127.*|169.254.*) return 1 ;; esac
+		[ "${address%%.*}" -lt 224 ] || return 1
+		case " $seen " in *" $address#$port "*) continue ;; esac
+		seen="$seen $address#$port"; count=$((count+1)); [ "$count" -le 4 ] || return 1
+		printf '%s#%s\n' "$address" "$port"
+	done
+	[ "$count" -gt 0 ]
+}
+
+init_ipv4_plan() {
+	local logical device section configured proto seen='' devices='' related=''
+	for logical in "$access" "$default_if" "$policy"; do
+		case " $seen " in *" $logical "*) continue ;; esac
+		seen="$seen $logical"
+		case "$logical" in "$access") device=$access_device ;; "$default_if") device=$default_device ;; *) device=$policy_device ;; esac
+		set_value "network.$logical.ipv6" 0
+		set_value "network.$logical.ip6assign" 0
+		set_value "network.$logical.delegate" 0
+		for configured in ip6addr ip6gw ip6prefix; do printf 'delete\tnetwork.%s.%s\t-\n' "$logical" "$configured"; done
+		case " $devices " in *" $device "*) continue ;; esac
+		devices="$devices $device"
+		for section in $(sections network device); do
+			[ "$(get "network.$section.name")" != "$device" ] || set_value "network.$section.ipv6" 0
+		done
+	done
+	for section in $(sections network interface); do
+		case " $seen " in *" $section "*) continue ;; esac
+		configured=$(get "network.$section.device")
+		[ -n "$configured" ] || configured=$(get "network.$section.ifname")
+		related=0
+		for logical in $seen; do case " $configured " in *" @$logical "*) related=1 ;; esac; done
+		for device in $devices; do case " $configured " in *" $device "*) related=1 ;; esac; done
+		[ "$related" = 1 ] || continue
+		proto=$(get "network.$section.proto")
+		[ "$proto" = dhcpv6 ] || fail "IPv6 设备还被未选接口 $section 占用，请先明确接口归属"
+		case "$configured" in *[[:space:]]*) fail "DHCPv6 接口 $section 同时引用其他设备，不能安全禁用" ;; esac
+		set_value "network.$section.auto" 0
+		set_value "network.$section.disabled" 1
+	done
+	for section in $(sections network route6); do
+		configured=$(get "network.$section.interface")
+		case " $seen " in *" $configured "*) [ -z "$configured" ] || fail "受管理接口有显式 IPv6 路由 $section，请先手工处理" ;; esac
+	done
+	for section in $(sections dhcp dhcp); do
+		configured=$(get "dhcp.$section.interface")
+		case " $seen " in *" $configured "*) ;; *) continue ;; esac
+		[ -n "$configured" ] && [ "$configured" != "$access" ] || continue
+		ident "$section" || fail '受管理出口的匿名 DHCP 段需要先改为稳定命名'
+		for configured in ra dhcpv6 ndp; do set_value "dhcp.$section.$configured" disabled; done
+	done
+}
+
+init_dns_plan() {
+	local roots root dnsmasq port role logical device values item index section group previous data files
+	rp_have dig || fail 'DNS 验证依赖缺失: dig'
+	[ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ -x "$RP_ROOT/usr/sbin/smartdns" ] || fail '需要官方 SmartDNS init 和二进制'
+	roots=$(rp_smartdns_root_sections)
+	[ "$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')" -le 1 ] || fail '多个 SmartDNS 根段，不能安全初始化'
+	root=$(printf '%s\n' "$roots" | sed -n '1p')
+	if [ -z "$root" ]; then root=rp_init; set_value smartdns.rp_init smartdns; fi
+	[ -z "$(get "smartdns.$root.redirect")" ] || fail 'SmartDNS redirect 旧迁移项会修改 DHCP；请先在官方界面完成迁移'
+	roots=$(sections dhcp dnsmasq)
+	[ "$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')" = 1 ] || fail '需要唯一 dnsmasq 实例；多实例请先明确接入归属'
+	dnsmasq=$roots
+	previous=$(init_dns_service_state smartdns) || fail '无法读取 SmartDNS 原运行状态'
+	if [ "$previous" = 1 ]; then
+		for item in port enabled auto_set_dnsmasq; do
+			previous=$(get "smartdns.$root.$item")
+			[ -n "$previous" ] || { case "$item" in port) previous=53 ;; enabled) previous=0 ;; *) previous=1 ;; esac; }
+			[ "$(get "smartdns.$root.old_$item")" = "$previous" ] || fail "SmartDNS 运行配置与原生 old_$item 不一致；请先在原生界面完成重载"
+		done
+		if [ "$(get "smartdns.$root.auto_set_dnsmasq")" = 1 ]; then
+			previous=$(get "smartdns.$root.port")
+			if [ "$previous" = 53 ]; then
+				[ "$(get "dhcp.$dnsmasq.port")" = 0 ] && [ "$(get "dhcp.$dnsmasq.dns_redirect")" != 1 ] || fail '原生 SmartDNS 自动主 DNS 与 DHCP 状态不一致，请先手工恢复'
+			else
+				case "$(get "dhcp.$dnsmasq.server") " in "127.0.0.1#$previous "*) ;; *) fail '原生 SmartDNS 自动转发与 DHCP 上游不一致，请先手工恢复' ;; esac
+			fi
+		fi
+	fi
+	for section in $(sections dhcp dhcp); do
+		[ "$(get "dhcp.$section.interface")" = "$access" ] || [ "$(get "dhcp.$section.ignore")" = 1 ] || fail "dnsmasq 仍承担其他 DHCP 服务: $section"
+	done
+	for section in boot mac tag match host; do
+		[ -z "$(sections dhcp "$section")" ] || [ "$section" = host ] || fail "dnsmasq 有额外 DHCP/PXE 配置: $section"
+	done
+	for item in enable_tftp dhcp_boot dhcp_range pxe_service; do
+		previous=$(get "dhcp.$dnsmasq.$item")
+		[ -z "$previous" ] || [ "$previous" = 0 ] || fail "dnsmasq 仍承担必要职责: $item"
+	done
+	# Unknown DNS daemons are never stopped or adopted on the strength of port alone.
+	netstat -lnptu | awk '$1~/^(tcp|udp)(6)?$/&&$4~/:53$/&&$0!~/(smartdns|dnsmasq)/{bad=1}END{exit bad}' || fail '53 端口存在未知监听进程'
+	port=53
+	previous=$(get "smartdns.$root.server_flags")
+	case "$previous" in ''|'-group rp_init_default') ;; *) fail 'SmartDNS server_flags 已有用户设置，不能安全接管默认上游组' ;; esac
+	# Seed the official init bookkeeping to prevent its legacy dnsmasq auto-edit path.
+	for item in enabled:1 port:"$port" tcp_server:1 ipv6_server:0 bind_device:1 bind_device_name:"$access_device" auto_set_dnsmasq:0 old_enabled:1 old_port:"$port" old_auto_set_dnsmasq:0 cache_persist:1 cache_file:/tmp/routepolicy/smartdns.cache force_aaaa_soa:1 tls_server:0 doh_server:0 seconddns_enabled:0; do
+		set_value "smartdns.$root.${item%%:*}" "${item#*:}"
+	done
+	for item in client-rule domain-rule ip-rule; do
+		if [ -z "$(sections smartdns "$item")" ]; then
+			section=rp_init_$(printf '%s' "$item" | tr '-' '_')
+			[ -z "$(get "smartdns.$section")" ] || fail "SmartDNS 保留段冲突: $section"
+			set_value "smartdns.$section" "$item"
+		fi
+	done
+	set_value "smartdns.$root.server_flags" '-group rp_init_default'
+	set_value "dhcp.$dnsmasq.port" 0
+	data=$(uci -q export smartdns | rp_uci_field_data "$root" conf_files) || {
+		[ -z "$(get "smartdns.$root.conf_files")" ] || fail 'SmartDNS conf_files 包含不能无损处理的值'
+		data=''
+	}
+	files=${data#*"$(printf '\t')"}
+	files=$(printf '%s\n' "$files" | tr '|' '\n' | awk '$0!="/etc/smartdns/conf.d/90-routepolicy.conf"&&NF' | tr '\n' '|'); files=${files%|}
+	case "|$files|" in *'|/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf|'*) ;; *) files="${files:+$files|}/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf" ;; esac
+	files="$files|/etc/smartdns/conf.d/90-routepolicy.conf"
+	printf 'list\tsmartdns.%s.conf_files\t%s\n' "$root" "$files"
+	set_value routepolicy.main.smartdns_enabled 1
+	set_value routepolicy.main.smartdns_policy_group rp_init_policy
+	for role in default policy; do
+		if [ "$role" = default ]; then logical=$default_if device=$default_device values=${dns_default:--}; else logical=$policy device=$policy_device values=${dns_policy:--}; fi
+		values=$(init_dns_values "$values" "$logical") || fail "出口 $role 的 IPv4 DNS 来源无效或缺失"
+		index=0
+		for item in $values; do
+			index=$((index+1)); section="rp_init_${role}_$index"; group="rp_init_$role"
+			previous=$(get "smartdns.$section")
+			[ -z "$previous" ] || { [ "$previous" = server ] && [ "$(get "smartdns.$section.routepolicy_init")" = 1 ]; } || fail "SmartDNS 保留段冲突: $section"
+			set_value "smartdns.$section" server
+			set_value "smartdns.$section.routepolicy_init" 1
+			set_value "smartdns.$section.enabled" 1
+			set_value "smartdns.$section.type" udp
+			set_value "smartdns.$section.ip" "${item%#*}"
+			set_value "smartdns.$section.port" "${item##*#}"
+			set_value "smartdns.$section.server_group" "$group"
+			set_value "smartdns.$section.exclude_default_group" 1
+			set_value "smartdns.$section.addition_arg" "-interface $device"
+		done
+		# A smaller repeated input disables only our previously generated surplus.
+		while [ "$index" -lt 4 ]; do
+			index=$((index+1)); section="rp_init_${role}_$index"
+			[ "$(get "smartdns.$section.routepolicy_init")" != 1 ] || set_value "smartdns.$section.enabled" 0
+		done
+	done
+	for section in $(rp_smartdns_server_sections); do
+		[ "$(get "smartdns.$section.routepolicy_init")" = 1 ] && continue
+		group=$(get "smartdns.$section.server_group")
+		case " $group " in *' rp_init_default '*|*' rp_init_policy '*) fail "用户上游占用了初始化保留组: $section" ;; esac
+	done
+}
+
+init_dns_owned() { grep -q '^set[[:space:]]smartdns\.' "$WAL/candidate"; }
+init_dns_managed() {
+	local root
+	init_dns_owned && [ "$(uci -q get routepolicy.main.enabled)" = 1 ] && [ "$(uci -q get routepolicy.main.smartdns_enabled)" = 1 ] || return 1
+	root=$(rp_smartdns_single_root) || return 1
+	[ "$(uci -q get "smartdns.$root.cache_file")" = /tmp/routepolicy/smartdns.cache ] &&
+		[ "$(uci -q get "smartdns.$root.server_flags")" = '-group rp_init_default' ] &&
+		[ "$(uci -q get "smartdns.$root.auto_set_dnsmasq")" = 0 ]
+}
+init_dns_service_state() {
+	local service=$1 output
+	output=$(ubus call service list "{\"name\":\"$service\"}") || return 1
+	case "$output" in \{*\}) ;; *) return 1 ;; esac
+	if printf '%s\n' "$output" | jsonfilter -e "@.$service.instances.*.running" | grep -Eq '^(true|1)$'; then printf 1; else printf 0; fi
+}
+init_dns_enabled() {
+	local result=0
+	"$RP_ROOT/etc/init.d/$1" enabled 9>&- >/dev/null 2>&1 || result=$?
+	case "$result" in 0) printf 1 ;; 1) printf 0 ;; *) return 1 ;; esac
+}
+init_dns_call() {
+	# The bounded supervisor retains FD9 until the service writer has exited.
+	timeout -k 2 15 sh -c 'exec 9>&-; exec "$1" "$2"' routepolicy-dns-service "$RP_ROOT/etc/init.d/$1" "$2"
+}
+init_dns_audit_binds() {
+	local config=$1 depth=$2 port=$3 device=$4 includes include
+	[ "$depth" -lt 16 ] && [ -f "$config" ] || return 1
+	# Also inspect loaded user includes: a second wildcard bind defeats device isolation.
+	includes=$(awk -v port="$port" -v device="$device" '
+		$1~/^#/ {next}
+		$1~/^bind/ {if($1!~/^bind(-tcp)?$/||($2!=":" port "@lo"&&$2!=":" port "@" device)||$3!="-group"||$4!="rp_init_default")bad=1}
+		$1=="conf-file"||$1=="conf_file" {
+			line=$0;sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/,"",line)
+			q=substr(line,1,1);if(q==sprintf("%c",39)||q=="\""){if(substr(line,length(line),1)!=q){bad=1;next}line=substr(line,2,length(line)-2)}
+			if(line!~/^\//||line~/[[:cntrl:]]/)bad=1;else print line
+		}
+		END{exit bad}' "$config") || return 1
+	[ -n "$includes" ] || return 0
+	while IFS= read -r include; do
+		init_dns_audit_binds "$RP_ROOT$include" "$((depth+1))" "$port" "$device" || return 1
+	done <<EOF
+$includes
+EOF
+}
+
+init_dns_coordinate() {
+	local action=$1 port answer protocol probe access_dev service running enabled section address group device temp remaining cache="$RP_RUN_DIR/smartdns.cache" path=$RP_SMARTDNS_EXTRA_FILE
+	# Old #17 WALs contain no DNS fields and retain their original recovery path.
+	init_dns_owned || return 0
+	case "$action" in
+		prepare)
+			[ ! -L "$cache" ] && { [ ! -e "$cache" ] || [ -f "$cache" ]; } || return 1
+			if [ -e "$cache" ]; then
+				section=$(rp_smartdns_single_root) || return 1
+				[ "$(uci -q get "smartdns.$section.cache_file")" = /tmp/routepolicy/smartdns.cache ] || return 1
+			fi
+			[ ! -L "$path" ] && { [ ! -e "$path" ] || [ -f "$path" ]; } || return 1
+			if [ -e "$path" ]; then cp -p "$path" "$WAL/dns-file-old" || return 1; else : >"$WAL/dns-file-absent"; fi
+			{ [ ! -f "$WAL/dns-file-old" ] || cat "$WAL/dns-file-old"; } >"$WAL/dns-file-new" || return 1
+			if ! grep -Fqx '# routepolicy initialization probes' "$WAL/dns-file-new"; then
+				{ printf '\n'; rp_smartdns_init_probes; } >>"$WAL/dns-file-new" || return 1
+			fi
+			for probe in default policy; do
+				[ "$(grep -Fxc "domain-rules /routepolicy-init-$probe.test/ -nameserver rp_init_$probe -speed-check-mode none" "$WAL/dns-file-new")" = 1 ] || return 1
+			done
+			[ ! -L "$RP_SMARTDNS_FILE" ] && { [ ! -e "$RP_SMARTDNS_FILE" ] || [ -f "$RP_SMARTDNS_FILE" ]; } || return 1
+			if [ -e "$RP_SMARTDNS_FILE" ]; then cp -p "$RP_SMARTDNS_FILE" "$WAL/dns90-old" || return 1; else : >"$WAL/dns90-absent"; fi
+			if [ -e "$RP_ACTIVE_DIR" ]; then
+				[ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ] || return 1
+				[ -z "$(find "$RP_ACTIVE_DIR" -mindepth 1 ! -type f)" ] || return 1
+				[ -z "$(find "$RP_ACTIVE_DIR" -mindepth 1 -maxdepth 1 ! -name generation ! -name domain-policy.list ! -name domain-default.list)" ] || return 1
+				cp -pR "$RP_ACTIVE_DIR" "$WAL/dns-active-old" || return 1
+			fi
+			for service in smartdns dnsmasq; do
+				[ -x "$RP_ROOT/etc/init.d/$service" ] || return 1
+				running=$(init_dns_service_state "$service") && enabled=$(init_dns_enabled "$service") || return 1
+				printf '%s\n' "$running" >"$WAL/$service-running" && printf '%s\n' "$enabled" >"$WAL/$service-enabled" || return 1
+			 done
+			enabled=$(init_dns_enabled routepolicy) || return 1
+			printf '%s\n' "$enabled" >"$WAL/routepolicy-enabled"
+			;;
+		apply)
+			for service in smartdns dnsmasq; do
+				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
+			done
+			[ "$(init_dns_enabled routepolicy)" = "$(cat "$WAL/routepolicy-enabled")" ] || return 1
+			if [ -f "$WAL/dns-file-absent" ]; then [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+			else cmp -s "$path" "$WAL/dns-file-old" || return 1; fi
+			printf '%s' '' >"$WAL/dns-attempted" && sync || return 1
+			temp="$path.init-$(cat "$WAL/token")"
+			[ ! -L "$temp" ] && [ ! -e "$temp" ] || return 1
+			mkdir -p "$(dirname "$path")" && (set -C; cat "$WAL/dns-file-new" >"$temp") && chmod 0644 "$temp" && mv "$temp" "$path" || return 1
+			;;
+		handoff)
+			printf '%s' '' >"$WAL/dns-service-attempted" && sync || return 1
+			{
+				init_dns_call dnsmasq stop &&
+				init_dns_call dnsmasq disable &&
+				timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- &&
+				init_dns_call routepolicy enable
+			} >"$WAL/dns-service-result" 2>&1 || return 1
+			remaining=10
+			while netstat -lnptu | grep -Eq 'smartdns'; do
+				[ "$remaining" -gt 0 ] || return 1
+				sleep 1; remaining=$((remaining-1))
+			done
+			# A fresh table must not consume a warm cache left by a previous disable.
+			# Keep this application's old /tmp cache only until confirm or rollback.
+			temp="$cache.init-$(cat "$WAL/token")"
+			[ ! -L "$cache" ] && [ ! -L "$temp" ] && [ ! -e "$temp" ] || return 1
+			if [ -e "$cache" ]; then
+				printf '%s' '' >"$WAL/dns-cache-move" && sync && mv "$cache" "$temp" || return 1
+			else printf '%s' '' >"$WAL/dns-cache-absent" && sync || return 1; fi
+			;;
+		start)
+			init_dns_call smartdns reload && init_dns_call smartdns enable
+			;;
+		policy-prepare)
+			rp_render_smartdns90 "$WAL/dns90-new" || return 1
+			printf '%s' '' >"$WAL/dns90-attempted" && sync
+			;;
+		verify)
+			[ "$(init_dns_service_state smartdns)" = 1 ] && { [ "${operation:-}" = boot-dns ] || [ "$(init_dns_enabled smartdns)" = 1 ]; } &&
+				[ "$(init_dns_service_state dnsmasq)" = 0 ] && [ "$(init_dns_enabled dnsmasq)" = 0 ] && rp_smartdns_fragment_loaded "$path" || return 1
+			if [ "${operation:-}" = boot-dns ]; then
+				for probe in default policy; do
+					[ "$(grep -Fxc "domain-rules /routepolicy-init-$probe.test/ -nameserver rp_init_$probe -speed-check-mode none" "$path")" = 1 ] || return 1
+				done
+			else cmp -s "$path" "$WAL/dns-file-new" || return 1; fi
+			rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" || return 1
+			port=$(awk -F '\t' '$2~/^smartdns\.[^.]+\.port$/ {print $3;exit}' "$WAL/candidate")
+			access_dev=$(awk -F '\t' '$2~/^smartdns\.[^.]+\.bind_device_name$/ {print $3;exit}' "$WAL/candidate")
+			awk -v port="$port" -v device="$access_dev" '
+				$1~/^bind/ {if($1!~/^bind(-tcp)?$/||($2!=":" port "@lo"&&$2!=":" port "@" device)||$3!="-group"||$4!="rp_init_default")bad=1;else seen[$1,$2]=1}
+				END{exit bad||!seen["bind",":" port "@lo"]||!seen["bind-tcp",":" port "@lo"]||!seen["bind",":" port "@" device]||!seen["bind-tcp",":" port "@" device]}' "$RP_SMARTDNS_GENERATED" || return 1
+			init_dns_audit_binds "$RP_SMARTDNS_GENERATED" 0 "$port" "$access_dev" || return 1
+			for group in default policy; do
+				device=$(uci_committed get "routepolicy.main.${group}_interface") || return 1
+				device=$(rp_interface_device "$device") || return 1
+				rp_is_device "$device" || return 1
+				awk -v group="rp_init_$group" -v device="$device" '
+					$1~/^server/&&index(" " $0 " "," -group " group " ") {
+						found=1;if(!index(" " $0 " "," -interface " device " ")||!index(" " $0 " "," -exclude-default-group "))bad=1
+					}
+					END{exit !found||bad}' "$RP_SMARTDNS_GENERATED" || return 1
+			done
+			netstat -lnptu | awk -v port="$port" '
+				$1~/^(tcp|udp)$/ && $4~(":" port "$") && $0~/smartdns/ {seen[$1]=1}
+				$1~/^(tcp|udp)(6)?$/ && $4~/:53$/ && $0!~/smartdns/ {bad=1}
+				$1~/^(tcp6|udp6)$/ && $4~/:53$/ {bad=1}
+				END{exit bad||!seen["tcp"]||!seen["udp"]}' || return 1
+			# Query both transports and groups through the client-facing SmartDNS socket.
+			for protocol in +notcp +tcp; do
+				for probe in default policy; do
+					answer=$(timeout 6 dig "$protocol" +time=2 +tries=1 +noall +comments +answer "@$(topology management-address)" "routepolicy-init-$probe.test" A) || return 1
+					printf '%s\n' "$answer" >>"$WAL/dns-query-result"
+					printf '%s\n' "$answer" | grep -Eq 'status: (NOERROR|NXDOMAIN),' || return 1
+				done
+			done
+			;;
+		rollback)
+			[ -f "$WAL/dns-attempted" ] || return 0
+			if [ "${recovery_early:-0}" != 1 ] && [ -f "$WAL/dns-service-attempted" ]; then timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- >/dev/null || return 1; fi
+			temp="$path.init-$(cat "$WAL/token")"
+			[ ! -L "$temp" ] || return 1
+			[ ! -e "$temp" ] || { [ -f "$temp" ] && rm -f "$temp"; } || return 1
+			[ ! -L "$path" ] || return 1
+			if cmp -s "$path" "$WAL/dns-file-new"; then
+				if [ -f "$WAL/dns-file-absent" ]; then rm -f "$path"; else cp -p "$WAL/dns-file-old" "$path"; fi
+			elif [ -f "$WAL/dns-file-absent" ]; then [ ! -e "$path" ] || return 1
+			else cmp -s "$path" "$WAL/dns-file-old" || return 1; fi
+			;;
+		restore-files|restore-service)
+			[ -f "$WAL/dns-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
+			if [ -f "$WAL/dns90-attempted" ]; then
+				[ ! -L "$RP_SMARTDNS_FILE" ] || return 1
+				if cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-new" || { [ -f "$WAL/dns90-restore" ] && cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-restore"; }; then
+					if [ -f "$WAL/dns90-absent" ]; then rm -f "$RP_SMARTDNS_FILE"; else cp -p "$WAL/dns90-old" "$RP_SMARTDNS_FILE"; fi
+				elif [ -f "$WAL/dns90-absent" ]; then [ ! -e "$RP_SMARTDNS_FILE" ] || return 1
+				else cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-old" || return 1; fi
+				if [ "$(cat "$WAL/policy-active")" = 0 ] && [ -d "$WAL/dns-active-old" ]; then
+					if [ -e "$RP_ACTIVE_DIR" ]; then
+						[ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ] || return 1
+						for section in generation domain-policy.list domain-default.list; do
+							if [ -e "$WAL/dns-active-old/$section" ]; then cmp -s "$WAL/dns-active-old/$section" "$RP_ACTIVE_DIR/$section" || return 1
+							else [ ! -e "$RP_ACTIVE_DIR/$section" ] || return 1; fi
+						done
+					else mkdir -p "$RP_RUN_DIR" && cp -pR "$WAL/dns-active-old" "$RP_ACTIVE_DIR" || return 1; fi
+				fi
+			fi
+			[ "$action" != restore-files ] || return 0
+			[ -f "$WAL/dns-service-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
+			temp="$cache.init-$(cat "$WAL/token")"
+			[ ! -L "$temp" ] && [ ! -L "$cache" ] || return 1
+			if [ -f "$temp" ]; then rm -f "$cache" && mv "$temp" "$cache" || return 1
+			elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
+			for service in dnsmasq smartdns; do
+				case "$(cat "$WAL/$service-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
+				init_dns_call "$service" "$enabled" >/dev/null || return 1
+				case "$(cat "$WAL/$service-running")" in 1) running=start ;; 0) running=stop ;; *) return 1 ;; esac
+				if [ "$service:$running" = smartdns:stop ]; then timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- >/dev/null || return 1
+				else init_dns_call "$service" "$running" >/dev/null || return 1; fi
+				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
+			done
+			case "$(cat "$WAL/routepolicy-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
+			init_dns_call routepolicy "$enabled" || return 1
+			init_dns_restore_bookkeeping
+			;;
+		quarantine-boot)
+			printf '%s' '' >"$WAL/dns-boot-quarantined" && sync || return 1
+			# Keep both S19 entries absent until S94 explicitly restores real state.
+			# A pre-expanded rcS list may still mention the now-missing link paths.
+			for service in smartdns dnsmasq; do init_dns_call "$service" disable >/dev/null || return 1; done
+			[ "$(init_dns_enabled smartdns)$(init_dns_enabled dnsmasq)" = 00 ]
+			;;
+		confirm)
+			temp="$cache.init-$(cat "$WAL/token")"
+			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } && rm -f "$temp"
+			;;
+		*) return 1 ;;
+	esac
+}

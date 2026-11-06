@@ -11,7 +11,7 @@ case "$*" in
 		;;
 	'list tables') exit 0 ;;
 	'delete table inet routepolicy') [ "${TEST_NFT_DELETE_FAIL:-0}" != 1 ] ;;
-	'list set inet routepolicy '*) printf 'set x {\n elements = { 8.8.8.8, 1.1.1.1 }\n}\n' ;;
+	'list set inet routepolicy '*) printf 'set x {\n type ipv4_addr\n flags timeout\n elements = { 8.8.8.8, 1.1.1.1 }\n}\n' ;;
 	'list chain inet routepolicy classify') echo 'udp dport 53 redirect to :53' ;;
 	'-c -f '*) [ "${TEST_NFT_FAIL_CHECK:-0}" = 1 ] && exit 1 || exit 0 ;;
 	'-f '*) exit 0 ;;

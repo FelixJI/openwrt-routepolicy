@@ -4,6 +4,11 @@ set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
 
+# A failed boot coordinator must not be bypassed by the later S95 apply.
+if [ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ]; then
+	ROUTEPOLICY_DNS_DEFER=1
+fi
+
 mode=${1:-apply}
 case "$mode" in apply|teardown) ;; *) rp_die '内部 apply 模式非法' ;; esac
 
@@ -40,7 +45,7 @@ if [ "$mode" = teardown ]; then
 	smartdns_backup="$RP_SMARTDNS_FILE.teardown.$$"
 	smartdns_uci_backup="$RP_RUN_DIR/smartdns.teardown.$$.uci"
 	uci -q export smartdns >"$smartdns_uci_backup" 2>/dev/null || : >"$smartdns_uci_backup"
-	if [ -e "$RP_SMARTDNS_FILE" ]; then
+	if [ "${ROUTEPOLICY_INIT_RESTORE:-0}" != 1 ] && [ -e "$RP_SMARTDNS_FILE" ]; then
 		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
@@ -187,7 +192,7 @@ else
 	: >"$active_new/domain-policy.list"
 	: >"$active_new/domain-default.list"
 fi
-active_generation="$(date -u +%Y%m%dT%H%M%SZ).$$"
+active_generation=${ROUTEPOLICY_INIT_GENERATION:-$(date -u +%Y%m%dT%H%M%SZ).$$}
 case "$active_generation" in ''|*[!A-Za-z0-9_.-]*|?????????????????????????????????????????????????????????????????*) rp_output_error apply '无法生成安全的 active catalog generation'; exit 1 ;; esac
 printf '%s\n' "$active_generation" >"$active_new/generation"
 chmod 0600 "$active_new/generation" "$active_new/domain-policy.list" "$active_new/domain-default.list"
@@ -240,16 +245,12 @@ if [ "$incremental" -eq 1 ]; then
 	candidate="$RP_RUN_DIR/update.nft"
 else
 	if nft list table inet routepolicy >"$work/nft.previous" 2>/dev/null; then
-		live_snapshot="$work/live-snapshot.nft"
-		if ! "$LIBEXEC/warm-state" live-save "$live_snapshot" >"$work/live-save.log" 2>&1; then
-			rp_output_error apply "无法在完整事务前保存动态集合 live snapshot: $(tr '\n' ';' <"$work/live-save.log")"
+		# Keep the producer sets themselves: no snapshot race and no TTL renewal.
+		if ! rp_nft_rebuild "$RP_NFT_FILE" "$work/nft.full"; then
+			rp_output_error apply '旧动态 DNS 集合缺失或类型不兼容；已保留原运行态，请先恢复两个 ipv4_addr/timeout 集合后重试'
 			exit 1
 		fi
-		# A warm DNS cache hit may not reinsert an IP. Restore captured members in the table replacement itself.
-		{ printf 'delete table inet routepolicy\n' && cat "$RP_NFT_FILE" "$live_snapshot"; } >"$work/nft.full" || {
-			rp_output_error apply '无法构建包含动态集合的 nft 事务'
-			exit 1
-		}
+		live_snapshot=retained
 		candidate="$work/nft.full"
 	else
 		: >"$work/nft.previous.absent"
@@ -288,8 +289,9 @@ uci -q export smartdns >"$work/smartdns.uci.previous" 2>/dev/null || : >"$work/s
 restore_previous() {
 	restore_active || true
 	if [ -s "$work/nft.previous" ]; then
-		{ printf 'delete table inet routepolicy\n'; cat "$work/nft.previous"; } >"$work/nft.restore"
-		nft -f "$work/nft.restore" >/dev/null 2>&1 || true
+		if rp_nft_rebuild "$work/nft.previous" "$work/nft.restore"; then
+			nft -f "$work/nft.restore" >/dev/null 2>&1 || true
+		fi
 	else
 		nft delete table inet routepolicy >/dev/null 2>&1 || true
 	fi
@@ -310,7 +312,7 @@ restore_previous() {
 	else
 		rm -f "$RP_SMARTDNS_FILE"
 	fi
-	if [ -s "$work/smartdns.uci.previous" ]; then
+	if [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ -s "$work/smartdns.uci.previous" ]; then
 		uci -q import smartdns <"$work/smartdns.uci.previous" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true
 	fi
 }
@@ -378,7 +380,7 @@ else
 	fi
 fi
 
-if [ -z "$failed" ]; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ]; then
 	if [ "$smartdns_enabled" = 1 ]; then
 		rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1 || failed='无法登记 SmartDNS 适配片段'
 	else
@@ -386,22 +388,22 @@ if [ -z "$failed" ]; then
 	fi
 fi
 
-if [ -z "$failed" ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
 	if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
 		"$RP_ROOT/etc/init.d/smartdns" reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
 	fi
 fi
 
-if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 	failed='SmartDNS 实际生成配置未加载 90 片段'
 fi
-if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 0 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 0 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 	failed='SmartDNS 实际生成配置仍加载已关闭的 90 片段'
 fi
 
 if [ -n "$failed" ]; then
 	restore_previous
-	[ -x "$RP_ROOT/etc/init.d/smartdns" ] && "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+	[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || { [ -x "$RP_ROOT/etc/init.d/smartdns" ] && "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true; }
 	rp_output_error apply "$failed；已尝试恢复应用前状态"
 	exit 1
 fi

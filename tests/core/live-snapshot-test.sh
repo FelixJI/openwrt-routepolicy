@@ -72,10 +72,10 @@ TABLE
 		;;
 	'list set inet routepolicy domain_policy4')
 		[ "${TEST_LIVE_SAVE_FAIL:-0}" != 1 ] || exit 1
-		printf '%s\n' 'set domain_policy4 { elements = { 1.1.1.1 timeout 1h expires 42m30s } }'
+		printf '%s\n' 'set domain_policy4 { type ipv4_addr; flags timeout; elements = { 1.1.1.1 timeout 1h expires 42m30s } }'
 		;;
 	'list set inet routepolicy domain_default4')
-		printf '%s\n' 'set domain_default4 { elements = { 9.9.9.9 timeout 1h expires 995ms } }'
+		printf '%s\n' 'set domain_default4 { type ipv4_addr; flags timeout; elements = { 9.9.9.9 timeout 1h expires 995ms } }'
 		;;
 	'list set inet routepolicy static_policy4'|'list set inet routepolicy static_default4'|\
 	'list chain inet routepolicy prerouting'|'list chain inet routepolicy classify') exit 0 ;;
@@ -85,7 +85,7 @@ TABLE
 		exit 0
 		;;
 	'-f '*)
-		if grep -Fq 'add element inet routepolicy domain_policy4' "$2" && grep -Fq 'chain output {' "$2"; then
+		if grep -Fq 'chain output {' "$2" && ! grep -Fq 'set domain_policy4 {' "$2" && ! grep -Fq 'delete table inet routepolicy' "$2"; then
 			printf '%s\n' ATOMIC_APPLY >>"$TEST_NFT_LOG"
 			[ -z "${TEST_NFT_ATOMIC:-}" ] || cp "$2" "$TEST_NFT_ATOMIC"
 			[ "${TEST_LIVE_RESTORE_FAIL:-0}" != 1 ]
@@ -105,10 +105,8 @@ esac
 EOF
 chmod +x "$tmp/bin/nft"
 
-# Successful full apply: the captured dynamic members must be validated and
-# committed inside the very nft batch that rebuilds the table (SmartDNS never
-# rewrites entries for a cleared set, so a member-less rebuild would leave
-# snapshot policy IPs on the default route until a separate restore landed).
+# Full rebuild preserves kernel DNS set objects: concurrent inserts and expiry
+# continue without a snapshot/reinsert window, even when a chain was missing.
 : >"$tmp/nft.log"; rm -f "$tmp/nft.check" "$tmp/nft.atomic"
 if TEST_NFT_LOG="$tmp/nft.log" TEST_NFT_CHECK="$tmp/nft.check" TEST_NFT_ATOMIC="$tmp/nft.atomic" \
 	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
@@ -131,12 +129,9 @@ fi
 [ "$(grep -c -- '^-c -f ' "$tmp/nft.log")" -eq 1 ] || {
 	printf 'full apply validated %s batches instead of one\n' "$(grep -c -- '^-c -f ' "$tmp/nft.log")" >&2; exit 1
 }
-grep -Fq 'add element inet routepolicy domain_policy4 { 1.1.1.1 timeout 42m30s }' "$tmp/nft.atomic" || {
-	printf 'merged batch omitted the policy member with its remaining TTL\n' >&2; exit 1
-}
-grep -Fq 'add element inet routepolicy domain_default4 { 9.9.9.9 timeout 995ms }' "$tmp/nft.atomic" || {
-	printf 'merged batch omitted the default member with its remaining TTL\n' >&2; exit 1
-}
+if grep -Eq '(delete|flush) table.*routepolicy|(delete|flush) set.*routepolicy domain_(policy|default)4|set domain_(policy|default)4 \{|add element .*domain_(policy|default)4' "$tmp/nft.atomic"; then
+	printf 'full rebuild destroyed or repopulated a live DNS set\n' >&2; exit 1
+fi
 cmp -s "$tmp/nft.check" "$tmp/nft.atomic" || { printf 'validated batch differed from the committed batch\n' >&2; exit 1; }
 [ -e "$tmp/etc/routepolicy/state/applied" ] || { printf 'successful full apply published no state\n' >&2; exit 1; }
 

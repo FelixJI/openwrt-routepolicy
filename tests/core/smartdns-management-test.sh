@@ -355,4 +355,11 @@ grep -Fxq import "$tmp/uci.log"
 [ -s "$tmp/root/tmp/routepolicy/smartdns-candidate.tsv" ]
 [ -s "$tmp/root/tmp/routepolicy/local-hosts-candidate.list" ]
 
+# Initialization's persistent lock and pending phase exclude independent writes.
+mkdir -p "$tmp/root/etc/routepolicy/state/init-transaction/current"
+for phase in prepared applying pending rolling_back conflict; do
+	printf '%s\n' "$phase" >"$tmp/root/etc/routepolicy/state/init-transaction/current/phase"
+	if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
+	grep -Fq '初始化事务' "$tmp/locked.json"
+done
 printf '%s\n' 'SmartDNS management tests: passed'
