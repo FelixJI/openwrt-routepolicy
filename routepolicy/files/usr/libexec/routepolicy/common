@@ -481,10 +481,17 @@ rp_init_section_owned() (
 		for section_index in $section_entries; do
 			section_entry="$section_record/fields/$section_index"
 			[ -d "$section_entry" ] && [ ! -L "$section_entry" ] || continue
-			for section_file in key expected expected-type attempted; do
+			for section_file in key expected attempted; do
 				[ -f "$section_entry/$section_file" ] && [ ! -L "$section_entry/$section_file" ] || continue 2
 			done
-			[ "$(cat "$section_entry/key")" = "$section_key" ] && [ "$(cat "$section_entry/expected")" = "$section_type" ] && [ "$(cat "$section_entry/expected-type")" = scalar ] && exit 0
+			# base614 set entries were scalar but had no expected-type file. The
+			# set candidate, actual attempted entry and trusted phase remain required.
+			section_expected_type=scalar
+			if [ -e "$section_entry/expected-type" ] || [ -L "$section_entry/expected-type" ]; then
+				[ -f "$section_entry/expected-type" ] && [ ! -L "$section_entry/expected-type" ] || continue
+				section_expected_type=$(cat "$section_entry/expected-type") || continue
+			fi
+			[ "$(cat "$section_entry/key")" = "$section_key" ] && [ "$(cat "$section_entry/expected")" = "$section_type" ] && [ "$section_expected_type" = scalar ] && exit 0
 		done
 	done
 	exit 1

@@ -288,6 +288,47 @@ multidevice_config() {
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
 }
+# base614 #17 wrote scalar set fields without expected-type. The optional real
+# baseline planner lets the offline upgrade check use its original candidate too.
+legacy_ownership_test() {
+	baseline
+	"${TEST_BASE17_TOPOLOGY:-$tool}" plan lan wan policy >"$tmp/base17-plan"
+	apply_mock_plan "$tmp/base17-plan"
+	printf 'confirmed\n' >"$mock_wal/phase"
+	printf '0123456789abcdef0123456789abcdef\n' >"$mock_wal/token"
+	for legacy_field in "$mock_wal"/fields/*; do
+		[ -d "$legacy_field" ] || continue
+		rm "$legacy_field/expected-type"
+		printf scalar >"$legacy_field/type"; printf 0 >"$legacy_field/existed"; : >"$legacy_field/old"
+	done
+	cp "$tmp/config" "$tmp/legacy-config"
+	if ! "$tool" plan lan wan policy >"$tmp/upgrade-plan" 2>"$tmp/upgrade-error"; then
+		cat "$tmp/upgrade-error" >&2; printf 'legacy applied scalar WAL rejected\n' >&2; exit 1
+	fi
+	cmp "$tmp/config" "$tmp/legacy-config"
+	legacy_index=$(awk -F '\t' '$2=="firewall.rp_init_default4"{print NR;exit}' "$mock_wal/candidate")
+	legacy_entry="$mock_wal/fields/$legacy_index"
+	for legacy_type in scalar list 0 ''; do
+		printf '%s' "$legacy_type" >"$legacy_entry/expected-type"
+		if [ "$legacy_type" = scalar ]; then "$tool" plan lan wan policy >"$tmp/upgrade-control"
+		else reject "$tool" plan lan wan policy; fi
+		cmp "$tmp/config" "$tmp/legacy-config"
+	done
+	rm "$legacy_entry/expected-type"
+	printf scalar >"$tmp/legacy-scalar"; ln -s "$tmp/legacy-scalar" "$legacy_entry/expected-type"
+	reject "$tool" plan lan wan policy; rm "$legacy_entry/expected-type"
+	rm "$legacy_entry/attempted"; reject "$tool" plan lan wan policy; : >"$legacy_entry/attempted"
+	for legacy_phase in prepared expired rolled_back applying; do
+		printf '%s\n' "$legacy_phase" >"$mock_wal/phase"
+		reject "$tool" plan lan wan policy; cmp "$tmp/config" "$tmp/legacy-config"
+	done
+	printf 'confirmed\n' >"$mock_wal/phase"
+	"$tool" plan lan wan policy >"$tmp/upgrade-final"
+	cmp "$tmp/config" "$tmp/legacy-config"
+	printf '%s\n' 'legacy section ownership: passed (base17 scalar WAL, explicit types, attempted/phase/symlink protection, unchanged configuration)'
+}
+legacy_ownership_test
+if [ "${1:-}" = --legacy-upgrade ]; then exit 0; fi
 # A candidate with no committed section fields is never ownership evidence.
 for ownership_phase in prepared expired rolled_back applying pending; do
 	baseline
