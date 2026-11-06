@@ -8,6 +8,7 @@ LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 umask 077
 TX="$RP_STATE_DIR/init-transaction"
 WAL="$TX/current"
+VERIFY_EXPORT_DIR=
 TAB=$(printf '\t')
 PACKAGES='network dhcp firewall routepolicy smartdns'
 . "$LIBEXEC/init-dns"
@@ -456,6 +457,17 @@ link_restore() {
 	link_live_up && [ "$LINK_UP" = "$(link_value up "$WAL/link-plan")" ]
 }
 read_current() {
+	# This context exists only inside one read-only verification, never a write pass.
+	case "$1" in *.*.*)
+		if [ -n "${VERIFY_EXPORT_DIR:-}" ]; then
+			field_package=${1%%.*}; field_rest=${1#*.}; field_section=${field_rest%%.*}; field_option=${field_rest#*.}
+			field_data=$(rp_uci_field_data "$field_section" "$field_option" 1 <"$VERIFY_EXPORT_DIR/$field_package") || return 2
+			FIELD_TYPE=${field_data%%"$TAB"*}; FIELD_VALUE=${field_data#*"$TAB"}
+			[ "$FIELD_TYPE" != 0 ] || return 1
+			! printf '%s' "$FIELD_VALUE" | LC_ALL=C grep -q '[^ -~]' || return 2
+			return 0
+		fi ;;
+	esac
 	# Sentinel retains trailing newlines, which shell command substitution otherwise loses.
 	raw=$(uci_committed get "$1" 2>/dev/null && printf '.') || return 1
 	FIELD_VALUE=${raw%.}
@@ -546,8 +558,12 @@ load_args() {
 	args_valid "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$a12" "$a13"
 }
 topology() { "$LIBEXEC/init-topology" "$1" "$a1" "$a2" "$a3" "$a4" "$a5" "$a6" "$a7" "$a8" "$a9" "$a10" "$a11" "$a12" "$a13" 9>&-; }
-verify_runtime() {
+verify_runtime() (
 	# Only the fixed topology verifier writes this private diagnostic; no UCI export is exposed.
+	VERIFY_EXPORT_DIR=$(mktemp -d "$RP_RUN_DIR/init-verify.XXXXXX") || return 1
+	trap 'rm -rf "$VERIFY_EXPORT_DIR"' EXIT HUP INT TERM
+	no_pending || return 1
+	for verify_package in $PACKAGES; do uci_committed export "$verify_package" >"$VERIFY_EXPORT_DIR/$verify_package" || return 1; done
 	while IFS="$TAB" read -r verify_action verify_key verify_expected; do
 		if [ "$verify_action" = delete ]; then
 			if uci_committed get "$verify_key" >/dev/null 2>&1; then
@@ -564,8 +580,13 @@ verify_runtime() {
 		printf '%s\n' 'new egress physical identity differs from the prepared candidate' >"$WAL/verify-error"
 		return 1
 	fi
-	topology verify >"$WAL/verify-result" 2>"$WAL/verify-error"
-}
+	topology verify >"$WAL/verify-result" 2>"$WAL/verify-error" || return 1
+	# A concurrent unknown-field change also invalidates this verification context.
+	for verify_package in $PACKAGES; do
+		uci_committed export "$verify_package" >"$VERIFY_EXPORT_DIR/recheck" && cmp -s "$VERIFY_EXPORT_DIR/$verify_package" "$VERIFY_EXPORT_DIR/recheck" || return 1
+	done
+	no_pending
+)
 new_dhcp_probe() {
 	dhcp_dump=$(timeout 3 ubus call network.interface dump) || return 1
 	dhcp_interfaces=$(printf '%s\n' "$dhcp_dump" | jsonfilter -e '@.interface') || return 1
@@ -876,6 +897,11 @@ pending_recovery_due() {
 	[ "$pending_now" -ge "$pending_started" ] || return 0
 	[ "$pending_now" -ge "$((pending_started + 12000))" ]
 }
+pending_confirmation_ready() {
+	! pending_recovery_due || return 1
+	confirmation_now=$(monotonic_now) && confirmation_started=$(cat "$WAL/uptime-start-cs") || return 1
+	[ "$confirmation_now" -le "$((confirmation_started + 10000))" ]
+}
 recover_auto_locked() {
 	# The guard's earlier observation is advisory; only this locked state permits rollback.
 	case "$(read_phase)" in
@@ -1177,20 +1203,21 @@ case "$operation" in
 		fi
 		[ -n "$failed_stage" ] || { smartdns_coordinate verify || failed_stage='smartdns-verify'; }
 		[ -n "$failed_stage" ] || { ! pending_recovery_due || failed_stage='confirmation-timeout'; }
-		case "$a4:$a6" in default:dhcp|policy:dhcp)
-			if [ -z "$failed_stage" ]; then
-				dhcp_finished=$(monotonic_now) || failed_stage='confirmation-window'
-				dhcp_started=$(cat "$WAL/uptime-start-cs") || failed_stage='confirmation-window'
-				[ "$dhcp_finished" -le "$((dhcp_started + 10000))" ] || failed_stage='confirmation-window'
-			fi ;;
-		esac
+		[ -n "$failed_stage" ] || { pending_confirmation_ready || failed_stage='confirmation-window'; }
 		if [ -n "$failed_stage" ]; then
 			printf '%s\n' "$failed_stage" >"$WAL/failed-stage"
 			rollback_fields || fail "阶段 $failed_stage 失败；恢复有冲突，需人工处理"
 			fail "阶段 $failed_stage 失败；本事务字段已恢复"
 		fi
 		phase pending || fail '不能记录待连通性确认状态'
-		status_json
+		pending_result=$(status_json) || fail '不能生成待确认结果'
+		# Include phase durability and response construction in the same original budget.
+		if ! pending_confirmation_ready; then
+			printf '%s\n' confirmation-window >"$WAL/failed-stage"
+			rollback_fields || fail '待确认剩余时间不足；恢复有冲突，需人工处理'
+			fail '待确认剩余时间不足；本事务字段已恢复'
+		fi
+		printf '%s\n' "$pending_result"
 		;;
 	confirm)
 		lock; check_token "$@"

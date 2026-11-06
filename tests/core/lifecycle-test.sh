@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
+NATIVE_IP=$(command -v ip || true); NATIVE_NFT=$(command -v nft || true)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-lifecycle.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 export ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="${TEST_LIFECYCLE_LIBEXEC:-$ROOT/routepolicy/files/usr/libexec/routepolicy}" ROUTEPOLICY_OUTPUT=json
@@ -72,6 +73,23 @@ sh "$tool" config-export >"$tmp/mixed-export"
 sh "$tool" config-import <"$tmp/mixed-export" >/dev/null
 for name in domain-policy domain-default; do grep -Fxq example.com "$tmp/root/tmp/routepolicy/restore/user.d/$name.list"; done
 for name in ipv4-policy ipv4-default; do grep -Fxq 1.1.1.1 "$tmp/root/tmp/routepolicy/restore/user.d/$name.list"; done
+if [ "${1:-}" != --active-target ]; then
+	for name in domain-policy domain-default; do printf '\t# heading\r\n \tEXAMPLE.COM.\t# inline\r\n\t\r\n' >"$tmp/root/etc/routepolicy/user.d/$name.list"; done
+	for name in ipv4-policy ipv4-default; do printf '\t; heading\r\n\t1.1.1.1 \t# inline\r\n' >"$tmp/root/etc/routepolicy/user.d/$name.list"; done
+	printf '\t# heading\r\n192.0.2.1\tHOST.EXAMPLE\talias.example \t\r\n' >"$tmp/root/etc/routepolicy/user.d/local-hosts.list"
+	sh "$tool" config-export >"$tmp/whitespace-export"
+	sh "$tool" config-import <"$tmp/whitespace-export" >/dev/null
+	for name in domain-policy domain-default; do grep -Fxq example.com "$tmp/root/tmp/routepolicy/restore/user.d/$name.list"; done
+	for name in ipv4-policy ipv4-default; do grep -Fxq 1.1.1.1 "$tmp/root/tmp/routepolicy/restore/user.d/$name.list"; done
+	grep -Fxq '192.0.2.1 host.example alias.example' "$tmp/root/tmp/routepolicy/restore/user.d/local-hosts.list"
+	for bad_control in 001 013; do
+		printf '%b' "example.com\\$bad_control\n" >"$tmp/root/etc/routepolicy/user.d/domain-policy.list"
+		if sh "$tool" config-export >/dev/null 2>&1; then printf 'export accepted illegal rule control\n' >&2; exit 1; fi
+	done
+	printf 'example.com\n' >"$tmp/root/etc/routepolicy/user.d/domain-policy.list"
+	printf '%s\n' 'portable whitespace: passed (five lists, tabs/CRLF/comments, canonical roundtrip, invalid controls rejected)'
+	[ "${1:-}" != --whitespace ] || exit 0
+fi
 for package in network dhcp firewall smartdns; do [ "$(cat "$tmp/root/etc/config/$package")" = "unchanged $package" ]; done
 reject() { if sh "$tool" config-import <"$1" >/dev/null 2>&1; then printf 'accepted malicious declaration: %s\n' "$1" >&2; exit 1; fi; }
 { cat "$tmp/export"; printf 'rule\tdomain-policy\tinvalid-domain\n'; } >"$tmp/invalid-domain"; reject "$tmp/invalid-domain"
@@ -105,6 +123,51 @@ if [ -n "${TEST_DECL_KILL_TO:-}" ] && [ "$target" = "$TEST_DECL_KILL_TO" ]; then
 SH
 chmod +x "$tmp/bin/mv"
 mapping=$(printf 'lan\twan\tusbwan\t-\t-\t-\t-\t-\t-\t-\t-\t192.0.2.53\t198.51.100.53\t1\t1\n')
+journal="$tmp/root/etc/routepolicy/state/init-transaction/declarations"
+if [ "${1:-}" = --active-netns ]; then
+	[ "${TEST_NFT_ISOLATED:-0}" = 1 ] && [ "$(readlink /proc/self/ns/net)" != "$(readlink /proc/1/ns/net)" ] && [ -n "$NATIVE_IP" ] && [ -n "$NATIVE_NFT" ]
+	printf '#!/bin/sh\nexec "%s" "$@"\n' "$NATIVE_IP" >"$tmp/bin/ip"
+	printf '#!/bin/sh\nexec "%s" "$@"\n' "$NATIVE_NFT" >"$tmp/bin/nft"
+	"$NATIVE_IP" -Version
+	printf '%s\n' "$mapping" | sh "$tool" restore-prepare >/dev/null
+	[ "$(cat "$journal/phase")" = installed ]; sh "$tool" restore-recover >/dev/null
+	cp "$tmp/root/etc/config/routepolicy" "$tmp/netns.before"
+	"$NATIVE_NFT" add table inet routepolicy
+	if printf '%s\n' "$mapping" | sh "$tool" restore-prepare >/dev/null 2>&1; then printf 'real nft owner accepted\n' >&2; exit 1; fi
+	cmp "$tmp/netns.before" "$tmp/root/etc/config/routepolicy"; [ "$(cat "$journal/phase")" = rolled_back ]
+	"$NATIVE_NFT" delete table inet routepolicy
+	printf '%s\n' 'real empty netns restore: passed (actual ip-full all-table query accepts absent FIB; real nft owner rejected unchanged)'
+	exit 0
+fi
+for command_name in nft ip; do
+	cat >"$tmp/bin/$command_name" <<'SH'
+#!/bin/sh
+name=${0##*/}
+[ ! -f "$ROUTEPOLICY_ROOT/$name.fail" ] || exit 1
+[ ! -f "$ROUTEPOLICY_ROOT/$name.output" ] || cat "$ROUTEPOLICY_ROOT/$name.output"
+SH
+done
+for activity in enabled receipt nft rule route unknown; do
+	uci set routepolicy.main.enabled=0
+	case "$activity" in
+		enabled) uci set routepolicy.main.enabled=1 ;;
+		receipt) mkdir -p "${journal%/*}"; printf 'old receipt\n' >"${journal%/*}/applied-placeholder"; mv "${journal%/*}/applied-placeholder" "$tmp/root/etc/routepolicy/state/applied" ;;
+		nft) printf 'table inet routepolicy\n' >"$tmp/root/nft.output" ;;
+		rule) printf '12000: from all fwmark 0x100/0x100 lookup 200\n' >"$tmp/root/ip.output" ;;
+		route) printf 'default via 198.51.100.1 dev eth2 table 200\n' >"$tmp/root/ip.output" ;;
+		unknown) : >"$tmp/root/nft.fail" ;;
+	esac
+	cp "$tmp/root/etc/config/routepolicy" "$tmp/active.before"
+	if printf '%s\n' "$mapping" | sh "$tool" restore-prepare >"$tmp/active-error" 2>&1; then printf 'restore accepted active/unknown target: %s\n' "$activity" >&2; exit 1; fi
+	grep -Fq '先显式停用' "$tmp/active-error"
+	cmp "$tmp/active.before" "$tmp/root/etc/config/routepolicy"
+	[ ! -e "$journal" ]
+	rm -f "$tmp/root/nft.output" "$tmp/root/ip.output" "$tmp/root/nft.fail" "$tmp/root/etc/routepolicy/state/applied"
+done
+uci set routepolicy.main.enabled=0
+printf '# original app configuration\n' >"$tmp/root/etc/config/routepolicy"
+printf '%s\n' 'active restore admission: passed (enabled, receipt, nft, rule/route, unknown query; no declaration writes)'
+[ "${1:-}" != --active-target ] || exit 0
 if printf '%s\n\n' "$mapping" | sh "$tool" restore-prepare >/dev/null 2>&1; then printf 'multi-line mapping accepted\n' >&2; exit 1; fi
 if printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n' | sh "$tool" init-apply-request >/dev/null 2>&1; then printf 'multi-line token accepted\n' >&2; exit 1; fi
 journal="$tmp/root/etc/routepolicy/state/init-transaction/declarations"

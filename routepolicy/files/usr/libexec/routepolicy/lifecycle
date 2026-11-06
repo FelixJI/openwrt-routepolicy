@@ -49,7 +49,7 @@ record() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$text"
 }
 export_content() {
-	local key value section list params record_path index parameter
+	local key value section list params record_path index parameter normalized format
 	printf 'routepolicy-config\t1\nsensitive\t1\n'
 	for key in $MAIN; do
 		value=$(uci -q get "routepolicy.main.$key") || continue
@@ -65,7 +65,15 @@ export_content() {
 	for list in domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
 		[ ! -e "$RP_USER_DIR/$list.list" ] || safe_file "$RP_USER_DIR/$list.list" || fail '人工清单路径不是安全普通文件'
 		[ ! -f "$RP_USER_DIR/$list.list" ] || [ "$(wc -c <"$RP_USER_DIR/$list.list")" -le 262144 ] || fail '人工清单超过 256 KiB'
-		[ ! -f "$RP_USER_DIR/$list.list" ] || while IFS= read -r value || [ -n "$value" ]; do record rule "$list" "$value"; done <"$RP_USER_DIR/$list.list" || return 1
+		[ -f "$RP_USER_DIR/$list.list" ] || continue
+		# Only the supported horizontal whitespace/CRLF may disappear during normalization.
+		LC_ALL=C awk '{line=$0;sub(/\r$/,"",line);gsub(/\t/,"",line);if(line~/[[:cntrl:]]/)bad=1}END{exit bad}' "$RP_USER_DIR/$list.list" || return 1
+		if [ "$list" = local-hosts ]; then normalized=$(sed 's/\r$//' "$RP_USER_DIR/$list.list" | rp_normalize_local_hosts) || return 1
+		elif rp_user_list_has_content "$RP_USER_DIR/$list.list"; then
+			case "$list" in domain-*) format=plain-domain ;; *) format=plain-ipv4 ;; esac
+			normalized=$(ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$format" "$RP_USER_DIR/$list.list") || return 1
+		else normalized=; fi
+		[ -z "$normalized" ] || printf '%s\n' "$normalized" | while IFS= read -r value; do record rule "$list" "$value"; done || return 1
 	done
 	if record_path=$(rp_init_active_record); then
 		safe_file "$record_path/parameters" || fail '初始化声明不是安全普通文件'
@@ -247,6 +255,16 @@ EOF
 		case "$value" in *[!A-Za-z0-9_.:/,#-]*) fail '映射参数含非法字符' ;; esac
 	done
 	no_pending || fail '五份配置存在未提交修改'
+	# Import does not migrate an existing kernel owner into a disabled declaration.
+	local target_enabled target_table target_tables target_rules target_routes
+	target_enabled=$(uci -q get routepolicy.main.enabled) || fail '不能证明目标分流已停用；请先显式停用并核对运行态'
+	[ "$target_enabled" = 0 ] && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] || fail '目标仍有分流配置或运行回执；请先显式停用，再恢复声明'
+	target_table=$(rp_uci_get main route_table 200)
+	rp_uint_between "$target_table" 1 252 || fail '目标策略表不明确；请先显式停用并核对运行态'
+	target_tables=$(timeout 3 nft list tables) && target_rules=$(timeout 3 ip -4 rule show) && target_routes=$(timeout 3 ip -4 route show table all) || fail '不能证明目标运行态不活动；请先显式停用并核对运行态'
+	! printf '%s\n' "$target_tables" | grep -Eq '^table[[:space:]]+inet[[:space:]]+routepolicy([[:space:]]|$)' &&
+		printf '%s\n%s\n' "$target_rules" "$target_routes" | awk -v table="$target_table" '
+		{for(i=1;i<NF;i++)if($i=="lookup"||$i=="table"){value=$(i+1);if(value==table||(value!~/^[0-9]+$/&&value!~/^(local|main|default)$/))bad=1}}END{exit bad}' || fail '目标仍有实际分流规则或不可判定的表名；请先显式停用，再恢复声明'
 	# Preflight target topology before writing even the application's own declarations.
 	"$LIBEXEC/init-topology" plan "$access" "$default_if" "$policy" "$new_role" "$device" "$proto" "$address" "$prefix" "$gateway" "$management" "$management_prefix" "$dns_default" "$dns_policy" >"$STAGE/topology" || fail '目标拓扑预检失败'
 	for name in domain-policy domain-default ipv4-policy ipv4-default local-hosts; do

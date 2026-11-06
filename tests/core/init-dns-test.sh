@@ -232,6 +232,7 @@ else printf ';; ->>HEADER<<- status: NOERROR, id: 1\n'; fi
 EOF
 cat >"$tmp/bin/nft" <<'EOF'
 #!/bin/sh
+if [ "$1:${2:-}" = list:tables ]; then [ ! -f "$TEST_DNS_TMP/policy-running" ] || printf 'table inet routepolicy\n'; exit 0; fi
 [ -f "$TEST_DNS_TMP/policy-running" ]
 EOF
 cat >"$tmp/bin/ip" <<'EOF'
@@ -255,7 +256,7 @@ if [ -f "$TEST_DNS_TMP/kill-policy" ]; then rm "$TEST_DNS_TMP/kill-policy"; kill
 [ ! -f "$TEST_DNS_TMP/policy-fail" ] || exit 1
 if [ -f "$TEST_DNS_TMP/policy-fail-once" ] && [ "${ROUTEPOLICY_SOURCE_BOOTSTRAP:-0}" != 1 ]; then rm "$TEST_DNS_TMP/policy-fail-once"; exit 1; fi
 if [ "${1:-}" = teardown ]; then
-	[ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ]
+	[ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ] || [ "$(uci -q get routepolicy.main.enabled)" = 0 ]
 	rm -f "$TEST_DNS_TMP/policy-running" "$RP_STATE_DIR/applied"
 	rm -rf "$RP_ACTIVE_DIR"
 	exit 0
@@ -565,6 +566,9 @@ if [ "${1:-}" = --restore-prior-confirmed ] || [ "${1:-}" = --migrate ]; then
 		[ "$(uci changes network)" != '' ]
 		printf '%s\n' 'native migrate: passed (real nested archive, no/archive legacy paths, schema and pending rejection)'; exit 0
 	fi
+	# Restore now requires explicit policy disable; retain the confirmed DNS contract.
+	uci set routepolicy.main.enabled=0; uci commit routepolicy
+	ROUTEPOLICY_INIT_RESTORE=1 "$tmp/lib/apply" teardown
 	mkdir -p "$RP_USER_DIR"; cp "$ROOT/routepolicy/files/etc/routepolicy/user.d/"*.list "$RP_USER_DIR/"
 	ROUTEPOLICY_OUTPUT=text "$tmp/lib/lifecycle" config-export >"$tmp/prior-export"
 	"$tmp/lib/lifecycle" config-import <"$tmp/prior-export" >/dev/null

@@ -153,6 +153,7 @@ case "$1" in
 			printf 'set\tfirewall.rp_init_policy\tzone\nset\tfirewall.rp_init_policy.name\trp_init_policy\nset\tfirewall.rp_init_policy.network\tusbwan\nset\tfirewall.rp_init_policy.input\tREJECT\nset\tfirewall.rp_init_policy.output\tACCEPT\nset\tfirewall.rp_init_policy.forward\tDROP\n'
 		fi ;;
 	verify)
+		[ ! -f "$TEST_TX_DIR/verify-clock" ] || cat "$TEST_TX_DIR/verify-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"
 		if [ -f "$TEST_TX_DIR/dhcp-test" ]; then
 			printf '%s\n' verify >>"$TEST_TX_DIR/dhcp-verify-calls"
 			current=$(ubus call network.interface dump)
@@ -319,6 +320,9 @@ EOF
 cat >"$tmp/bin/sync" <<'EOF'
 #!/bin/sh
 wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+if [ -f "$TEST_TX_DIR/pending-clock" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = pending ]; then
+	cat "$TEST_TX_DIR/pending-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"; rm "$TEST_TX_DIR/pending-clock"
+fi
 if [ -f "$TEST_TX_DIR/wal-fault" ] && [ "$(cat "$wal/stage" 2>/dev/null)" = commit:routepolicy.main.lan_interface ]; then
 	fault=$(cat "$TEST_TX_DIR/wal-fault"); rm "$TEST_TX_DIR/wal-fault"
 	case "$fault" in sync) exit 1 ;; attempted) mkdir "$wal/fields/1/attempted" || exit 1 ;; esac
@@ -377,6 +381,7 @@ reset() {
 	rm -f "$tmp/guard-delete"
 	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
 	rm -f "$tmp/"auto-*
+	rm -f "$tmp/verify-clock" "$tmp/pending-clock"
 	rm -f "$tmp/"dhcp-* "$tmp/"policy-* "$tmp/runtime-policy"
 	mkdir -p "$tmp/root/etc/config"
 	for config_package in network dhcp firewall routepolicy smartdns; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
@@ -662,7 +667,29 @@ monotonic_clock_tests() {
 	[ ! -f "$tmp/commits" ]; [ ! -f "$tmp/link-log" ]; restored
 }
 
+confirmation_budget_tests() {
+	for finished in 1100.00 1100.01 1119.42; do
+		reset; prepare; printf '%s 0.00\n' "$finished" >"$tmp/verify-clock"
+		if [ "$finished" = 1100.00 ]; then
+			"$TX" apply "$token" >/dev/null; phase_is pending
+			rm "$tmp/verify-clock"; printf '1119.99 0.00\n' >"$tmp/root/proc/uptime"
+			cp "$tmp/commits" "$tmp/retry-commits"; cp "$tmp/services" "$tmp/retry-services"
+			"$TX" apply "$token" >/dev/null; phase_is pending
+			[ "$(cat "$WAL/deadline")" = 1700000120 ] && [ "$(cat "$WAL/uptime-start-cs")" = 100000 ]
+			cmp "$tmp/commits" "$tmp/retry-commits"; cmp "$tmp/services" "$tmp/retry-services"
+			SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/null; phase_is confirmed
+		else
+			bad "$TX" apply "$token"; phase_is rolled_back; restored
+			[ "$(cat "$WAL/failed-stage")" = confirmation-window ]
+		fi
+	done
+	reset; prepare; printf '1100.01 0.00\n' >"$tmp/pending-clock"
+	bad "$TX" apply "$token"; phase_is rolled_back; restored
+	[ "$(cat "$WAL/failed-stage")" = confirmation-window ]
+	printf '%s\n' 'confirmation budget: passed (first pending reserves 20s; original 120s deadline; late idempotent apply only reads status; phase persistence cost included)'
+}
 case "${1:-}" in
+	--confirmation-budget) confirmation_budget_tests; exit 0 ;;
 	--guard-races) guard_race_tests; exit 0 ;;
 	--confirm-boot) confirm_boot_tests; exit 0 ;;
 	--clock-backward) backward_clock_test; exit 0 ;;
@@ -1023,6 +1050,7 @@ phase_is conflict
 guard_race_tests
 confirm_boot_tests
 monotonic_clock_tests
+confirmation_budget_tests
 policy_runtime_tests
 dhcp_readiness_tests
 
