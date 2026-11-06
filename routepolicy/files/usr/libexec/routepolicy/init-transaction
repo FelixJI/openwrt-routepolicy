@@ -19,16 +19,13 @@ safe_dir() {
 	mkdir -p "$1" && chmod 700 "$1" || fail '无法创建受限事务目录'
 }
 lock() {
+	rp_writer_enter init || fail '统一写入门禁忙、owner 失效或已有 writer 未退出'
 	for parent in "$RP_ETC" "$RP_STATE_DIR"; do
 		[ ! -L "$parent" ] && { [ ! -e "$parent" ] || [ -d "$parent" ]; } || fail '事务父目录不安全'
 	done
 	mkdir -p "$RP_STATE_DIR" || fail '不能创建事务父目录'
 	safe_dir "$TX"
 	[ ! -L "$TX/lock" ] || fail '事务锁不是安全文件'
-	exec 9>"$TX/lock"
-	if [ "${operation:-}" = recover-startup ] || [ "${operation:-}" = recover-early ]; then
-		flock -w 180 9 || fail '启动恢复等待写锁超时'
-	else flock -n 9 || fail '另一个初始化事务正在写入'; fi
 	[ ! -L "$WAL" ] && [ ! -L "$TX/previous" ] || fail '事务记录路径不安全'
 	# Restore the previous terminal/prepared generation if power failed during promotion.
 	if [ ! -e "$WAL" ] && [ -d "$TX/previous" ]; then
@@ -411,7 +408,7 @@ policy_sync() {
 	case "$policy_required" in 0|1) ;; *) return 1 ;; esac
 	if [ "$policy_required" = 0 ]; then
 		if [ "$policy_mode" = restore ]; then
-			[ ! -f "$WAL/policy-attempted" ] || ROUTEPOLICY_INIT_RESTORE=1 timeout -k 2 30 sh -c 'exec 9>&-; exec "$1" teardown' routepolicy-policy-restore "$LIBEXEC/apply" >"$WAL/policy-restore-result" 2>"$WAL/policy-restore-error" || return 1
+			[ ! -f "$WAL/policy-attempted" ] || ROUTEPOLICY_INIT_RESTORE=1 timeout -s KILL 30 sh -c 'exec "$1" teardown' routepolicy-policy-restore "$LIBEXEC/apply" >"$WAL/policy-restore-result" 2>"$WAL/policy-restore-error" || return 1
 			return 0
 		fi
 		# A DNS initialization activates policy routing in this same transaction.
@@ -437,13 +434,9 @@ policy_sync() {
 		[ "$policy_remaining" -ge "$policy_timeout" ] || policy_timeout=$policy_remaining
 	fi
 	policy_wait_started=$(monotonic_now) || return 1
-	while [ -d "$RP_RUN_DIR/apply.lock" ]; do
-		policy_wait_now=$(monotonic_now) || return 1
-		if [ "$policy_wait_now" -ge "$((policy_wait_started + policy_timeout * 100))" ]; then
-			printf '%s\n' 'existing RoutePolicy apply is busy; its lock was preserved' >"$WAL/$policy_log-error"; return 1
-		fi
-		sleep 1
-	done
+	if [ -d "$RP_RUN_DIR/apply.lock" ]; then
+		printf '%s\n' 'existing RoutePolicy apply is busy; its lock was preserved' >"$WAL/$policy_log-error"; return 1
+	fi
 	policy_wait_now=$(monotonic_now) || return 1
 	policy_timeout=$((policy_timeout - (policy_wait_now - policy_wait_started + 99) / 100))
 	[ "$policy_timeout" -gt 0 ] || return 1
@@ -452,8 +445,8 @@ policy_sync() {
 		rp_render_smartdns90 "$WAL/dns90-restore" || return 1
 	else init_dns_coordinate policy-prepare || return 1; fi
 	printf '%s' '' >"$WAL/policy-attempted" && sync || return 1
-	# The finite supervisor owns FD9; the policy writer and its service children never inherit it.
-	ROUTEPOLICY_DNS_DEFER="$( init_dns_owned && printf 1 || printf 0 )" ROUTEPOLICY_INIT_RESTORE="$( [ "$policy_mode" = restore ] && printf 1 || printf 0 )" ROUTEPOLICY_INIT_GENERATION="$(cat "$WAL/token")" ROUTEPOLICY_OUTPUT=text timeout -k 2 "$policy_timeout" sh -c 'exec 9>&-; exec "$1"' routepolicy-policy-sync "$LIBEXEC/apply" >"$WAL/$policy_log-result" 2>"$WAL/$policy_log-error" || return 1
+	# Synchronous policy writers retain the same OFD; native services close it.
+	ROUTEPOLICY_DNS_DEFER="$( init_dns_owned && printf 1 || printf 0 )" ROUTEPOLICY_INIT_RESTORE="$( [ "$policy_mode" = restore ] && printf 1 || printf 0 )" ROUTEPOLICY_INIT_GENERATION="$(cat "$WAL/token")" ROUTEPOLICY_OUTPUT=text timeout -s KILL "$policy_timeout" sh -c 'exec "$1"' routepolicy-policy-sync "$LIBEXEC/apply" >"$WAL/$policy_log-result" 2>"$WAL/$policy_log-error" || return 1
 	if ! policy_verify_runtime; then
 		printf '%s\n' 'RoutePolicy policy table does not match the selected interface/gateway' >"$WAL/$policy_log-error"
 		return 1
@@ -518,10 +511,10 @@ guard_start() {
 	[ -x "$RP_ROOT/etc/init.d/routepolicy-initguard" ] || return 1
 	if init_dns_owned; then
 		[ -x "$RP_ROOT/etc/init.d/routepolicy-prerecover" ] || return 1
-		"$RP_ROOT/etc/init.d/routepolicy-prerecover" enable 9>&- >/dev/null 2>&1 &&
-			"$RP_ROOT/etc/init.d/routepolicy-initguard" enable 9>&- >/dev/null 2>&1 || return 1
+		rp_native_service routepolicy-prerecover enable >/dev/null 2>&1 &&
+			rp_native_service routepolicy-initguard enable >/dev/null 2>&1 || return 1
 	fi
-	"$RP_ROOT/etc/init.d/routepolicy-initguard" start 9>&- >/dev/null 2>&1 || return 1
+	rp_native_service routepolicy-initguard start >/dev/null 2>&1 || return 1
 	guard_attempt=0
 	while [ "$guard_attempt" -lt 10 ]; do
 		if service_state=$(ubus call service list '{"name":"routepolicy-initguard"}' 9>&- 2>/dev/null); then
@@ -538,12 +531,17 @@ guard_stop_if_inactive() (
 	flock -n 9 || exit 1
 	case "$(read_phase)" in
 		applying|rolling_back|pending|confirming) exit 1 ;;
-		prepared) pending_recovery_due || exit 1 ;;
+		prepared)
+			pending_recovery_due || exit 1
+			rp_native_run 3 ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit $? ;;
+		conflict) rp_native_run 3 ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit $? ;;
 	esac
 	! rp_dns_boot_pending || exit 1
-	ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' 9>&- >/dev/null 2>&1
+	! rp_writer_event_pending || exit 1
+	rp_native_run 3 ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1
 )
 rollback_fields() {
+	rp_writer_idle || { printf '%s\n' 'previous synchronous writer has not drained; recovery deferred' >"$WAL/verify-error"; return 1; }
 	recovery_early=${1:-0}
 	phase rolling_back || return 1
 	uci_layout || { phase conflict; return 1; }
@@ -702,7 +700,7 @@ boot_dns_locked() (
 	init_dns_stop &&
 		init_dns_call dnsmasq stop && init_dns_call dnsmasq disable || return 1
 	printf '%s\n' boot-policy-runtime >"$WAL/stage" && sync || return 1
-	if ! ROUTEPOLICY_DNS_DEFER=1 ROUTEPOLICY_OUTPUT=text timeout -k 2 30 sh -c 'exec 9>&-; exec "$1"' routepolicy-boot-policy "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || ! policy_verify_runtime; then
+	if ! ROUTEPOLICY_DNS_DEFER=1 ROUTEPOLICY_OUTPUT=text timeout -s KILL 30 sh -c 'exec "$1"' routepolicy-boot-policy "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || ! policy_verify_runtime; then
 		printf '%s\n' boot-policy-runtime >"$WAL/failed-stage"; return 1
 	fi
 	rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1 || return 1
@@ -838,7 +836,7 @@ case "$operation" in
 			fi
 			no_pending && write_field "$key" "$(action_type "$_action")" "$value" && uci_private commit "${key%%.*}" || { failed_stage=commit; break; }
 		done <"$WAL/candidate"
-		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage" && timeout 15 fw4 check 9>&- >/dev/null 2>&1 || failed_stage='firewall-check'; }
+		[ -n "$failed_stage" ] || { printf '%s\n' firewall-check >"$WAL/stage" && rp_native_run 15 fw4 check >/dev/null 2>&1 || failed_stage='firewall-check'; }
 		[ -n "$failed_stage" ] || { services_reload || failed_stage="reload:$service"; }
 		[ -n "$failed_stage" ] || { wait_new_dhcp || failed_stage='dhcp-readiness'; }
 		if init_dns_owned; then
@@ -890,11 +888,14 @@ case "$operation" in
 		if init_dns_owned; then phase confirming && active_publish || fail '确认提升尚未完成；保留记录供恢复收敛'
 		else phase confirmed || fail '不能持久化确认状态'; fi
 		init_dns_coordinate confirm || fail '确认已保存，但应用临时缓存清理失败'
+		if rp_writer_event_pending; then rp_writer_event_wake; fi
 		status_json
 		;;
 	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
+	boot-pending) [ "$#" -eq 0 ] || exit 1; rp_dns_boot_pending ;;
 	guard-needed)
 		rp_dns_boot_pending && exit 0
+		rp_writer_event_pending && exit 0
 		case "$(read_phase)" in prepared|applying|pending|rolling_back|confirming) exit 0 ;; *) exit 1 ;; esac
 		;;
 	boot-dns)
@@ -926,6 +927,7 @@ case "$operation" in
 		if [ "$operation" = recover-auto ]; then
 			recover_auto_locked || fail '自动恢复有冲突；已保留未知配置与 WAL'
 		else recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; fi
+		if rp_writer_event_pending; then rp_writer_event_wake; fi
 		status_json
 		;;
 	guard)
@@ -935,6 +937,7 @@ case "$operation" in
 				"$0" boot-dns >/dev/null 2>&1 || true
 				if rp_dns_boot_pending; then sleep 10; continue; fi
 			fi
+			if rp_writer_event_pending; then "$LIBEXEC/apply" reconcile-event >"$RP_RUN_DIR/event-reconcile.log" 2>&1 || true; fi
 			case "$(read_phase)" in
 				applying|rolling_back|confirming) "$0" recover-auto >/dev/null 2>&1 || true ;;
 				pending) if pending_recovery_due; then "$0" recover-auto >/dev/null 2>&1 || true; fi ;;

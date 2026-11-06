@@ -66,7 +66,7 @@ grep -Fxq new-default.example "$tmp/tmp/routepolicy/active/domain-default.list" 
 mkdir -p "$tmp/etc/routepolicy/state/init-transaction/current"
 printf 'boot-awaiting-dns\n' >"$tmp/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
 : >"$tmp/smartdns.log"
-TEST_SMARTDNS_LOG="$tmp/smartdns.log" TEST_SMARTDNS_RELOAD_FAIL=1 run_apply >/dev/null
+if TEST_SMARTDNS_LOG="$tmp/smartdns.log" TEST_SMARTDNS_RELOAD_FAIL=1 run_apply >/dev/null 2>&1; then fail 'ordinary apply admitted before DNS boot verification'; fi
 [ ! -s "$tmp/smartdns.log" ] || fail 'pending DNS boot verification was bypassed by ordinary apply'
 rm "$tmp/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
 token=11111111111111111111111111111111
@@ -75,9 +75,10 @@ mkdir "$record"; printf '%s\n' "$token" >"$record/token"
 printf confirmed >"$record/phase"; : >"$record/dns-boot-pending"
 printf '%s\n' "$token" >"$tmp/etc/routepolicy/state/init-transaction/active"
 printf prepared >"$tmp/etc/routepolicy/state/init-transaction/current/phase"
-TEST_SMARTDNS_LOG="$tmp/smartdns.log" TEST_SMARTDNS_RELOAD_FAIL=1 run_apply >/dev/null
+if TEST_SMARTDNS_LOG="$tmp/smartdns.log" TEST_SMARTDNS_RELOAD_FAIL=1 run_apply >/dev/null 2>&1; then fail 'ordinary apply admitted with a pending active DNS contract'; fi
 [ ! -s "$tmp/smartdns.log" ] || fail 'independent active DNS boot contract was bypassed by ordinary apply'
 rm "$record/dns-boot-pending"
+rm "$tmp/etc/routepolicy/state/init-transaction/current/phase" "$tmp/etc/routepolicy/state/init-transaction/active"
 
 TEST_NFT_ABSENT=1 TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" TEST_UCI_LOG="$tmp/uci.log" \
 	PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \

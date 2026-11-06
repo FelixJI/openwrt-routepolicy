@@ -3,17 +3,19 @@
 set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
+rp_writer_enter update || { rp_output_error update '写入门禁忙或初始化尚未完成'; exit 1; }
 
 validation=$(ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" 2>&1)
 if [ "$?" -ne 0 ]; then rp_output_error update "更新前校验失败: $validation"; exit 1; fi
 rp_have curl || { rp_output_error update '缺少 curl'; exit 1; }
 rp_ensure_dirs
 lock="$RP_RUN_DIR/update.lock"
-mkdir "$lock" 2>/dev/null || { rp_output_error update '另一个更新操作正在进行'; exit 1; }
-candidate=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX") || { rmdir "$lock"; exit 1; }
-work=$(mktemp -d "$RP_RUN_DIR/update.XXXXXX") || { rm -rf "$candidate"; rmdir "$lock"; exit 1; }
-cleanup() { rm -rf "$work"; [ ! -d "$candidate" ] || rm -rf "$candidate"; rmdir "$lock" 2>/dev/null || true; }
-trap cleanup EXIT HUP INT TERM
+rp_local_lock "$lock" || { rp_output_error update '另一个更新操作正在进行'; exit 1; }
+candidate=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX") || { rp_local_unlock "$lock"; exit 1; }
+work=$(mktemp -d "$RP_RUN_DIR/update.XXXXXX") || { rm -rf "$candidate"; rp_local_unlock "$lock"; exit 1; }
+cleanup() { rm -rf "$work"; [ ! -d "$candidate" ] || rm -rf "$candidate"; rp_local_unlock "$lock"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 sections=$(rp_source_sections)
 [ -n "$sections" ] || { rp_output_error update '没有配置清单来源'; exit 1; }

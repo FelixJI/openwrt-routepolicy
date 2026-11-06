@@ -197,9 +197,9 @@ EOF
 cat >"$tmp/lib/apply" <<'EOF'
 #!/bin/sh
 set -eu
-[ ! -e /proc/self/fd/9 ]
-[ ! -f "$TEST_DNS_TMP/policy-fail" ] || exit 1
 . "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_enter apply
+[ ! -f "$TEST_DNS_TMP/policy-fail" ] || exit 1
 if [ "${1:-}" = teardown ]; then
 	[ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ]
 	rm -f "$TEST_DNS_TMP/policy-running" "$RP_STATE_DIR/applied"

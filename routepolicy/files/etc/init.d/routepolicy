@@ -25,7 +25,10 @@ start_service() {
 		printf '%s\n' 'RoutePolicy 未启用；已跳过应用并保持停用'
 		return 0
 	fi
-	"$ROUTEPOLICY_CTL" apply || return 1
+	# The coordinator owns cold boot policy/DNS admission; keep its watcher available.
+	if ! "$ROUTEPOLICY_INIT_TRANSACTION" boot-pending >/dev/null 2>&1; then
+		"$ROUTEPOLICY_CTL" apply || return 1
+	fi
 	procd_open_instance
 	procd_set_param command "$ROUTEPOLICY_WATCH"
 	procd_set_param respawn 3600 5 0

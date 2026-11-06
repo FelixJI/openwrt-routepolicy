@@ -4,13 +4,23 @@ set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
 
-# A failed boot coordinator must not be bypassed by the later S95 apply.
-if rp_dns_boot_pending; then
-	ROUTEPOLICY_DNS_DEFER=1
-fi
-
 mode=${1:-apply}
-case "$mode" in apply|teardown) ;; *) rp_die '内部 apply 模式非法' ;; esac
+case "$mode" in apply|teardown|event|reconcile-event) ;; *) rp_die '内部 apply 模式非法' ;; esac
+if [ "$mode" = event ]; then rp_writer_event_mark; exit $?; fi
+rp_writer_enter apply || { rp_output_error apply '写入门禁忙或初始化尚未完成'; exit 1; }
+# Kernel writers stay bounded even if their invoking shell is killed.
+nft() { timeout -s KILL 15 nft "$@"; }
+ip() { timeout -s KILL 10 ip "$@"; }
+if [ "$mode" = reconcile-event ]; then
+	rp_writer_event_take || exit 0
+	if [ "$(rp_uci_get main enabled 0)" != 1 ]; then rp_writer_event_done; exit 0; fi
+	if ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply"; then rp_writer_event_done; exit 0; else exit 1; fi
+fi
+rp_ensure_dirs
+lock="$RP_RUN_DIR/apply.lock"
+rp_local_lock "$lock" || { rp_output_error apply '另一个应用操作正在进行'; exit 1; }
+trap 'rp_local_unlock "$lock"' EXIT
+trap 'exit 1' HUP INT TERM
 
 remove_owned_rule() {
 	priority=$1 mark=$2 mask=$3 table=$4
@@ -23,7 +33,7 @@ if [ "$mode" = teardown ]; then
 	if nft list table inet routepolicy >/dev/null 2>&1; then
 		nft_present=1
 		if [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
-			"$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
+			timeout -s KILL 10 "$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
 		fi
 	fi
 	# Stop must remove what was actually applied, even when UCI identifiers were
@@ -45,7 +55,7 @@ if [ "$mode" = teardown ]; then
 	smartdns_backup="$RP_SMARTDNS_FILE.teardown.$$"
 	smartdns_uci_backup="$RP_RUN_DIR/smartdns.teardown.$$.uci"
 	uci -q export smartdns >"$smartdns_uci_backup" 2>/dev/null || : >"$smartdns_uci_backup"
-	if [ "${ROUTEPOLICY_INIT_RESTORE:-0}" != 1 ] && [ -e "$RP_SMARTDNS_FILE" ]; then
+	if [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ "${ROUTEPOLICY_INIT_RESTORE:-0}" != 1 ] && [ -e "$RP_SMARTDNS_FILE" ]; then
 		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
@@ -56,17 +66,17 @@ if [ "$mode" = teardown ]; then
 			rp_output_error apply '无法移除 SmartDNS 片段登记；已恢复原片段'
 			exit 1
 		fi
-		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1; then
+		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! rp_native_service smartdns reload >/dev/null 2>&1; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
 			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
-			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+			rp_native_service smartdns reload >/dev/null 2>&1 || true
 			rp_output_error apply 'SmartDNS 重载失败；已恢复原片段且未拆除策略规则'
 			exit 1
 		fi
 		if rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
 			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
-			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+			rp_native_service smartdns reload >/dev/null 2>&1 || true
 			rp_output_error apply 'SmartDNS 实际生成配置仍加载 90 片段；已回滚'
 			exit 1
 		fi
@@ -136,12 +146,7 @@ if [ "$enabled" != 1 ]; then
 fi
 
 rp_ensure_dirs
-lock="$RP_RUN_DIR/apply.lock"
-if ! mkdir "$lock" 2>/dev/null; then
-	rp_output_error apply '另一个应用操作正在进行'
-	exit 1
-fi
-work=$(mktemp -d "$RP_RUN_DIR/apply.XXXXXX") || { rmdir "$lock"; exit 1; }
+work=$(mktemp -d "$RP_RUN_DIR/apply.XXXXXX") || exit 1
 active_had_previous=0
 active_published=0
 active_swap_started=0
@@ -152,7 +157,7 @@ cleanup() {
 		[ ! -d "$work/active.previous" ] || mv "$work/active.previous" "$RP_ACTIVE_DIR" >/dev/null 2>&1 || true
 	fi
 	rm -rf "$work"
-	rmdir "$lock" 2>/dev/null || true
+	rp_local_unlock "$lock"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -175,7 +180,7 @@ old_source_idle_timeout=$(rp_state_get source_idle_timeout 2>/dev/null) || old_s
 old_source_max_entries=$(rp_state_get source_max_entries 2>/dev/null) || old_source_max_entries=
 old_managed_devices=$(rp_state_get managed_devices 2>/dev/null) || old_managed_devices=
 
-if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/render" >"$work/render.log" 2>&1; then
+if ! ROUTEPOLICY_OUTPUT=text timeout -s KILL 30 "$LIBEXEC/render" >"$work/render.log" 2>&1; then
 	rp_output_error apply "候选配置生成失败: $(tr '\n' ';' <"$work/render.log")"
 	exit 1
 fi
@@ -324,7 +329,7 @@ fi
 
 if [ -z "$failed" ] && [ "$incremental" -eq 0 ] && [ -z "$live_snapshot" ] && \
 	[ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
-	if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
+	if ! timeout -s KILL 10 "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
 		printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
 	fi
 fi
@@ -390,7 +395,7 @@ fi
 
 if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
 	if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
-		"$RP_ROOT/etc/init.d/smartdns" reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
+		rp_native_service smartdns reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
 	fi
 fi
 
@@ -403,7 +408,7 @@ fi
 
 if [ -n "$failed" ]; then
 	restore_previous
-	[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || { [ -x "$RP_ROOT/etc/init.d/smartdns" ] && "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true; }
+	[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || { [ -x "$RP_ROOT/etc/init.d/smartdns" ] && rp_native_service smartdns reload >/dev/null 2>&1 || true; }
 	rp_output_error apply "$failed；已尝试恢复应用前状态"
 	exit 1
 fi

@@ -331,14 +331,13 @@ restore_file() {
 }
 
 management_lock() {
+	rp_writer_enter smartdns || return 1
 	lock_parent="$RP_STATE_DIR/init-transaction"
 	for path in "$RP_ETC" "$RP_STATE_DIR" "$lock_parent"; do
 		[ ! -L "$path" ] && { [ ! -e "$path" ] || [ -d "$path" ]; } || return 1
 	done
 	mkdir -p "$lock_parent" && chmod 700 "$lock_parent" || return 1
 	[ ! -L "$lock_parent/lock" ] || return 1
-	exec 9>"$lock_parent/lock"
-	flock -n 9 || return 1
 	if [ -e "$lock_parent/active" ] || [ -L "$lock_parent/active" ]; then rp_init_active_record >/dev/null || return 1; fi
 	! rp_dns_boot_pending || return 1
 	case "$(cat "$lock_parent/current/phase" 2>/dev/null || printf absent)" in
@@ -418,10 +417,11 @@ smartdns_apply() {
 	baseline_unchanged || { rp_output_error smartdns-apply 'SmartDNS 配置已被外部修改，请刷新'; return 1; }
 	rp_ensure_dirs
 	lock="$RP_RUN_DIR/smartdns-apply.lock"
-	mkdir "$lock" 2>/dev/null || { rp_output_error smartdns-apply '另一个 SmartDNS 应用正在进行'; return 1; }
-	work=$(mktemp -d "$RP_RUN_DIR/smartdns-apply.XXXXXX") || { rmdir "$lock"; return 1; }
-	cleanup_apply() { rm -rf "$work"; rmdir "$lock" 2>/dev/null || true; }
-	trap cleanup_apply EXIT HUP INT TERM
+	rp_local_lock "$lock" || { rp_output_error smartdns-apply '另一个 SmartDNS 应用正在进行'; return 1; }
+	work=$(mktemp -d "$RP_RUN_DIR/smartdns-apply.XXXXXX") || { rp_local_unlock "$lock"; return 1; }
+	cleanup_apply() { rm -rf "$work"; rp_local_unlock "$lock"; }
+	trap cleanup_apply EXIT
+	trap 'exit 1' HUP INT TERM
 	current_export >"$work/smartdns.previous"
 	snapshot_file "$RP_SMARTDNS_FILE" "$work/90.previous" || { rp_output_error smartdns-apply '90 片段不是安全普通文件'; return 1; }
 	snapshot_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous" || { rp_output_error smartdns-apply '91 片段不是安全普通文件'; return 1; }
@@ -476,9 +476,9 @@ smartdns_apply() {
 	enabled=$(candidate_value enabled "$RP_SMARTDNS_CANDIDATE")
 	[ -n "$enabled" ] || enabled=$(rp_uci_config_get smartdns "$root" enabled 1)
 	if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
-		if [ "$enabled" = 0 ]; then "$RP_ROOT/etc/init.d/smartdns" stop >"$work/service.log" 2>&1 || failed='停止 SmartDNS 失败';
-		elif [ "$service_was_running" = 1 ]; then "$RP_ROOT/etc/init.d/smartdns" reload >"$work/service.log" 2>&1 || failed='重载 SmartDNS 失败';
-		else "$RP_ROOT/etc/init.d/smartdns" start >"$work/service.log" 2>&1 || failed='启动 SmartDNS 失败'; fi
+		if [ "$enabled" = 0 ]; then rp_native_service smartdns stop >"$work/service.log" 2>&1 || failed='停止 SmartDNS 失败';
+		elif [ "$service_was_running" = 1 ]; then rp_native_service smartdns reload >"$work/service.log" 2>&1 || failed='重载 SmartDNS 失败';
+		else rp_native_service smartdns start >"$work/service.log" 2>&1 || failed='启动 SmartDNS 失败'; fi
 	fi
 	if [ -z "$failed" ] && [ "$enabled" != 0 ]; then
 		if [ "$adapter_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then failed='90 片段未出现在 SmartDNS 实际生成配置中'; fi
@@ -498,8 +498,8 @@ smartdns_apply() {
 		restore_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous"
 		restore_file "$RP_LOCAL_HOSTS" "$work/hosts.previous"
 		if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
-			if [ "$service_was_running" = 1 ]; then "$RP_ROOT/etc/init.d/smartdns" start >/dev/null 2>&1 || true
-			else "$RP_ROOT/etc/init.d/smartdns" stop >/dev/null 2>&1 || true; fi
+			if [ "$service_was_running" = 1 ]; then rp_native_service smartdns start >/dev/null 2>&1 || true
+			else rp_native_service smartdns stop >/dev/null 2>&1 || true; fi
 		fi
 		rp_output_error smartdns-apply "$failed；已恢复应用前配置与自有文件"
 		return 1
@@ -564,7 +564,7 @@ smartdns_read_local_hosts() {
 }
 
 case "${1:-}" in
-	save|apply|discard|write-local-hosts)
+	status|save|apply|discard|write-local-hosts)
 		management_lock || { rp_output_error "smartdns-${1:-write}" '初始化事务占用写锁或尚未完成，请先确认/恢复'; exit 1; } ;;
 esac
 

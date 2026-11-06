@@ -10,6 +10,7 @@ case "$mode" in
 	live-save|live-restore) [ "$#" -eq 2 ] || exit 2 ;;
 	*) exit 2 ;;
 esac
+rp_writer_enter warm-state || { rp_output_error warm-state '写入门禁忙或初始化尚未完成'; exit 1; }
 rp_ensure_dirs
 
 live_snapshot_set() {

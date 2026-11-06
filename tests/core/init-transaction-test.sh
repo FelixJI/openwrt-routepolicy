@@ -266,7 +266,8 @@ EOF
 cat >"$tmp/lib/apply" <<'EOF'
 #!/bin/sh
 set -eu
-[ ! -e /proc/self/fd/9 ] || { printf '%s\n' 'policy child inherited initialization lock' >&2; exit 1; }
+. "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_enter apply || { printf '%s\n' 'policy child did not inherit authenticated writer ownership' >&2; exit 1; }
 mkdir -p "$ROUTEPOLICY_ROOT/tmp/routepolicy"
 mkdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock" || exit 1
 trap 'rmdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock"' EXIT
@@ -498,13 +499,17 @@ policy_runtime_tests() {
 	reset; enable_policy_fixture; prepare_policy
 	mkdir -p "$tmp/root/tmp/routepolicy/apply.lock"
 	touch "$tmp/policy-clock-active"
-	bad "$TX" apply "$token"; phase_is conflict
+	bad "$TX" apply "$token"; phase_is prepared
+	[ ! -f "$tmp/commits" ]
 	[ -d "$tmp/root/tmp/routepolicy/apply.lock" ]
-	rmdir "$tmp/root/tmp/routepolicy/apply.lock"; "$TX" recover >/dev/null; phase_is rolled_back
+	rmdir "$tmp/root/tmp/routepolicy/apply.lock"
 	reset; enable_policy_fixture; prepare_policy
 	mkdir -p "$tmp/root/tmp/routepolicy/apply.lock"; touch "$tmp/policy-clock-active" "$tmp/policy-owner-release"
+	bad "$TX" apply "$token"; phase_is prepared
+	[ -f "$tmp/policy-owner-release" ] && [ ! -f "$tmp/commits" ]
+	rm "$tmp/policy-owner-release" "$tmp/policy-clock-active"; rmdir "$tmp/root/tmp/routepolicy/apply.lock"
 	"$TX" apply "$token" >/dev/null; phase_is pending
-	[ "$(cat "$tmp/runtime-policy")" = wan2 ]; [ ! -f "$tmp/policy-owner-release" ]
+	[ "$(cat "$tmp/runtime-policy")" = wan2 ]
 }
 dhcp_readiness_tests() {
 	dhcp_readiness_test

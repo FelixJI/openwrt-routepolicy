@@ -3,6 +3,7 @@
 set -eu
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
+rp_writer_enter render || { rp_output_error render '写入门禁忙或初始化尚未完成'; exit 1; }
 
 rp_ensure_dirs
 work=$(mktemp -d "$RP_RUN_DIR/render.XXXXXX") || exit 1

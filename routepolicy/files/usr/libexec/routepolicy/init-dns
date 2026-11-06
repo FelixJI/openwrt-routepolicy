@@ -216,12 +216,12 @@ init_dns_service_state() {
 }
 init_dns_enabled() {
 	local result=0
-	"$RP_ROOT/etc/init.d/$1" enabled 9>&- >/dev/null 2>&1 || result=$?
+	rp_native_run 3 "$RP_ROOT/etc/init.d/$1" enabled >/dev/null 2>&1 || result=$?
 	case "$result" in 0) printf 1 ;; 1) printf 0 ;; *) return 1 ;; esac
 }
 init_dns_call() {
 	# The bounded supervisor retains FD9 until the service writer has exited.
-	timeout -k 2 15 sh -c 'exec 9>&-; exec "$1" "$2"' routepolicy-dns-service "$RP_ROOT/etc/init.d/$1" "$2"
+	rp_native_service "$1" "$2"
 }
 init_dns_present() {
 	local output
@@ -233,7 +233,7 @@ init_dns_present() {
 init_dns_stop() {
 	local result=0 remaining=10 present
 	if init_dns_present; then :; else present=$?; [ "$present" = 1 ] && return 0; return 1; fi
-	timeout -k 2 15 sh -c 'exec 9>&-; exec ubus call service delete "$1"' routepolicy-dns-stop '{"name":"smartdns"}' >/dev/null || result=$?
+	rp_native_run 15 ubus call service delete '{"name":"smartdns"}' >/dev/null || result=$?
 	# Only NotFound is benign, and only after an independent successful readback.
 	case "$result" in 0|4) ;; *) return 1 ;; esac
 	while :; do

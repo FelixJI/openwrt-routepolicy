@@ -126,7 +126,7 @@ LuCI 入口为“服务 → 路由策略 → SmartDNS”。它不依赖官方 `l
 - `/etc/config/smartdns` 保存 SmartDNS 服务、监听、上游、缓存、TTL、DNS 行为及两个附加片段的 `conf_files` 登记。RoutePolicy 只精确修改页面涉及的字段，保留未知 option、未知段和其他 `conf_files`。
 - `/etc/smartdns/conf.d/90-routepolicy.conf` 只保存 RoutePolicy domain-set/nftset/domain-rules、本地主机引用和 PTR 扩展；`routepolicy.main.smartdns_enabled` 只控制这一适配片段。
 - `/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf` 保存 OpenWrt init 未映射的 `serve-expired-reply-ttl`、`cache-checkpoint-time` 和受支持的可选仪表盘字段。
-- `/etc/routepolicy/user.d/local-hosts.list` 是保留的用户配置，每行为 `IP 主名称 [别名 ...]`；A/AAAA 覆盖全部名称，PTR 只扩展主名称。DHCP 租约页面只读。只有管理员确认旁路由初始化方案后，后端才可关闭选定接入接口的 DHCPv4、RA、DHCPv6 与 NDP 服务。其他接口的 DHCP 服务、出口 DHCP client 和 dnsmasq 的 DNS 功能应保留。
+- `/etc/routepolicy/user.d/local-hosts.list` 是保留的用户配置，每行为 `IP 主名称 [别名 ...]`；A/AAAA 覆盖全部名称，PTR 只扩展主名称。DHCP 租约页面只读。只有管理员确认旁路由初始化方案后，后端才可关闭选定接入接口的 DHCPv4、RA、DHCPv6 与 NDP 服务。保留出口 DHCP client 和其他接口配置；若其他接口仍依赖 dnsmasq 提供服务，拒绝接管。成功接管后由 SmartDNS 提供 DNS，dnsmasq 停止并禁用自启动。
 
 服务启用、RoutePolicy 启用、90 适配启用是三个独立状态。90/91 的 loaded 状态来自 `/var/etc/smartdns/smartdns.conf` 中实际生成的 `conf-file`，不是仅检查文件存在。
 

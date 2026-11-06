@@ -15,6 +15,7 @@ EOF
 chmod +x "$tmp/routepolicyctl"
 cat >"$tmp/init-transaction" <<'EOF'
 #!/bin/sh
+if [ "$1" = boot-pending ]; then [ "${TEST_BOOT_PENDING:-0}" = 1 ]; exit; fi
 [ "$1" = recover-startup ] || exit 1
 printf '%s\n' "$1" >>"$TEST_RECOVERY_LOG"
 [ "${TEST_RECOVERY_FAIL:-0}" != 1 ]
@@ -81,5 +82,10 @@ if TEST_RECOVERY_FAIL=1 run_start 1 >/dev/null 2>&1; then
 fi
 [ ! -s "$tmp/lifecycle.log" ]
 grep -Fxq recover-startup "$tmp/recovery.log"
+
+: >"$tmp/lifecycle.log"
+TEST_BOOT_PENDING=1 run_start 1 >/dev/null
+if grep -Fxq apply "$tmp/lifecycle.log"; then printf 'S95 bypassed boot coordinator\n' >&2; exit 1; fi
+grep -Fxq "command $tmp/watch" "$tmp/lifecycle.log"
 
 printf '%s\n' 'init lifecycle tests: passed'

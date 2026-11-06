@@ -10,7 +10,7 @@ ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routep
 
 start_service() {
 	# A transient boot failure still needs the existing supervised retry worker.
-	"$ROUTEPOLICY_INIT_TRANSACTION" boot-dns >/dev/null || true
+	[ "${1:-}" = event ] || "$ROUTEPOLICY_INIT_TRANSACTION" boot-dns >/dev/null || true
 	"$ROUTEPOLICY_INIT_TRANSACTION" guard-needed || return 0
 	procd_open_instance guard
 	procd_set_param command "$ROUTEPOLICY_INIT_TRANSACTION" guard

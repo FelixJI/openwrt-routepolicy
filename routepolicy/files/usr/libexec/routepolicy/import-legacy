@@ -3,6 +3,7 @@
 set -eu
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
+rp_writer_enter import || { rp_output_error import-legacy '写入门禁忙或初始化尚未完成'; exit 1; }
 
 [ "$#" -eq 1 ] || { rp_output_error import-legacy '必须提供旧目录'; exit 2; }
 legacy=$1
@@ -19,15 +20,16 @@ for protected in "$marker" "$report_target"; do
 	fi
 done
 lock="$RP_RUN_DIR/import.lock"
-mkdir "$lock" 2>/dev/null || { rp_output_error import-legacy '另一个导入正在进行'; exit 1; }
-work=$(mktemp -d "$RP_RUN_DIR/import.XXXXXX") || { rmdir "$lock"; exit 1; }
+rp_local_lock "$lock" || { rp_output_error import-legacy '另一个导入正在进行'; exit 1; }
+work=$(mktemp -d "$RP_RUN_DIR/import.XXXXXX") || { rp_local_unlock "$lock"; exit 1; }
 prepared_files=
 cleanup() {
 	for prepared in $prepared_files; do rm -f "$prepared"; done
 	rm -rf "$work"
-	rmdir "$lock" 2>/dev/null || true
+	rp_local_unlock "$lock"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 imported_files=0
 imported_entries=0

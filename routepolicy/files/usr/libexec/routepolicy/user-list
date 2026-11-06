@@ -14,6 +14,7 @@ case "$name" in
 	*) usage ;;
 esac
 case "$action" in read|write) ;; *) usage ;; esac
+rp_writer_enter user-list || { rp_output_error user-list '写入门禁忙或初始化尚未完成'; exit 1; }
 
 rp_ensure_dirs
 target="$RP_USER_DIR/$name.list"
