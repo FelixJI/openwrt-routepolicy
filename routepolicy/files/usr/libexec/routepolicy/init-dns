@@ -129,8 +129,9 @@ init_dns_plan() {
 		if [ "$previous" = 53 ]; then
 			[ "$(get "dhcp.$dnsmasq.port")" = 0 ] || fail '原已运行 SmartDNS 端口53但 dnsmasq.port 非0；原生回滚启动会修改端口与 DHCP option6，请先手工处理'
 		fi
-		if [ "$(get "smartdns.$root.auto_set_dnsmasq")" = 1 ]; then
-			previous=$(get "smartdns.$root.port")
+		previous=$(get "smartdns.$root.auto_set_dnsmasq"); previous=${previous:-1}
+		if [ "$previous" = 1 ]; then
+			previous=$(get "smartdns.$root.port"); previous=${previous:-53}
 			if [ "$previous" = 53 ]; then
 				[ "$(get "dhcp.$dnsmasq.port")" = 0 ] && [ "$(get "dhcp.$dnsmasq.dns_redirect")" != 1 ] || fail '原生 SmartDNS 自动主 DNS 与 DHCP 状态不一致，请先手工恢复'
 			else

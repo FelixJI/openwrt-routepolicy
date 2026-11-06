@@ -280,12 +280,14 @@ enabled=$(uci -q get 'smartdns.@smartdns[0].enabled' || printf 0)
 printf '%s' "$enabled" >"$TEST_DNS_TMP/svc/$service.running"
 [ "$enabled" = 1 ] || exit 0
 port=$(uci -q get 'smartdns.@smartdns[0].port' || printf 53)
+port=${port:-53}
 printf '%s' "$port" >"$TEST_DNS_TMP/svc/smartdns.port"
 if [ "$port" = 53 ]; then
 	. "$TEST_DNS_TMP/native-main"
 	set_main_dns
 fi
 auto=$(uci -q get 'smartdns.@smartdns[0].auto_set_dnsmasq' || printf 1)
+auto=${auto:-1}
 if [ "$port" != 53 ] && [ "$auto" = 1 ]; then
 	. "$TEST_DNS_TMP/native-forward"
 	set +e; set_forward_dnsmasq "$port"; set -e
@@ -402,6 +404,103 @@ prepare_dns() {
 	[ "${#token}" = 32 ]
 }
 confirm_dns() { "$TX" apply "$token" >/dev/null; SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null; }
+native_auto_defaults_test() {
+	# The official start callback destroys an uncoordinated list even without native stop.
+	baseline 1 1 1 1
+	uci delete 'smartdns.@smartdns[0].auto_set_dnsmasq'
+	uci set 'smartdns.@smartdns[0].old_auto_set_dnsmasq=1'; uci commit smartdns
+	uci add_list 'dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53'; uci commit dhcp
+	"$tmp/root/etc/init.d/smartdns" start
+	[ "$(uci -q get 'dhcp.@dnsmasq[0].server')" = '127.0.0.1#6053' ]
+	printf '%s\n' 'native default-on start control: reproduced conditional forwarding deletion'
+	for auto_state in missing empty 1; do
+		baseline 1 1 1 1
+		case "$auto_state" in missing) uci delete 'smartdns.@smartdns[0].auto_set_dnsmasq' ;; empty) uci set 'smartdns.@smartdns[0].auto_set_dnsmasq=' ;; *) uci set 'smartdns.@smartdns[0].auto_set_dnsmasq=1' ;; esac
+		uci set 'smartdns.@smartdns[0].old_auto_set_dnsmasq=1'; uci commit smartdns
+		uci add_list 'dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53'; uci commit dhcp
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.before"; done
+		if prepare >"$tmp/default-auto-error" 2>&1; then printf 'unsafe native auto default accepted: %s\n' "$auto_state" >&2; exit 1; fi
+		grep -Fq '原生 SmartDNS 自动转发与 DHCP 上游不一致' "$tmp/default-auto-error"
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.after"; cmp "$tmp/$package.before" "$tmp/$package.after"; done
+		[ ! -s "$tmp/service-log" ]
+	done
+	for safe_state in explicit-off inherited-forward port-missing port-empty; do
+		baseline 1 1 1 1
+		uci add_list 'dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53'
+		case "$safe_state" in
+			explicit-off) ;;
+			inherited-forward)
+				uci delete 'smartdns.@smartdns[0].auto_set_dnsmasq'; uci set 'smartdns.@smartdns[0].old_auto_set_dnsmasq=1'
+				uci delete 'dhcp.@dnsmasq[0].server'; uci add_list 'dhcp.@dnsmasq[0].server=127.0.0.1#6053'; uci add_list 'dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53' ;;
+			port-*)
+				if [ "$safe_state" = port-missing ]; then uci delete 'smartdns.@smartdns[0].port'; else uci set 'smartdns.@smartdns[0].port='; fi
+				uci set 'smartdns.@smartdns[0].old_port=53'; uci set 'smartdns.@smartdns[0].auto_set_dnsmasq=1'; uci set 'smartdns.@smartdns[0].old_auto_set_dnsmasq=1'
+				uci set 'dhcp.@dnsmasq[0].port=0'; printf 53 >"$tmp/svc/smartdns.port"; printf 0 >"$tmp/svc/dnsmasq.port"; printf 0 >"$tmp/svc/dnsmasq.running" ;;
+		esac
+		uci commit smartdns; uci commit dhcp
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.before"; done
+		prepare; : >"$tmp/query-fail"
+		if "$TX" apply "$token" >"$tmp/default-auto-rollback" 2>&1; then exit 1; fi
+		[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = rolled_back ]
+		restored
+		uci -q get 'dhcp.@dnsmasq[0].server' | grep -Fq '/corp.example/10.20.0.53'
+	done
+	printf '%s\n' 'native auto/port defaults: passed (missing/empty auto=1, explicit0, port=53, conditional forwarding and full rollback preservation)'
+}
+native_auto_defaults_test
+management_auto_defaults_test() {
+	control="$REAL_LIB/smartdns-control"
+	while read -r current requested dns_running accepted; do
+		baseline 1 1 1 "$dns_running"
+		case "$current" in missing) uci delete 'smartdns.@smartdns[0].auto_set_dnsmasq' ;; empty) uci set 'smartdns.@smartdns[0].auto_set_dnsmasq=' ;; *) uci set "smartdns.@smartdns[0].auto_set_dnsmasq=$current" ;; esac
+		uci commit smartdns
+		# A deliberate return to default-on may safely retain an existing forwarder.
+		if [ "$requested:$dns_running" = inherit:1 ]; then
+			uci delete 'dhcp.@dnsmasq[0].server'; uci add_list 'dhcp.@dnsmasq[0].server=127.0.0.1#6053'; uci add_list 'dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53'; uci commit dhcp
+		fi
+		canonical smartdns >"$tmp/control-before"
+		"$control" status >"$tmp/control-status"
+		version=$(jsonfilter -i "$tmp/control-status" -e '@.version')
+		printf 'version\t%s\ninitialize\t0\nconfirm_danger\t1\n' "$version" >"$tmp/control-candidate"
+		case "$requested" in omit) ;; inherit) printf 'auto_set_dnsmasq\t\n' >>"$tmp/control-candidate" ;; *) printf 'auto_set_dnsmasq\t%s\n' "$requested" >>"$tmp/control-candidate" ;; esac
+		if [ "$accepted" = 1 ]; then "$control" save <"$tmp/control-candidate" >"$tmp/control-save" 2>"$tmp/control-error"
+		else
+			if "$control" save <"$tmp/control-candidate" >"$tmp/control-save" 2>"$tmp/control-error"; then printf 'unsafe effective auto accepted: %s/%s\n' "$current" "$requested" >&2; exit 1; fi
+			grep -Fq 'dnsmasq 未运行' "$tmp/control-error"
+		fi
+		canonical smartdns >"$tmp/control-after"; cmp "$tmp/control-before" "$tmp/control-after"
+		if [ "$current:$requested:$accepted" = 0:omit:1 ]; then
+			"$control" apply >"$tmp/control-apply"
+			[ "$(uci -q get 'smartdns.@smartdns[0].auto_set_dnsmasq')" = 0 ]
+		elif [ "$current:$requested:$dns_running" = 0:inherit:1 ]; then
+			"$control" apply >"$tmp/control-apply"
+			if uci -q get 'smartdns.@smartdns[0].auto_set_dnsmasq'; then exit 1; fi
+			[ "$(uci -q get 'dhcp.@dnsmasq[0].server')" = '127.0.0.1#6053 /corp.example/10.20.0.53' ]
+		fi
+	done <<'CASES'
+missing omit 0 0
+empty omit 0 0
+0 omit 0 1
+1 omit 0 0
+0 inherit 0 0
+1 inherit 0 0
+missing 0 0 1
+1 0 0 1
+0 1 0 0
+0 inherit 1 1
+missing omit 1 1
+0 omit 1 1
+CASES
+	baseline 1 1 1 1
+	"$control" status >"$tmp/control-status"; version=$(jsonfilter -i "$tmp/control-status" -e '@.version')
+	if printf 'version\t%s\ninitialize\t0\nauto_set_dnsmasq\t\n' "$version" | "$control" save >"$tmp/control-save" 2>"$tmp/control-error"; then exit 1; fi
+	grep -Fq '危险操作缺少明确确认' "$tmp/control-error"
+	if printf 'version\t%s\ninitialize\t0\nconfirm_danger\t1\nauto_set_dnsmasq\t0\nauto_set_dnsmasq\t\n' "$version" | "$control" save >"$tmp/control-save" 2>"$tmp/control-error"; then exit 1; fi
+	grep -Fq 'auto_set_dnsmasq 不能重复' "$tmp/control-error"
+	printf '%s\n' 'management effective auto: passed (missing row preserves explicit0, blank deletes to native1, running prerequisite and danger confirmation, real UCI apply)'
+}
+management_auto_defaults_test
+if [ "${1:-}" = --native-auto-defaults ]; then exit 0; fi
 # Surplus servers remain owned by the original applied source, after active shrinks.
 baseline 0 0 1 1
 prepare_dns 192.0.2.53,192.0.2.54; confirm_dns

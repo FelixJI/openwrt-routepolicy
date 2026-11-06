@@ -174,9 +174,19 @@ validate_candidate() {
 	initialize=$(candidate_value initialize "$file")
 	[ "$root_count" -le 1 ] || { rp_err '存在多个 SmartDNS 根段，拒绝写入'; errors=$((errors + 1)); }
 	[ "$root_count" -ne 0 ] || [ "$initialize" = 1 ] || { rp_err 'SmartDNS 未初始化'; errors=$((errors + 1)); }
+	auto_requested=$(awk -F '\t' '$1=="auto_set_dnsmasq"{n++}END{print n+0}' "$file")
+	[ "$auto_requested" -le 1 ] || { rp_err 'auto_set_dnsmasq 不能重复'; return 1; }
+	auto_dnsmasq=$(candidate_value auto_set_dnsmasq "$file")
+	if [ "$auto_requested" = 1 ]; then
+		# A blank row deletes the option; only an absent row preserves its current value.
+		auto_dnsmasq=${auto_dnsmasq:-1}
+	elif [ "$root_count" -eq 1 ]; then
+		root=$(printf '%s\n' "$roots" | sed -n '1p'); auto_dnsmasq=$(rp_uci_config_get smartdns "$root" auto_set_dnsmasq 1)
+	else auto_dnsmasq=1; fi
 	danger=0
 	for field in enabled auto_set_dnsmasq force_aaaa_soa force_https_soa dashboard_enabled cache_persist; do
 		value=$(candidate_value "$field" "$file")
+		if [ "$field" = auto_set_dnsmasq ] && [ "$auto_requested" = 1 ]; then value=$auto_dnsmasq; fi
 		case "$field:$value" in enabled:0|auto_set_dnsmasq:1|force_aaaa_soa:1|force_https_soa:1|dashboard_enabled:1|cache_persist:0) danger=1 ;; esac
 	done
 	awk -F '\t' '$1 ~ /^server\.[A-Za-z0-9_.-]+\.delete$/ && $2 == "1" { found=1 } END { exit !found }' "$file" && danger=1
@@ -186,8 +196,6 @@ validate_candidate() {
 	if [ "$(candidate_value dashboard_enabled "$file")" = 1 ] && [ ! -x "$RP_ROOT/etc/init.d/smartdns-ui" ]; then
 		rp_err 'smartdns-ui 未安装，不能启用仪表盘'; errors=$((errors + 1))
 	fi
-	auto_dnsmasq=$(candidate_value auto_set_dnsmasq "$file")
-	if [ -z "$auto_dnsmasq" ] && [ "$root_count" -eq 1 ]; then root=$(printf '%s\n' "$roots" | sed -n '1p'); auto_dnsmasq=$(rp_uci_config_get smartdns "$root" auto_set_dnsmasq 0); fi
 	if [ "$auto_dnsmasq" = 1 ] && rp_have ubus; then
 		if ! ubus call service list '{"name":"dnsmasq"}' 2>/dev/null | jsonfilter -e '@.dnsmasq.instances.*.running' 2>/dev/null | grep -Eq '^(true|1)$'; then
 			rp_err 'dnsmasq 未运行，不能启用自动配置'; errors=$((errors + 1))

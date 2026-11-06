@@ -71,6 +71,7 @@ cat >"$tmp/bin/ubus" <<'EOF'
 case "${2:-}" in
 	network.interface.wan) printf '{"l3_device":"eth0"}\n' ;;
 	network.interface.lan) printf '{"l3_device":"br-lan"}\n' ;;
+	service) printf '{"dnsmasq":{"instances":{"main":{"running":true}}}}\n' ;;
 esac
 exit 0
 EOF
@@ -81,6 +82,7 @@ cat >"$tmp/bin/jsonfilter" <<'EOF'
 [ "${1:-}" = -e ] || exit 0
 case "$2" in
 	'@.l3_device') sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ;;
+	'@.dnsmasq.instances.*.running') sed -n 's/.*"running":\(true\|false\).*/\1/p' ;;
 esac
 exit 0
 EOF
