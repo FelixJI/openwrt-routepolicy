@@ -149,24 +149,59 @@ exec "$ROUTEPOLICY_LIBEXEC/init-transaction" "$@"
         started=time.monotonic()
         assert run([bindir/'target-rc',init,'shutdown'],None).returncode != 0
         assert time.monotonic()-started < 12 and queued.exists()
+    def fields_and_pending():
+        return ({p.name:p.read_bytes() for p in (root/'etc/config').iterdir() if p.is_file() and not p.is_symlink()},
+                {p.name:p.read_bytes() for p in (tmp/'delta').iterdir() if p.is_file()})
+    def cancel_callbacks(case):
+        run([smart,'enable']); before=fields_and_pending()
+        run([bindir/'target-rc',init,'shutdown'])
+        assert not queued.exists() and fields_and_pending()==before
+        calls_before=(tmp/'uci-commands').read_bytes()
+        assert run([bindir/'target-rc',queued,'shutdown'],None).returncode!=0
+        assert (tmp/'uci-commands').read_bytes()==calls_before
+        results.append({'cancel_case':case,'K10_rc':0,'queued_K82_absent':True,'field_and_pending_bytes_unchanged':True})
+    def startup_still_refused():
+        write(active/'dns-boot-pending',boot.read_text())
+        before=fields_and_pending(); applied=(tmp/'apply-calls').read_bytes()
+        assert run(['sh',transaction,'boot-dns'],None).returncode!=0
+        assert fields_and_pending()==before and (tmp/'apply-calls').read_bytes()==applied
+        assert not (active/'dns-boot-ready').exists()
+        (active/'dns-boot-pending').unlink()
+    # Cancelling a destructive callback is permitted even when startup is unsafe.
     for key, value in [('dhcp.@dnsmasq[0].port','53'), ('dhcp.@dnsmasq[0].disabled','0'),
                        ('smartdns.@smartdns[0].enabled','0'), ('smartdns.@smartdns[0].old_port','6053'),
                        ('dhcp.@dnsmasq[0].dns_redirect','1')]:
         package=key.split('.')[0]; original=(root/'etc/config'/package).read_bytes()
         run([bindir/'uci','set',key+'='+value]);run([bindir/'uci','commit',package])
-        before=(root/'etc/config'/package).read_bytes()
-        assert run(['sh',transaction,'shutdown-dns'],None).returncode != 0
-        assert (root/'etc/config'/package).read_bytes() == before and queued.exists()
+        cancel_callbacks('committed:'+key);startup_still_refused()
         (root/'etc/config'/package).write_bytes(original)
-    run([bindir/'uci','set','dhcp.@dnsmasq[0].port=53'])
-    assert run(['sh',transaction,'shutdown-dns'],None).returncode != 0
-    run([bindir/'uci','revert','dhcp'])
+    write(root/'etc/config/firewall',"config rule 'f25'\n option value 'original'\n")
+    # The zero-write prepared candidate falls back to active; expired does too.
+    write(current/'phase','expired')
+    for key,value in [('firewall.f25.value','pending'),('dhcp.@dnsmasq[0].port','53'),
+                      ('smartdns.@smartdns[0].port','6053'),('network.lan.ipaddr','192.0.2.8/24'),
+                      ('routepolicy.main.enabled','0')]:
+        package=key.split('.')[0]
+        run([bindir/'uci','set',key+'='+value])
+        cancel_callbacks('pending:'+key);startup_still_refused()
+        run([bindir/'uci','revert',package])
+        if package=='firewall':
+            # Reboot discards volatile UCI deltas, not the committed DHCP port.
+            run([smart,'start']);assert (root/'etc/config/dhcp').read_text()==dhcp
     run([bindir/'uci','delete','dhcp.@dnsmasq[0].port']);run([bindir/'uci','add_list','dhcp.@dnsmasq[0].port=0']);run([bindir/'uci','commit','dhcp'])
-    assert run(['sh',transaction,'shutdown-dns'],None).returncode != 0
+    cancel_callbacks('committed:port-list-type');startup_still_refused()
     write(root/'etc/config/dhcp',dhcp)
+    run([smart,'enable']);write(current/'phase','prepared')
     # A preview without actual writes and without an old active contract owns nothing.
     (tx/'active').unlink(); before=(tmp/'uci-commands').read_text()
     run(['sh',transaction,'shutdown-dns']); assert queued.exists()
+    # A quiesce marker without the existing applied DNS identity adds no authority.
+    write(current/'phase','applying');write(current/'dns-service-attempted','')
+    write(current/'candidate','set\tsmartdns.@smartdns[0].port\t53\n')
+    before=fields_and_pending()
+    assert run(['sh',transaction,'shutdown-dns'],None).returncode!=0 and queued.exists()
+    assert fields_and_pending()==before
+    (current/'dns-service-attempted').unlink();write(current/'phase','prepared');write(current/'candidate','')
     write(tx/'active','a'*32)
     # Disable failure is visible; its later native callback must not be repaired by boot start.
     run([smart,'enable']); write(tmp/'disable-fail','1')
@@ -179,12 +214,26 @@ exec "$ROUTEPOLICY_LIBEXEC/init-transaction" "$@"
     assert (active/'failed-stage').read_text().strip() == 'boot-dns-admission'
     assert (active/'dns-boot-pending').exists() and not (active/'dns-boot-ready').exists()
     assert (root/'etc/config/dhcp').read_bytes() == before
-    # Restoring the committed scalar does not authorize an unapplied/forged record.
+    # Startup requires DHCP field proof; cancellation requires the existing DNS identity.
     run([bindir/'uci','set','dhcp.@dnsmasq[0].port=0']);run([bindir/'uci','commit','dhcp'])
     port_row=next(row for row,(key,_) in enumerate(values,1) if key=='dhcp.@dnsmasq[0].port')
     (active/'fields'/str(port_row)/'attempted').unlink()
-    assert run(['sh',transaction,'shutdown-dns'],None).returncode != 0
+    cancel_callbacks('DNS-owned-without-DHCP-startup-proof');startup_still_refused()
     write(active/'fields'/str(port_row)/'attempted','')
+    identity_row=next(row for row,(key,_) in enumerate(values,1) if key=='smartdns.@smartdns[0].cache_file')
+    identity_entry=active/'fields'/str(identity_row)
+    run([smart,'enable'])
+    for bad_proof in ['unattempted','bad-type','symlink','bad-token']:
+        if bad_proof=='unattempted':(identity_entry/'attempted').unlink()
+        if bad_proof=='bad-type':write(identity_entry/'expected-type','list')
+        if bad_proof=='symlink':
+            (identity_entry/'attempted').unlink();(identity_entry/'attempted').symlink_to(identity_entry/'expected')
+        if bad_proof=='bad-token':write(active/'token','invalid')
+        assert run(['sh',transaction,'shutdown-dns'],None).returncode!=0 and queued.exists()
+        if bad_proof in ['unattempted','symlink']:
+            (identity_entry/'attempted').unlink(missing_ok=True);write(identity_entry/'attempted','')
+        if bad_proof=='bad-type':write(identity_entry/'expected-type','scalar')
+        if bad_proof=='bad-token':write(active/'token','a'*32)
     assert run(['sh',transaction,'shutdown-dns'],None,{'ROUTEPOLICY_WRITER_OWNER':'1:1','ROUTEPOLICY_WRITER_KIND':'init'}).returncode != 0
     # Both UI switches retain DNS ownership; real core stop does not restore DHCP.
     write(bindir/'nft', '#!/bin/sh\n[ "$1:$2" = list:tables ]\n')

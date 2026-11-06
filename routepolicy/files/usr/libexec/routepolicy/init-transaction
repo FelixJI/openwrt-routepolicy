@@ -758,7 +758,7 @@ case "$operation" in
 		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/active" ] && [ ! -L "$TX/active" ]; then exit 0; fi
 		lock
 		# Prefer the current actually applied DNS; a prepared WAL falls back to active.
-		if init_dns_owned && init_dns_managed_admit; then :
+		if init_dns_owned && init_dns_managed; then :
 		else
 			shutdown_current=$WAL
 			if ! WAL=$(rp_init_active_record); then
@@ -766,7 +766,7 @@ case "$operation" in
 				[ ! -e "$WAL/dns-service-attempted" ] && [ ! -L "$WAL/dns-service-attempted" ] || fail '关机 DNS 字段归属有冲突；未猜测修改配置'
 				exit 0
 			fi
-			init_dns_managed_admit || fail '关机 DNS 字段归属有冲突；未猜测修改配置'
+			init_dns_managed || fail '关机 DNS 字段归属有冲突；未猜测修改配置'
 		fi
 		# Do not stop SmartDNS: rc.common calls service_stopped even if ubus is empty.
 		init_dns_call smartdns disable && [ "$(init_dns_enabled smartdns)" = 0 ] || fail '不能取消原生 SmartDNS 关机回调'
