@@ -3,7 +3,11 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 REAL_LIB="${TEST_INIT_LIBEXEC:-$ROOT/routepolicy/files/usr/libexec/routepolicy}"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-dns.XXXXXX")
-trap '[ -z "${guard_pid:-}" ] || kill "$guard_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
+cleanup() {
+	[ -z "${guard_pid:-}" ] || kill "$guard_pid" 2>/dev/null || true
+	if [ "${TEST_KEEP_INIT_DNS:-0}" = 1 ]; then printf 'init DNS evidence: %s\n' "$tmp"; else rm -rf "$tmp"; fi
+}
+trap cleanup EXIT HUP INT TERM
 export TEST_DNS_TMP=$tmp ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 export TEST_DNS_REAL_APPLY="$REAL_LIB/apply"
 export TEST_DNS_REAL_INIT="$ROOT/routepolicy/files/etc/init.d/routepolicy"
@@ -135,7 +139,7 @@ case "$1" in
 		init_ipv4_plan
 		init_dns_plan ;;
 	link-plan) printf 'required\t0\n' ;;
-	management-address) uci -q get network.lan.ipaddr ;;
+	management-address) [ ! -f "$TEST_DNS_TMP/policy-down" ] || exit 1; uci -q get network.lan.ipaddr ;;
 	verify) own_section firewall.rp_init_dns ;;
 	*) exit 1 ;;
 esac
@@ -163,8 +167,11 @@ case "$2:${3:-}" in
 			rm "$TEST_DNS_TMP/quiesce-fault" "$wal/dns-file-new"; mkdir "$wal/dns-file-new"
 		fi ;;
 	network.interface.wan:status|network.interface.wan2:status)
+		if [ "$2" = network.interface.wan2 ] && [ -f "$TEST_DNS_TMP/policy-down" ]; then printf '{"up":false}\n'; exit 0; fi
 		device=eth1; [ "$2" != network.interface.wan2 ] || device=eth2
 		printf '{"up":true,"l3_device":"%s","dns-server":["192.0.2.53"],"route":[{"target":"0.0.0.0","nexthop":"198.51.100.1"}]}\n' "$device" ;;
+	network.interface.lan:status)
+		printf '{"up":true,"l3_device":"br-lan","ipv4-address":[{"address":"192.0.2.1","mask":24}]}\n' ;;
 	*) exit 1 ;;
 esac
 EOF
@@ -307,7 +314,8 @@ mkdir -p "$ROUTEPOLICY_ROOT/var/etc/smartdns"
 	printf 'bind :%s@br-lan -group rp_init_default\nbind :%s@lo -group rp_init_default\n' "$port" "$port"
 	printf 'bind-tcp :%s@br-lan -group rp_init_default\nbind-tcp :%s@lo -group rp_init_default\n' "$port" "$port"
 	printf 'server 192.0.2.53:53 -group rp_init_default -exclude-default-group -interface eth1\nserver 198.51.100.53:53 -group rp_init_policy -exclude-default-group -interface eth2\n'
-	printf "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'\nconf-file '/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n"
+	case " $(uci -q get 'smartdns.@smartdns[0].conf_files') " in *' /etc/smartdns/conf.d/90-routepolicy.conf '*) printf "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'\n" ;; esac
+	printf "conf-file '/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n"
 } >"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
 EOF
 cat >"$tmp/root/etc/init.d/dnsmasq" <<'EOF'
@@ -548,6 +556,12 @@ rm "$tmp/watch-fail"
 grep -Fxq 'command /usr/libexec/routepolicy/watch' "$tmp/watch-registration"
 "$TX" confirm "$token" >/dev/null
 [ "$(grep -c '^command ' "$tmp/watch-registration")" = 1 ]
+uci set routepolicy.main.enabled=0; uci commit routepolicy; printf 0 >"$tmp/svc/routepolicy.running"
+"$TX" recover >/dev/null
+[ "$(grep -c '^command ' "$tmp/watch-registration")" = 1 ] && [ "$(cat "$tmp/svc/routepolicy.running")" = 0 ]
+uci set routepolicy.main.enabled=1
+if sh -c '. "$ROUTEPOLICY_LIBEXEC/common"; rp_writer_enter init || exit 1; exec "$ROUTEPOLICY_LIBEXEC/init-transaction" watch-ready' >"$tmp/watch-rejected" 2>&1; then printf 'pending switch bypassed committed disabled policy\n' >&2; exit 1; fi
+uci revert routepolicy; uci set routepolicy.main.enabled=1; uci commit routepolicy; printf 1 >"$tmp/svc/routepolicy.running"
 mkdir -p "$tmp/watch-lib"
 cp "$REAL_LIB/common" "$tmp/watch-lib/common"
 cat >"$tmp/watch-lib/update" <<'EOF'
@@ -1040,6 +1054,27 @@ reboot_services() {
 	printf '%s\n' "$1" >"$tmp/root/proc/sys/kernel/random/boot_id"
 	"$TX" recover-early >/dev/null
 }
+# Policy off keeps DNS, even when the policy NIC is down and apply cannot run.
+for adapter in 1 0; do
+	uci set routepolicy.main.enabled=0; uci set "routepolicy.main.smartdns_enabled=$adapter"; uci commit routepolicy
+	: >"$tmp/policy-down"; : >"$tmp/policy-fail"; : >"$tmp/queries"; rm -f "$tmp/watch-registration"
+	reboot_services "dns-only-$adapter"
+	"$TX" boot-dns >/dev/null
+	[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.running")" = 10 ]
+	[ ! -f "$tmp/policy-running" ] && [ ! -e "$tmp/root/tmp/routepolicy/active" ] && [ ! -e "$tmp/watch-registration" ]
+	[ "$(wc -l <"$tmp/queries")" = 2 ]
+	if grep -Fq routepolicy-init-policy.test "$tmp/queries" || grep -Fq "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/root/var/etc/smartdns/smartdns.conf"; then exit 1; fi
+	[ "$(uci -q get routepolicy.main.enabled):$(uci -q get routepolicy.main.smartdns_enabled)" = "0:$adapter" ]
+done
+rm "$tmp/policy-down" "$tmp/policy-fail"
+uci set routepolicy.main.enabled=1; uci set routepolicy.main.smartdns_enabled=0; uci commit routepolicy
+reboot_services policy-without-adapter; "$TX" boot-dns >/dev/null
+[ -f "$tmp/policy-running" ]
+if grep -Fq "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/root/var/etc/smartdns/smartdns.conf"; then exit 1; fi
+uci set routepolicy.main.smartdns_enabled=1; uci commit routepolicy
+reboot_services policy-with-adapter; "$TX" boot-dns >/dev/null
+grep -Fq "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/root/var/etc/smartdns/smartdns.conf"
+printf 'DNS ownership/policy switches: passed (DNS-only with policy down, both adapter values, no policy apply/90/watch, policy enabled unchanged)\n'
 txdir="$tmp/root/etc/routepolicy/state/init-transaction"
 origin=$(cat "$txdir/source"); cp -R "$txdir/confirmed-$origin/fields" "$tmp/origin-fields"
 prepare

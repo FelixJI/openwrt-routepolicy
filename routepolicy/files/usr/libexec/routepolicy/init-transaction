@@ -721,11 +721,17 @@ boot_dns_locked() (
 	# S19 may have been queued before S18 quarantined its link; converge explicitly.
 	init_dns_stop &&
 		init_dns_call dnsmasq stop && init_dns_call dnsmasq disable || return 1
-	printf '%s\n' boot-policy-runtime >"$WAL/stage" && sync || return 1
-	if ! ROUTEPOLICY_DNS_DEFER=1 ROUTEPOLICY_OUTPUT=text timeout -s KILL 30 sh -c 'exec "$1"' routepolicy-boot-policy "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || ! policy_verify_runtime; then
-		printf '%s\n' boot-policy-runtime >"$WAL/failed-stage"; return 1
-	fi
-	rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1 || return 1
+	case "$(uci_committed get routepolicy.main.enabled)" in
+		1)
+			printf '%s\n' boot-policy-runtime >"$WAL/stage" && sync || return 1
+			if ! ROUTEPOLICY_DNS_DEFER=1 ROUTEPOLICY_OUTPUT=text timeout -s KILL 30 sh -c 'exec "$1"' routepolicy-boot-policy "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || ! policy_verify_runtime; then
+				printf '%s\n' boot-policy-runtime >"$WAL/failed-stage"; return 1
+			fi ;;
+		0) ;;
+		*) return 1 ;;
+	esac
+	adapter=0; if init_dns_policy_adapter; then adapter=1; fi
+	rp_smartdns_set_registration "$RP_SMARTDNS_FILE" "$adapter" || return 1
 	# The application's /tmp cache starts cold on every boot, after its nft sets exist.
 	init_dns_call smartdns start && init_dns_coordinate verify && init_dns_call smartdns enable || {
 		init_dns_stop || true
@@ -940,7 +946,7 @@ case "$operation" in
 	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
 	watch-ready)
 		[ "$#" = 0 ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned &&
-			[ "$(read_phase)" = confirmed ] && transaction_same_boot && ! rp_dns_boot_pending && init_dns_managed &&
+			[ "$(read_phase)" = confirmed ] && transaction_same_boot && ! rp_dns_boot_pending && uci_layout && [ "$(uci_committed get routepolicy.main.enabled)" = 1 ] && init_dns_managed &&
 			[ "$(rp_init_active_record)" = "$TX/confirmed-$(cat "$WAL/token")" ] || exit 1
 		;;
 	boot-pending) [ "$#" -eq 0 ] || exit 1; rp_dns_boot_pending ;;

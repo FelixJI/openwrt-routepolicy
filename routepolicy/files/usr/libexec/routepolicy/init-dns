@@ -219,15 +219,22 @@ init_dns_plan() {
 
 init_dns_owned() { grep -q '^set[[:space:]]smartdns\.' "$WAL/candidate"; }
 init_dns_managed() {
-	local root
-	init_dns_owned && [ "$(uci -q get routepolicy.main.enabled)" = 1 ] && [ "$(uci -q get routepolicy.main.smartdns_enabled)" = 1 ] || return 1
-	root=$(rp_smartdns_single_root) || return 1
-	[ "$(uci -q get "smartdns.$root.cache_file")" = /tmp/routepolicy/smartdns.cache ] &&
-		[ "$(uci -q get "smartdns.$root.server_flags")" = '-group rp_init_default' ] &&
-		[ "$(uci -q get "smartdns.$root.auto_set_dnsmasq")" = 0 ]
+	local root item token
+	# Policy/90 switches do not relinquish the already applied port53/DHCP contract.
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned || return 1
+	[ -d "$WAL" ] && [ ! -L "$WAL" ] && [ -f "$WAL/phase" ] && [ ! -L "$WAL/phase" ] || return 1
+	[ -f "$WAL/token" ] && [ ! -L "$WAL/token" ] || return 1
+	token=$(cat "$WAL/token") && [ "${#token}" = 32 ] || return 1
+	case "$token" in *[!0-9a-f]*) return 1 ;; esac
+	case "$(cat "$WAL/phase")" in applying|pending|confirming|confirmed) ;; *) return 1 ;; esac
+	[ -f "$WAL/candidate" ] && [ ! -L "$WAL/candidate" ] || return 1
+	root=$(awk -F '\t' '$1=="set"&&$2~/^smartdns\.[^.]+\.cache_file$/&&$3=="/tmp/routepolicy/smartdns.cache"{n++;v=$2;sub(/^smartdns\./,"",v);sub(/\.cache_file$/,"",v)}END{if(n!=1)exit 1;print v}' "$WAL/candidate") || return 1
+	for item in port:53 auto_set_dnsmasq:0 cache_file:/tmp/routepolicy/smartdns.cache server_flags:'-group rp_init_default'; do
+		init_dns_applied_record "smartdns.$root.${item%%:*}" "${item#*:}" || return 1
+	done
 }
 # An unapplied candidate is never authority for native service side effects.
-init_dns_applied_value() {
+init_dns_applied_record() {
 	local key=$1 value=$2 index entry
 	[ -f "$WAL/candidate" ] && [ ! -L "$WAL/candidate" ] && [ -d "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
 	index=$(awk -F '\t' -v key="$key" -v value="$value" '$1=="set"&&$2==key&&$3==value{n++;row=NR}END{if(n!=1)exit 1;print row}' "$WAL/candidate") || return 1
@@ -239,7 +246,9 @@ init_dns_applied_value() {
 	if [ -e "$entry/expected-type" ] || [ -L "$entry/expected-type" ]; then
 		[ -f "$entry/expected-type" ] && [ ! -L "$entry/expected-type" ] && [ "$(cat "$entry/expected-type")" = scalar ] || return 1
 	fi
-	read_current "$key" && [ "$FIELD_TYPE" = scalar ] && [ "$FIELD_VALUE" = "$value" ]
+}
+init_dns_applied_value() {
+	init_dns_applied_record "$1" "$2" && read_current "$1" && [ "$FIELD_TYPE" = scalar ] && [ "$FIELD_VALUE" = "$2" ]
 }
 init_dns_managed_admit() {
 	local root port_key item
@@ -257,6 +266,83 @@ init_dns_managed_admit() {
 	for item in dns_redirect old_dns_redirect; do
 		[ "$(uci_committed get "${port_key%.*}.$item")" != 1 ] || return 1
 	done
+}
+init_dns_policy_adapter() {
+	[ "$(uci_committed get routepolicy.main.enabled)" = 1 ] && [ "$(uci_committed get routepolicy.main.smartdns_enabled)" = 1 ]
+}
+# DNS-only boot must not parse or require the disabled policy egress.
+init_dns_management_address() {
+	local raw address prefix device expected
+	raw=$(rp_interface_json "$a1") || return 1
+	[ "$(printf '%s\n' "$raw" | jsonfilter -e '@.up')" = true ] || return 1
+	address=$(printf '%s\n' "$raw" | jsonfilter -e '@["ipv4-address"][0].address') && rp_is_ipv4 "$address" || return 1
+	prefix=$(printf '%s\n' "$raw" | jsonfilter -e '@["ipv4-address"][0].mask') && rp_uint_between "$prefix" 1 30 || return 1
+	device=$(printf '%s\n' "$raw" | jsonfilter -e '@.l3_device') && rp_is_device "$device" || return 1
+	expected=$(awk -F '\t' '$1=="set"&&$2~/^smartdns\.[^.]+\.bind_device_name$/{n++;v=$3}END{if(n!=1)exit 1;print v}' "$WAL/candidate") || return 1
+	[ "$device" = "$expected" ] || return 1
+	if [ "$a10" != - ]; then [ "$address:$prefix" = "$a10:$a11" ] || return 1; fi
+	printf '%s\n' "$address"
+}
+init_dns_restore_admit() {
+	local service=$1 packages package pending row entry key existed old type root port auto value
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned || return 1
+	[ -f "$WAL/count" ] && [ ! -L "$WAL/count" ] && [ -d "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+	for key in enabled running; do
+		[ "$service:$key" != routepolicy:running ] || continue
+		[ -f "$WAL/$service-$key" ] && [ ! -L "$WAL/$service-$key" ] || return 1
+		case "$(cat "$WAL/$service-$key")" in 0|1) ;; *) return 1 ;; esac
+	done
+	case "$service" in smartdns) packages='network dhcp smartdns' ;; dnsmasq) packages='network dhcp' ;; routepolicy) packages=routepolicy ;; *) return 1 ;; esac
+	for package in $packages; do
+		pending=$(uci -q changes "$package") && [ -z "$pending" ] && uci_committed export "$package" >/dev/null || return 1
+	done
+	row=$(cat "$WAL/count") && rp_uint_between "$row" 1 256 || return 1
+	while [ "$row" -gt 0 ]; do
+		entry="$WAL/fields/$row"; row=$((row-1))
+		[ ! -L "$entry" ] && [ -d "$entry" ] || return 1
+		if [ ! -e "$entry/attempted" ] && [ ! -L "$entry/attempted" ]; then continue; fi
+		for key in key attempted old type existed; do [ -f "$entry/$key" ] && [ ! -L "$entry/$key" ] || return 1; done
+		key=$(cat "$entry/key") || return 1
+		case "$service:$key" in
+			smartdns:smartdns.*|smartdns:dhcp.*.port|smartdns:dhcp.*.disabled|dnsmasq:dhcp.*|dnsmasq:network.*|routepolicy:routepolicy.*) ;;
+			*) continue ;;
+		esac
+		existed=$(cat "$entry/existed") && old=$(cat "$entry/old") && type=$(cat "$entry/type") || return 1
+		case "$type" in scalar|list) ;; *) return 1 ;; esac
+		if read_current "$key"; then
+			[ "$existed" = 1 ] && [ "$FIELD_TYPE" = "$type" ] && [ "$FIELD_VALUE" = "$old" ] || return 1
+		else [ "$?" = 1 ] && [ "$existed" = 0 ] || return 1; fi
+	done
+	[ "$service" = smartdns ] && [ "$(cat "$WAL/smartdns-running")" = 1 ] || return 0
+	root=$(rp_smartdns_single_root) || return 1
+	case "$(uci_committed get "smartdns.$root.enabled")" in 1|on|true|yes|enabled) ;; *) return 1 ;; esac
+	[ -z "$(uci_committed get "smartdns.$root.redirect")" ] || return 1
+	port=$(uci_committed get "smartdns.$root.port") || port=53; port=${port:-53}
+	rp_uint_between "$port" 0 65535 || return 1
+	auto=$(uci_committed get "smartdns.$root.auto_set_dnsmasq") || auto=1
+	case "$auto" in ''|1|on|true|yes|enabled) auto=1 ;; 0|off|false|no|disabled) auto=0 ;; *) return 1 ;; esac
+	if [ "$port" = 53 ]; then
+		read_current 'dhcp.@dnsmasq[0].port' && [ "$FIELD_TYPE" = scalar ] && [ "$FIELD_VALUE" = 0 ] || return 1
+		for value in dns_redirect old_dns_redirect; do [ "$(uci_committed get "dhcp.@dnsmasq[0].$value")" != 1 ] || return 1; done
+	elif [ "$auto" = 1 ]; then
+		value=$(uci_committed get 'dhcp.@dnsmasq[0].server') || return 1
+		case "$value " in "127.0.0.1#$port "*) ;; *) return 1 ;; esac
+	fi
+	# Recheck the same native cache/cron preconditions against the restored state.
+	( get() { uci_committed get "$1" 2>/dev/null || true; }; fail() { rp_err "$*"; exit 1; }; init_dns_native_side_effects "$root" 1 )
+}
+init_dns_restore_blocked() {
+	local blocked_marker authorized=0
+	# rollback already quiesced this transaction's registered SmartDNS writer.
+	if [ "$1" = smartdns ]; then
+		for blocked_marker in dns-service-attempted dns-boot-quarantined; do
+			if [ -f "$WAL/$blocked_marker" ] && [ ! -L "$WAL/$blocked_marker" ]; then authorized=1; break; fi
+		done
+		[ "$authorized" = 1 ] && init_dns_call smartdns disable && [ "$(init_dns_enabled smartdns)" = 0 ] || return 1
+	fi
+	# Full flash/log failure must not prevent cancelling the destructive rc callback.
+	[ ! -L "$WAL/deferred-services" ] && { [ ! -e "$WAL/deferred-services" ] || [ -f "$WAL/deferred-services" ]; } &&
+		printf 'restore:%s:field-or-pending-conflict\n' "$1" >>"$WAL/deferred-services"
 }
 init_dns_service_state() {
 	local service=$1 output
@@ -479,7 +565,7 @@ EOF
 }
 
 init_dns_coordinate() {
-	local action=$1 port answer protocol probe access_dev service running enabled section address group device temp remaining cache="$RP_RUN_DIR/smartdns.cache" path=$RP_SMARTDNS_EXTRA_FILE
+	local action=$1 port answer protocol probe access_dev service running enabled section address group device temp remaining restore_failed=0 cache="$RP_RUN_DIR/smartdns.cache" path=$RP_SMARTDNS_EXTRA_FILE
 	# Old #17 WALs contain no DNS fields and retain their original recovery path.
 	init_dns_owned || return 0
 	case "$action" in
@@ -574,7 +660,9 @@ init_dns_coordinate() {
 					[ "$(grep -Fxc "domain-rules /routepolicy-init-$probe.test/ -nameserver rp_init_$probe -speed-check-mode none" "$path")" = 1 ] || return 1
 				done
 			else cmp -s "$path" "$WAL/dns-file-new" || return 1; fi
-			rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" || return 1
+			if [ "${operation:-}" != boot-dns ] || init_dns_policy_adapter; then
+				rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" || return 1
+			else ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" || return 1; fi
 			port=$(awk -F '\t' '$2~/^smartdns\.[^.]+\.port$/ {print $3;exit}' "$WAL/candidate")
 			access_dev=$(awk -F '\t' '$2~/^smartdns\.[^.]+\.bind_device_name$/ {print $3;exit}' "$WAL/candidate")
 			awk -v port="$port" -v device="$access_dev" '
@@ -582,6 +670,7 @@ init_dns_coordinate() {
 				END{exit bad||!seen["bind",":" port "@lo"]||!seen["bind-tcp",":" port "@lo"]||!seen["bind",":" port "@" device]||!seen["bind-tcp",":" port "@" device]}' "$RP_SMARTDNS_GENERATED" || return 1
 			init_dns_audit_binds "$RP_SMARTDNS_GENERATED" 0 "$port" "$access_dev" || return 1
 			for group in default policy; do
+				[ "$group" != policy ] || [ "${operation:-}" != boot-dns ] || [ "$(uci_committed get routepolicy.main.enabled)" = 1 ] || continue
 				device=$(uci_committed get "routepolicy.main.${group}_interface") || return 1
 				device=$(rp_interface_device "$device") || return 1
 				rp_is_device "$device" || return 1
@@ -597,9 +686,13 @@ init_dns_coordinate() {
 				$1~/^(tcp6|udp6)$/ && $4~/:53$/ {bad=1}
 				END{exit bad||!seen["tcp"]||!seen["udp"]}' || return 1
 			# Query both transports and groups through the client-facing SmartDNS socket.
+			if [ "${operation:-}" = boot-dns ] && [ "$(uci_committed get routepolicy.main.enabled)" = 0 ]; then
+				address=$(init_dns_management_address) || return 1
+			else address=$(topology management-address) || return 1; fi
 			for protocol in +notcp +tcp; do
 				for probe in default policy; do
-					answer=$(timeout 6 dig "$protocol" +time=2 +tries=1 +noall +comments +answer "@$(topology management-address)" "routepolicy-init-$probe.test" A) || return 1
+					[ "$probe" != policy ] || [ "${operation:-}" != boot-dns ] || [ "$(uci_committed get routepolicy.main.enabled)" = 1 ] || continue
+					answer=$(timeout 6 dig "$protocol" +time=2 +tries=1 +noall +comments +answer "@$address" "routepolicy-init-$probe.test" A) || return 1
 					printf '%s\n' "$answer" >>"$WAL/dns-query-result"
 					printf '%s\n' "$answer" | grep -Eq 'status: (NOERROR|NXDOMAIN),' || return 1
 				done
@@ -642,9 +735,16 @@ init_dns_coordinate() {
 			if [ -f "$temp" ]; then rm -f "$cache" && mv "$temp" "$cache" || return 1
 			elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
 			# An existing confirmed contract owns cold boot DNS admission after rollback.
-			if rp_dns_boot_pending; then init_dns_restore_bookkeeping; return; fi
+			if rp_dns_boot_pending; then
+				if ! init_dns_restore_admit smartdns; then init_dns_restore_blocked smartdns || return 1; return 1; fi
+				init_dns_restore_bookkeeping; return
+			fi
 			# Complete native SmartDNS callbacks before the final dnsmasq runtime convergence.
 			for service in smartdns dnsmasq; do
+				if ! init_dns_restore_admit "$service"; then
+					init_dns_restore_blocked "$service" || rp_err "恢复冲突服务隔离或诊断写入失败: $service"
+					restore_failed=1; continue
+				fi
 				case "$(cat "$WAL/$service-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
 				[ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || init_dns_call "$service" "$enabled" >/dev/null || return 1
 				case "$(cat "$WAL/$service-running")" in 1) running=start ;; 0) running=stop ;; *) return 1 ;; esac
@@ -662,10 +762,15 @@ init_dns_coordinate() {
 				done
 				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
 				[ "$running" != start ] || init_dns_original_probe "$service" verify || return 1
+				[ "$service" != smartdns ] || init_dns_restore_bookkeeping || return 1
 			done
+			if ! init_dns_restore_admit routepolicy; then
+				init_dns_restore_blocked routepolicy || return 1
+				return 1
+			fi
 			case "$(cat "$WAL/routepolicy-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
 			init_dns_call routepolicy "$enabled" || return 1
-			init_dns_restore_bookkeeping
+			[ "$restore_failed" = 0 ]
 			;;
 		quarantine-boot)
 			printf '%s' '' >"$WAL/dns-boot-quarantined" && sync || return 1
@@ -677,6 +782,8 @@ init_dns_coordinate() {
 		confirm)
 			temp="$cache.init-$(cat "$WAL/token")"
 			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } && rm -f "$temp" || return 1
+			uci_layout || return 1
+			case "$(uci_committed get routepolicy.main.enabled)" in 0) return 0 ;; 1) ;; *) return 1 ;; esac
 			if [ "$(init_dns_service_state routepolicy)" != 1 ]; then
 				# This watch-only start inherits the gate; procd creates the worker separately.
 				timeout -k 2 15 "$RP_ROOT/etc/init.d/routepolicy" start init-confirmed >"$WAL/watch-result" 2>&1 || return 1

@@ -47,6 +47,8 @@ case "${1:-}:${2:-}" in
 		;;
 	"get:smartdns.@smartdns[0].enabled") printf '%s\n' 1 ;;
 	"get:smartdns.@smartdns[0].port") printf '%s\n' 6053 ;;
+	get:routepolicy.main.enabled) printf '%s\n' "${TEST_POLICY_ENABLED:-1}" ;;
+	get:routepolicy.main.smartdns_enabled) printf '%s\n' "${TEST_ADAPTER_ENABLED:-1}" ;;
 	"get:smartdns.@server[0].enabled"|"get:smartdns.@server[1].enabled"|"get:smartdns.@server[2].enabled") printf '%s\n' 1 ;;
 	"get:smartdns.@server[0].type"|"get:smartdns.@server[1].type"|"get:smartdns.@server[2].type") printf '%s\n' udp ;;
 	"get:smartdns.@server[0].ip") printf '%s\n' 1.1.1.1 ;;
@@ -93,10 +95,10 @@ cat >"$tmp/root/etc/init.d/smartdns" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_SMARTDNS_LOG"
 mkdir -p "$ROUTEPOLICY_ROOT/var/etc/smartdns"
-printf '%s\n' \
-	'conf-file /etc/smartdns/conf.d/90-routepolicy.conf' \
-	'conf-file /etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf' \
-	>"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
+{
+	if [ "${TEST_POLICY_ENABLED:-1}:${TEST_ADAPTER_ENABLED:-1}" = 1:1 ]; then printf '%s\n' 'conf-file /etc/smartdns/conf.d/90-routepolicy.conf'; fi
+	printf '%s\n' 'conf-file /etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'
+} >"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
 [ "${TEST_SMARTDNS_RELOAD_FAIL:-0}" != 1 ]
 EOF
 chmod +x "$tmp/root/etc/init.d/smartdns"
@@ -356,6 +358,24 @@ grep -Fxq '192.168.1.20 old-host' "$tmp/root/etc/routepolicy/user.d/local-hosts.
 grep -Fxq import "$tmp/uci.log"
 [ -s "$tmp/root/tmp/routepolicy/smartdns-candidate.tsv" ]
 [ -s "$tmp/root/tmp/routepolicy/local-hosts-candidate.list" ]
+
+# The policy switch and the 90 adapter switch both gate policy DNS generation.
+for switches in 1:1 0:1 1:0 0:0; do
+	TEST_POLICY_ENABLED=${switches%:*} TEST_ADAPTER_ENABLED=${switches#*:}
+	export TEST_POLICY_ENABLED TEST_ADAPTER_ENABLED
+	out=$(TEST_SMARTDNS_ROOTS=1 PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-status --json)
+	version=$(printf '%s\n' "$out" | sed -n 's/.*"version":"\([0-9][0-9]*\)".*/\1/p')
+	printf 'version\t%s\ninitialize\t0\nport\t6053\n' "$version" | TEST_SMARTDNS_ROOTS=1 TEST_UCI_LOG="$tmp/uci.log" PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >/dev/null
+	: >"$tmp/uci.log"
+	TEST_SMARTDNS_ROOTS=1 TEST_UCI_LOG="$tmp/uci.log" TEST_SMARTDNS_LOG="$tmp/smartdns.log" PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-apply --json >/dev/null
+	if [ "$switches" = 1:1 ]; then
+		grep -Fq "add_list smartdns.main.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/uci.log"
+	else
+		if grep -Fq "add_list smartdns.main.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/uci.log"; then exit 1; fi
+		[ ! -e "$tmp/root/etc/smartdns/conf.d/90-routepolicy.conf" ]
+	fi
+done
+unset TEST_POLICY_ENABLED TEST_ADAPTER_ENABLED
 
 # Initialization's persistent lock and pending phase exclude independent writes.
 mkdir -p "$tmp/root/etc/routepolicy/state/init-transaction/current"

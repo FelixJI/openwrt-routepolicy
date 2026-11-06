@@ -207,7 +207,7 @@ validate_candidate() {
 		END { for(id in ids) if(value[id,"delete"] != "1" && value[id,"enabled"] != "0" && value[id,"server_group"] == wanted) found=1; print touched+0, found+0 }
 	' "$file")
 	set -- $server_check
-	if [ "${1:-0}" = 1 ] && [ "${2:-0}" != 1 ] && [ "$(rp_uci_get main smartdns_enabled 1)" = 1 ]; then
+	if [ "${1:-0}" = 1 ] && [ "${2:-0}" != 1 ] && [ "$(rp_uci_get main enabled 0)" = 1 ] && [ "$(rp_uci_get main smartdns_enabled 1)" = 1 ]; then
 		rp_err "上游变更会使 RoutePolicy 引用组 $policy_group 没有可用服务器"; errors=$((errors + 1))
 	fi
 	[ "$errors" -eq 0 ]
@@ -446,6 +446,7 @@ smartdns_apply() {
 	hosts_source=$RP_LOCAL_HOSTS
 	[ ! -f "$RP_LOCAL_HOSTS_CANDIDATE" ] || hosts_source=$RP_LOCAL_HOSTS_CANDIDATE
 	adapter_enabled=$(rp_uci_get main smartdns_enabled 1)
+	[ "$(rp_uci_get main enabled 0)" = 1 ] || adapter_enabled=0
 	if [ "$adapter_enabled" = 1 ]; then rp_render_smartdns90 "$work/90.candidate" "$hosts_source" || { rp_output_error smartdns-apply '生成 90 片段失败'; return 1; }; fi
 	printf "del_list smartdns.%s.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'\n" "$root" >>"$work/uci.batch"
 	printf "del_list smartdns.%s.conf_files='/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n" "$root" >>"$work/uci.batch"
@@ -490,6 +491,7 @@ smartdns_apply() {
 	fi
 	if [ -z "$failed" ] && [ "$enabled" != 0 ]; then
 		if [ "$adapter_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then failed='90 片段未出现在 SmartDNS 实际生成配置中'; fi
+		if [ "$adapter_enabled" = 0 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then failed='停用策略适配后实际配置仍加载 90 片段'; fi
 		if [ -s "$work/91.candidate" ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_EXTRA_FILE"; then failed='91 片段未出现在 SmartDNS 实际生成配置中'; fi
 	fi
 	if [ -z "$failed" ] && [ "$(candidate_value cache_persist "$RP_SMARTDNS_CANDIDATE")" = 0 ]; then

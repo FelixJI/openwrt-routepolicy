@@ -186,6 +186,106 @@ exec "$ROUTEPOLICY_LIBEXEC/init-transaction" "$@"
     assert run(['sh',transaction,'shutdown-dns'],None).returncode != 0
     write(active/'fields'/str(port_row)/'attempted','')
     assert run(['sh',transaction,'shutdown-dns'],None,{'ROUTEPOLICY_WRITER_OWNER':'1:1','ROUTEPOLICY_WRITER_KIND':'init'}).returncode != 0
+    # Both UI switches retain DNS ownership; real core stop does not restore DHCP.
+    write(bindir/'nft', '#!/bin/sh\n[ "$1:$2" = list:tables ]\n')
+    write(bindir/'ip', '#!/bin/sh\nexit 0\n')
+    write(current/'phase','expired')
+    (active/'dns-boot-pending').unlink(missing_ok=True)
+    write(root/'etc/config/dhcp',dhcp)
+    actual_apply=repo/'routepolicy/files/usr/libexec/routepolicy/apply'
+    for policy,adapter in [('0','1'),('0','0'),('1','0'),('1','1')]:
+        write(root/'etc/config/routepolicy', "config main 'main'\n option enabled '"+policy+"'\n option smartdns_enabled '"+adapter+"'\n")
+        if policy=='0':
+            run(['sh',actual_apply,'teardown'])
+            assert (root/'etc/config/dhcp').read_text()==dhcp
+        run([smart,'enable']);run([bindir/'target-rc',init,'shutdown'])
+        assert not queued.exists() and (root/'etc/config/dhcp').read_text()==dhcp
+    write(root/'etc/config/routepolicy',configs['routepolicy'])
+    # Restore uses old typed values, not the managed-forward guard.
+    write(bindir/'ubus', '''#!/bin/sh
+case "$2:$3" in
+ service:delete) rm -f "$F22_DIR/smart-running"; printf '{}\\n' ;;
+ service:set) touch "$F22_DIR/smart-running"; printf '{}\\n' ;;
+ service:list)
+  case "${4:-}" in *smartdns*) name=smartdns; file=smart-running ;; *) name=dnsmasq; file=dns-running ;; esac
+  if [ "$name" = smartdns ] && [ ! -f "$F22_DIR/$file" ]; then printf '{}\\n'; exit 0; fi
+  running=false; [ ! -f "$F22_DIR/$file" ] || running=true
+  printf '{"%s":{"instances":{"main":{"running":%s}}}}\\n' "$name" "$running" ;;
+ *) printf '{}\\n' ;;
+esac
+''')
+    write(root/'etc/init.d/dnsmasq', '''#!/bin/sh
+printf 'dnsmasq %s\\n' "$1" >>"$F22_DIR/restore-services"
+case "$1" in
+ enabled) [ -f "$F22_DIR/dns-enabled" ] ;;
+ enable) touch "$F22_DIR/dns-enabled" ;;
+ disable) rm -f "$F22_DIR/dns-enabled" ;;
+ start|restart) touch "$F22_DIR/dns-running" ;;
+ stop) rm -f "$F22_DIR/dns-running" ;;
+esac
+''')
+    write(bindir/'netstat', '''#!/bin/sh
+for service in smartdns dnsmasq; do
+ case "$service" in smartdns) file=smart-running; port=$(uci -q get 'smartdns.@smartdns[0].port') ;; *) file=dns-running; port=$(uci -q get 'dhcp.@dnsmasq[0].port') ;; esac
+ [ -f "$F22_DIR/$file" ] && [ "$port" != 0 ] || continue
+ printf 'tcp 0 0 127.0.0.1:%s 0.0.0.0:* LISTEN 123/%s\\nudp 0 0 127.0.0.1:%s 0.0.0.0:* 123/%s\\n' "$port" "$service" "$port" "$service"
+done
+''')
+    write(bindir/'dig', "#!/bin/sh\nprintf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\\n'\n")
+    write(root/'etc/init.d/routepolicy', '#!/bin/sh\n[ "$1" != enabled ]\n')
+    for service in ['network','firewall']:write(root/'etc/init.d'/service,'#!/bin/sh\nexit 0\n')
+    (tx/'active').unlink();(tx/'source').unlink(missing_ok=True)
+    def restore_case(kind, original_port='53', original_auto='0'):
+        shutil.rmtree(current);current.mkdir();(current/'delta').mkdir()
+        for delta in (tmp/'delta').iterdir():delta.unlink()
+        write(root/'etc/config/smartdns',configs['smartdns'])
+        write(root/'etc/config/routepolicy',configs['routepolicy'])
+        original_dns_port='0' if original_port=='53' else '53'
+        write(root/'etc/config/dhcp', dhcp+"\n")
+        run([bindir/'uci','delete','dhcp.@dnsmasq[0].server']);run([bindir/'uci','add_list','dhcp.@dnsmasq[0].server=127.0.0.1#'+original_port]);run([bindir/'uci','add_list','dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53']);run([bindir/'uci','commit','dhcp'])
+        rows=values+[('routepolicy.main.enabled','1')]
+        if kind in ['firewall','firewall-pending']:rows=rows+[('firewall.test.value','1')]
+        write(root/'etc/config/firewall',"config rule 'test'\n option value '1'\n")
+        for name,value in {'phase':'pending','token':'b'*32,'count':str(len(rows)),'policy-active':'0','dns-attempted':'','dns-service-attempted':'','dns-file-absent':'','dns-file-new':'','smartdns-enabled':'1','smartdns-running':'1','dnsmasq-enabled':'1','dnsmasq-running':'1','routepolicy-enabled':'0','boot-id':boot.read_text()}.items():write(current/name,value)
+        write(current/'candidate',''.join('set\t'+key+'\t'+value+'\n' for key,value in rows))
+        for row,(key,value) in enumerate(rows,1):
+            old=value
+            if key in ['smartdns.@smartdns[0].port','smartdns.@smartdns[0].old_port']:old=original_port
+            if key in ['smartdns.@smartdns[0].auto_set_dnsmasq','smartdns.@smartdns[0].old_auto_set_dnsmasq']:old=original_auto
+            if key=='dhcp.@dnsmasq[0].port':old=original_dns_port
+            if key in ['dhcp.@dnsmasq[0].disabled','routepolicy.main.enabled','firewall.test.value']:old='0'
+            for name,data in {'key':key,'expected':value,'expected-type':'scalar','old':old,'type':'scalar','existed':'1','attempted':''}.items():write(current/'fields'/str(row)/name,data)
+        (root/'etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf').unlink(missing_ok=True)
+        write(current/'smartdns-listeners','tcp 127.0.0.1 '+original_port+' 1\nudp 127.0.0.1 '+original_port+' 1\n')
+        write(current/'dnsmasq-listeners','' if original_dns_port=='0' else 'tcp 127.0.0.1 53 1\nudp 127.0.0.1 53 1\n')
+        (tmp/'dns-running').unlink(missing_ok=True);(tmp/'dns-enabled').unlink(missing_ok=True)
+        write(tmp/'smart-running','1');run([smart,'enable'])
+        if kind in ['port','port-logdir']:run([bindir/'uci','set','dhcp.@dnsmasq[0].port=53']);run([bindir/'uci','commit','dhcp'])
+        if kind=='port-logdir':(current/'deferred-services').mkdir()
+        if kind=='type':run([bindir/'uci','delete','dhcp.@dnsmasq[0].port']);run([bindir/'uci','add_list','dhcp.@dnsmasq[0].port=0']);run([bindir/'uci','commit','dhcp'])
+        if kind=='pending':run([bindir/'uci','set','dhcp.@dnsmasq[0].port=53'])
+        if kind=='smart':run([bindir/'uci','set','smartdns.@smartdns[0].port=6053']);run([bindir/'uci','commit','smartdns'])
+        if kind.startswith('firewall'):
+            run([bindir/'uci','set','firewall.test.value=2'])
+            if kind=='firewall':run([bindir/'uci','commit','firewall'])
+        result=run(['sh',transaction,'recover'],None)
+        if kind in ['port','port-logdir','type','pending','smart']:
+            assert result.returncode!=0 and not (tmp/'smart-running').exists() and not queued.exists()
+            if kind=='port':
+                assert run([bindir/'uci','get','dhcp.@dnsmasq[0].port']).stdout.strip()=='53'
+                run([bindir/'uci','set','dhcp.@dnsmasq[0].port=0']);run([bindir/'uci','commit','dhcp'])
+                run(['sh',transaction,'recover'])
+                assert (tmp/'smart-running').exists() and queued.exists() and (tmp/'dns-running').exists()
+            if kind=='type':assert "list port '0'" in (root/'etc/config/dhcp').read_text()
+            if kind=='smart':assert (tmp/'dns-running').exists() and (tmp/'dns-enabled').exists()
+        else:
+            assert (tmp/'smart-running').exists() and (tmp/'dns-running').exists()
+            assert result.returncode==(0 if kind=='safe' else 1)
+            assert run([bindir/'uci','get','dhcp.@dnsmasq[0].server']).stdout.strip().endswith('127.0.0.1#'+original_port+' /corp.example/10.20.0.53')
+        assert run([bindir/'uci','get','dhcp.lan.dhcp_option']).stdout.split()==['6,192.168.1.1/24','42,192.0.2.8']
+    for kind in ['port','port-logdir','type','pending','smart','firewall','firewall-pending']:restore_case(kind)
+    restore_case('safe','6053','1')
+    print('native recovery admission: passed (port/type/pending preservation, independent dnsmasq, unrelated firewall conflict/pending, legal6053 conditional forwarding)')
     print('native DNS shutdown: passed (K10, queued K82, old active + prepared, native callbacks, options, disable failure, boot refusal, provenance)')
 finally:
     if os.environ.get('TEST_KEEP_SHUTDOWN'):
