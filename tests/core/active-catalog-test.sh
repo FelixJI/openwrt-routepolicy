@@ -17,6 +17,7 @@ fail() {
 
 cat >"$tmp/etc/init.d/smartdns" <<'EOF'
 #!/bin/sh
+[ -z "${TEST_SMARTDNS_LOG:-}" ] || printf '%s\n' "$*" >>"$TEST_SMARTDNS_LOG"
 mkdir -p "$ROUTEPOLICY_ROOT/var/etc/smartdns"
 if [ -f "$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/90-routepolicy.conf" ]; then
 	printf '%s\n' 'conf-file /etc/smartdns/conf.d/90-routepolicy.conf' >"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
@@ -60,6 +61,14 @@ fi
 grep -Fxq new.example "$tmp/tmp/routepolicy/active/domain-policy.list" || fail 'failed apply leaked candidate policy domains'
 grep -Fxq new-default.example "$tmp/tmp/routepolicy/active/domain-default.list" || fail 'failed apply changed default domains'
 [ "$(sed -n '1p' "$tmp/tmp/routepolicy/active/generation")" = "$generation" ] || fail 'failed apply changed active generation'
+
+# A later S95 apply cannot restart DNS rejected by the S94 boot verifier.
+mkdir -p "$tmp/etc/routepolicy/state/init-transaction/current"
+printf 'boot-awaiting-dns\n' >"$tmp/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
+: >"$tmp/smartdns.log"
+TEST_SMARTDNS_LOG="$tmp/smartdns.log" TEST_SMARTDNS_RELOAD_FAIL=1 run_apply >/dev/null
+[ ! -s "$tmp/smartdns.log" ] || fail 'pending DNS boot verification was bypassed by ordinary apply'
+rm "$tmp/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
 
 TEST_NFT_ABSENT=1 TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" TEST_UCI_LOG="$tmp/uci.log" \
 	PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \

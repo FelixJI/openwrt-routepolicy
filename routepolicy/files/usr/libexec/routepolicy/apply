@@ -228,7 +228,7 @@ live_snapshot=
 for object in \
 	'set domain_policy4' 'set domain_default4' 'set static_policy4' 'set static_default4' \
 	'set source_ingress4' 'set source_egress4' \
-	'chain prerouting' 'chain output' 'chain classify' \
+	'chain prerouting' 'chain dns_prerouting' 'chain output' 'chain classify' \
 	'chain source_prerouting' 'chain source_postrouting'; do
 	type=${object%% *}; name=${object#* }
 	nft "list" "$type" inet routepolicy "$name" >/dev/null 2>&1 || incremental=0

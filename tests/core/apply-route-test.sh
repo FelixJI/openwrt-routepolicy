@@ -16,6 +16,7 @@ for object in \
 	'list set inet routepolicy source_ingress4' \
 	'list set inet routepolicy source_egress4' \
 	'list chain inet routepolicy prerouting' \
+	'list chain inet routepolicy dns_prerouting' \
 	'list chain inet routepolicy output' \
 	'list chain inet routepolicy classify' \
 	'list chain inet routepolicy source_prerouting' \

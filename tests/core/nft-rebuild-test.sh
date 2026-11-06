@@ -25,13 +25,15 @@ table inet routepolicy {
 	set source_ingress4 { type ifname . ipv4_addr; flags dynamic,timeout; }
 	set source_egress4 { type ifname . ipv4_addr; flags dynamic,timeout; }
 	chain prerouting { }
+	chain dns_prerouting { type nat hook prerouting priority dstnat; policy accept; }
 	chain output { }
 	chain classify { }
 	chain source_prerouting { }
 	chain source_postrouting { }
 }
 EOF
-nft -f "$RP_NFT_FILE"
+# A pre-NAT-chain table must migrate without replacing live DNS set objects.
+sed '/chain dns_prerouting {/d' "$RP_NFT_FILE" | nft -f -
 nft add element inet routepolicy domain_policy4 '{ 192.0.2.1 timeout 45s, 192.0.2.2 timeout 1s }'
 nft add element inet routepolicy domain_default4 '{ 198.51.100.1 timeout 45s }'
 nft list table inet routepolicy >"$tmp/old.nft"
@@ -44,6 +46,7 @@ nft add element inet routepolicy domain_policy4 '{ 192.0.2.3 timeout 30s }'
 sleep 2
 nft -c -f "$tmp/rebuild.nft"
 nft -f "$tmp/rebuild.nft"
+nft list chain inet routepolicy dns_prerouting | grep -Fq 'type nat hook prerouting priority dstnat'
 nft list set inet routepolicy domain_policy4 >"$tmp/policy"
 grep -Fq '192.0.2.1' "$tmp/policy"
 grep -Fq '192.0.2.3' "$tmp/policy"
@@ -56,6 +59,7 @@ if nft -f "$tmp/rejected.nft" >/dev/null 2>&1; then exit 1; fi
 nft add element inet routepolicy domain_policy4 '{ 192.0.2.4 timeout 30s }'
 rp_nft_rebuild "$tmp/old.nft" "$tmp/restore.nft"
 nft -f "$tmp/restore.nft"
+if nft list chain inet routepolicy dns_prerouting >/dev/null 2>&1; then exit 1; fi
 nft list set inet routepolicy domain_policy4 >"$tmp/policy"
 grep -Fq '192.0.2.3' "$tmp/policy"
 grep -Fq '192.0.2.4' "$tmp/policy"

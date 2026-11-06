@@ -84,6 +84,12 @@ case " $* " in *' commit '*)
 		rm "$TEST_DNS_TMP/kill-stage"; kill -KILL "$PPID"
 	fi ;;
 esac
+case "$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/stage" 2>/dev/null)" in
+	commit:*)
+		if [ "$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/phase")" = applying ] && [ ! -f "$TEST_DNS_TMP/svc/smartdns.absent" ]; then
+			printf 'native SmartDNS writer still registered during candidate commit\n' >&2; exit 1
+		fi ;;
+esac
 EOF
 cat >"$tmp/bin/sync" <<'EOF'
 #!/bin/sh
@@ -121,9 +127,20 @@ case "$2:${3:-}" in
 		service=$(printf '%s' "${4:-}" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
 		[ "$service" != routepolicy-initguard ] || { printf '{"routepolicy-initguard":{"instances":{"guard":{"running":true}}}}'; exit 0; }
 		[ -n "$service" ] || exit 1
+		[ ! -f "$TEST_DNS_TMP/list-fail" ] || exit 1
+		if [ "$service" = smartdns ] && [ -f "$TEST_DNS_TMP/svc/smartdns.absent" ]; then printf '{}\n'; exit 0; fi
 		running=false; [ "$(cat "$TEST_DNS_TMP/svc/$service.running")" != 1 ] || running=true
 		printf '{"%s":{"instances":{"main":{"running":%s}}}}\n' "$service" "$running" ;;
-	service:delete) printf 0 >"$TEST_DNS_TMP/svc/smartdns.running" ;;
+	service:delete)
+		[ ! -f "$TEST_DNS_TMP/delete-fail" ] || exit 1
+		[ ! -f "$TEST_DNS_TMP/svc/smartdns.absent" ] || exit 4
+		printf 0 >"$TEST_DNS_TMP/svc/smartdns.running"
+		: >"$TEST_DNS_TMP/svc/smartdns.absent"
+		if [ -f "$TEST_DNS_TMP/delete-race" ]; then rm "$TEST_DNS_TMP/delete-race"; exit 4; fi
+		if [ -f "$TEST_DNS_TMP/quiesce-fault" ]; then
+			wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+			rm "$TEST_DNS_TMP/quiesce-fault" "$wal/dns-file-new"; mkdir "$wal/dns-file-new"
+		fi ;;
 	network.interface.wan:status|network.interface.wan2:status)
 		device=eth1; [ "$2" != network.interface.wan2 ] || device=eth2
 		printf '{"up":true,"l3_device":"%s","dns-server":["192.0.2.53"],"route":[{"target":"0.0.0.0","nexthop":"198.51.100.1"}]}\n' "$device" ;;
@@ -187,6 +204,8 @@ case "$1" in
 	start|reload) ;;
 	*) exit 1 ;;
 esac
+: >"$TEST_DNS_TMP/native-start-called"
+rm -f "$TEST_DNS_TMP/svc/smartdns.absent"
 enabled=$(uci -q get 'smartdns.@smartdns[0].enabled' || printf 0)
 printf '%s' "$enabled" >"$TEST_DNS_TMP/svc/$service.running"
 [ "$enabled" = 1 ] || exit 0
@@ -239,7 +258,7 @@ canonical() {
 }
 baseline() {
 	rm -rf "$tmp/root/etc/routepolicy" "$tmp/root/tmp/routepolicy" "$tmp/root/etc/smartdns" "$tmp/root/var" "$tmp/svc" "$tmp/external"
-	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log"
+	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called"
 	mkdir -p "$tmp/svc" "$tmp/external" "$tmp/root/etc/smartdns/conf.d" "$tmp/root/proc/sys/kernel/random"
 	printf '100.00 0.00\n' >"$tmp/root/proc/uptime"
 	printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
@@ -269,8 +288,9 @@ restored() {
 }
 # Exercise every enabled/running combination for both pre-existing services.
 matrix_count=0
-if [ "${1:-}" != --boot-smoke ]; then
+if [ "${1:-}" != --boot-smoke ] && [ "${1:-}" != --quiesce-smoke ]; then
 for se in 0 1; do for sr in 0 1; do for de in 0 1; do for dr in 0 1; do
+	case "${1:-}:$se$sr$de$dr" in --recovery-smoke:0000|--recovery-smoke:0111|--recovery-smoke:1001|--recovery-smoke:1110) ;; --recovery-smoke:*) continue ;; esac
 	baseline "$se" "$sr" "$de" "$dr"; prepare
 	"$TX" apply "$token" >/dev/null
 	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = 1100 ]
@@ -278,8 +298,32 @@ for se in 0 1; do for sr in 0 1; do for de in 0 1; do for dr in 0 1; do
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 1 ]
 	"$TX" recover >/dev/null; restored
 	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = "$se$sr$de$dr" ]
+	matrix_count=$((matrix_count+1))
 done; done; done; done
-matrix_count=16
+fi
+baseline 0 0 1 1
+: >"$tmp/delete-fail"
+if init_dns_stop; then exit 1; fi
+rm "$tmp/delete-fail"; : >"$tmp/list-fail"
+if init_dns_stop; then exit 1; fi
+rm "$tmp/list-fail"; : >"$tmp/delete-race"
+init_dns_stop; init_dns_stop
+# Stopping before the first field must restore running state after a later failure.
+baseline 0 1 1 1; prepare; : >"$tmp/quiesce-fault"
+if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+[ "$(find "$tmp/root/etc/routepolicy/state/init-transaction/current/fields" -name attempted | wc -l)" = 0 ]
+restored
+[ "$(cat "$tmp/svc/smartdns.running")" = 1 ]
+# Stopped UCI-disabled service must stay stopped without native start adding old_*.
+baseline 1 0 1 1
+uci set 'smartdns.@smartdns[0].enabled=0'
+for option in old_enabled old_port old_auto_set_dnsmasq; do uci delete "smartdns.@smartdns[0].$option"; done
+uci commit smartdns; canonical smartdns >"$tmp/smartdns.before"
+prepare; : >"$tmp/quiesce-fault"
+if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+restored; [ ! -e "$tmp/native-start-called" ]
+if [ "${1:-}" = --quiesce-smoke ]; then
+	printf '%s\n' 'init DNS quiesce recovery: passed (no field attempted, native metadata absent, stopped UCI-disabled service, NotFound and real errors)'; exit 0
 fi
 baseline 0 0 1 1; prepare; : >"$tmp/query-fail"
 if "$TX" apply "$token" >/dev/null; then printf 'SERVFAIL was accepted\n' >&2; exit 1; fi
@@ -328,6 +372,11 @@ printf 'confirmed-reboot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
 if "$TX" boot-dns >/dev/null; then exit 1; fi
 [ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")" = 00 ]
 rm "$tmp/policy-fail"
+: >"$tmp/query-fail"
+if "$TX" boot-dns >/dev/null; then exit 1; fi
+[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")" = 00 ]
+[ -f "$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending" ]
+rm "$tmp/query-fail"
 "$TX" boot-dns >/dev/null
 [ -f "$tmp/policy-running" ]
 [ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 1100 ]

@@ -218,6 +218,26 @@ init_dns_call() {
 	# The bounded supervisor retains FD9 until the service writer has exited.
 	timeout -k 2 15 sh -c 'exec 9>&-; exec "$1" "$2"' routepolicy-dns-service "$RP_ROOT/etc/init.d/$1" "$2"
 }
+init_dns_present() {
+	local output
+	output=$(timeout 3 ubus call service list '{"name":"smartdns"}') || return 2
+	case "$output" in \{*\}) ;; *) return 2 ;; esac
+	printf '%s\n' "$output" | jsonfilter -e '@' >/dev/null || return 2
+	printf '%s\n' "$output" | jsonfilter -e '@.smartdns' >/dev/null 2>&1
+}
+init_dns_stop() {
+	local result=0 remaining=10 present
+	if init_dns_present; then :; else present=$?; [ "$present" = 1 ] && return 0; return 1; fi
+	timeout -k 2 15 sh -c 'exec 9>&-; exec ubus call service delete "$1"' routepolicy-dns-stop '{"name":"smartdns"}' >/dev/null || result=$?
+	# Only NotFound is benign, and only after an independent successful readback.
+	case "$result" in 0|4) ;; *) return 1 ;; esac
+	while :; do
+		if init_dns_present; then
+			[ "$result" = 0 ] && [ "$remaining" -gt 0 ] || return 1
+		else present=$?; [ "$present" = 1 ] && return 0; return 1; fi
+		sleep 1; remaining=$((remaining-1))
+	done
+}
 init_dns_audit_binds() {
 	local config=$1 depth=$2 port=$3 device=$4 includes include
 	[ "$depth" -lt 16 ] && [ -f "$config" ] || return 1
@@ -275,11 +295,16 @@ init_dns_coordinate() {
 			enabled=$(init_dns_enabled routepolicy) || return 1
 			printf '%s\n' "$enabled" >"$WAL/routepolicy-enabled"
 			;;
-		apply)
+		quiesce)
 			for service in smartdns dnsmasq; do
 				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
 			done
 			[ "$(init_dns_enabled routepolicy)" = "$(cat "$WAL/routepolicy-enabled")" ] || return 1
+			printf '%s' '' >"$WAL/dns-service-attempted" && sync || return 1
+			# Remove native config.reload writers before the first candidate commit.
+			init_dns_stop
+			;;
+		apply)
 			if [ -f "$WAL/dns-file-absent" ]; then [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
 			else cmp -s "$path" "$WAL/dns-file-old" || return 1; fi
 			printf '%s' '' >"$WAL/dns-attempted" && sync || return 1
@@ -292,7 +317,7 @@ init_dns_coordinate() {
 			{
 				init_dns_call dnsmasq stop &&
 				init_dns_call dnsmasq disable &&
-				timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- &&
+				init_dns_stop &&
 				init_dns_call routepolicy enable
 			} >"$WAL/dns-service-result" 2>&1 || return 1
 			remaining=10
@@ -355,8 +380,8 @@ init_dns_coordinate() {
 			done
 			;;
 		rollback)
+			if [ "${recovery_early:-0}" != 1 ] && [ -f "$WAL/dns-service-attempted" ]; then init_dns_stop || return 1; fi
 			[ -f "$WAL/dns-attempted" ] || return 0
-			if [ "${recovery_early:-0}" != 1 ] && [ -f "$WAL/dns-service-attempted" ]; then timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- >/dev/null || return 1; fi
 			temp="$path.init-$(cat "$WAL/token")"
 			[ ! -L "$temp" ] || return 1
 			[ ! -e "$temp" ] || { [ -f "$temp" ] && rm -f "$temp"; } || return 1
@@ -367,7 +392,7 @@ init_dns_coordinate() {
 			else cmp -s "$path" "$WAL/dns-file-old" || return 1; fi
 			;;
 		restore-files|restore-service)
-			[ -f "$WAL/dns-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
+			[ -f "$WAL/dns-attempted" ] || [ -f "$WAL/dns-service-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
 			if [ -f "$WAL/dns90-attempted" ]; then
 				[ ! -L "$RP_SMARTDNS_FILE" ] || return 1
 				if cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-new" || { [ -f "$WAL/dns90-restore" ] && cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-restore"; }; then
@@ -392,10 +417,10 @@ init_dns_coordinate() {
 			elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
 			for service in dnsmasq smartdns; do
 				case "$(cat "$WAL/$service-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
-				init_dns_call "$service" "$enabled" >/dev/null || return 1
+				[ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || init_dns_call "$service" "$enabled" >/dev/null || return 1
 				case "$(cat "$WAL/$service-running")" in 1) running=start ;; 0) running=stop ;; *) return 1 ;; esac
-				if [ "$service:$running" = smartdns:stop ]; then timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- >/dev/null || return 1
-				else init_dns_call "$service" "$running" >/dev/null || return 1; fi
+				if [ "$service:$running" = smartdns:stop ]; then init_dns_stop || return 1
+				elif [ "$(init_dns_service_state "$service")" != "$(cat "$WAL/$service-running")" ]; then init_dns_call "$service" "$running" >/dev/null || return 1; fi
 				[ "$(init_dns_service_state "$service")" = "$(cat "$WAL/$service-running")" ] && [ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || return 1
 			done
 			case "$(cat "$WAL/routepolicy-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac

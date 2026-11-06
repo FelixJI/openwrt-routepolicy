@@ -110,12 +110,12 @@ rp_nft_rebuild() {
 			printf '%s\n' "$nft_schema" | grep -Eq 'flags timeout([ ;]|$)|^[[:space:]]*timeout [1-9][0-9]*(ms|[smhd])' || return 1
 	done
 	: >"$nft_target" || return 1
-	for nft_name in prerouting output classify source_prerouting source_postrouting; do
+	for nft_name in prerouting dns_prerouting output classify source_prerouting source_postrouting; do
 		if nft list chain inet routepolicy "$nft_name" >/dev/null 2>&1; then
 			printf 'flush chain inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
 		fi
 	done
-	for nft_name in prerouting output classify source_prerouting source_postrouting; do
+	for nft_name in prerouting dns_prerouting output classify source_prerouting source_postrouting; do
 		if nft list chain inet routepolicy "$nft_name" >/dev/null 2>&1; then
 			printf 'delete chain inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
 		fi

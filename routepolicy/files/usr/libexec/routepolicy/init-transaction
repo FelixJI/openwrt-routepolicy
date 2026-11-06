@@ -627,7 +627,7 @@ boot_dns_locked() {
 	[ "$(cat "$WAL/dns-boot-pending")" = "$boot_now" ] && init_dns_managed || return 1
 	load_args && uci_layout && no_pending || return 1
 	# S19 may have been queued before S18 quarantined its link; converge explicitly.
-	timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- >/dev/null &&
+	init_dns_stop &&
 		init_dns_call dnsmasq stop && init_dns_call dnsmasq disable || return 1
 	printf '%s\n' boot-policy-runtime >"$WAL/stage" && sync || return 1
 	if ! ROUTEPOLICY_DNS_DEFER=1 ROUTEPOLICY_OUTPUT=text timeout -k 2 30 sh -c 'exec 9>&-; exec "$1"' routepolicy-boot-policy "$LIBEXEC/apply" >"$WAL/policy-result" 2>"$WAL/policy-error" || ! policy_verify_runtime; then
@@ -636,7 +636,7 @@ boot_dns_locked() {
 	rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1 || return 1
 	# The application's /tmp cache starts cold on every boot, after its nft sets exist.
 	init_dns_call smartdns start && init_dns_coordinate verify && init_dns_call smartdns enable || {
-		timeout 15 ubus call service delete '{"name":"smartdns"}' 9>&- >/dev/null || true
+		init_dns_stop || true
 		printf '%s\n' boot-dns-start >"$WAL/failed-stage"; return 1
 	}
 	case "$(cat "$WAL/failed-stage" 2>/dev/null || true)" in boot-*) rm -f "$WAL/failed-stage" ;; esac
@@ -738,7 +738,8 @@ case "$operation" in
 		guard_start || fail '独立 procd 守卫尚未运行；拒绝应用'
 		phase applying || fail '持久化 WAL 失败'
 		failed_stage=
-		link_apply || failed_stage=$(cat "$WAL/stage" 2>/dev/null || printf link-preparation)
+		init_dns_coordinate quiesce || failed_stage=smartdns-quiesce
+		[ -n "$failed_stage" ] || { link_apply || failed_stage=$(cat "$WAL/stage" 2>/dev/null || printf link-preparation); }
 		[ -n "$failed_stage" ] || { smartdns_coordinate apply || failed_stage='smartdns-apply'; }
 		index=0
 		while IFS="$TAB" read -r _action key value; do
