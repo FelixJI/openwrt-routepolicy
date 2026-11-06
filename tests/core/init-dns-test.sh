@@ -6,10 +6,12 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-dns.XXXXXX")
 trap '[ -z "${guard_pid:-}" ] || kill "$guard_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 export TEST_DNS_TMP=$tmp ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 export TEST_DNS_REAL_APPLY="$REAL_LIB/apply"
+export TEST_DNS_REAL_INIT="$ROOT/routepolicy/files/etc/init.d/routepolicy"
 mkdir -p "$tmp/bin" "$tmp/lib" "$tmp/root/etc/config" "$tmp/root/etc/init.d" "$tmp/root/usr/sbin"
 cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$REAL_LIB/init-transaction" "$tmp/lib/"
 cp -R "$REAL_LIB/converters" "$tmp/lib/"
 chmod +x "$tmp/lib/"*
+cp "$ROOT/tests/core/stubs/smartdns-forward.sh" "$tmp/native-forward"
 # The parser must preserve anonymous roots, list ordering, spaces and quotes.
 . "$tmp/lib/common"
 . "$tmp/lib/init-dns"
@@ -266,6 +268,12 @@ case "$1" in
 	start|reload|restart) ;;
 	*) exit 1 ;;
 esac
+if [ "$1" = restart ]; then
+	. "$TEST_DNS_TMP/native-forward"
+	config_get() { value=$(uci -q get "smartdns.$2.$3" || printf '%s' "${4:-}"); export "$1=$value"; }
+	config_get_bool() { config_get "$@"; }
+	DO_RELOAD=0; set +e; unload_service '@smartdns[0]'; set -e
+fi
 : >"$TEST_DNS_TMP/native-start-called"
 rm -f "$TEST_DNS_TMP/svc/smartdns.absent"
 enabled=$(uci -q get 'smartdns.@smartdns[0].enabled' || printf 0)
@@ -278,6 +286,10 @@ if [ "$port" = 53 ]; then
 	set_main_dns
 fi
 auto=$(uci -q get 'smartdns.@smartdns[0].auto_set_dnsmasq' || printf 1)
+if [ "$port" != 53 ] && [ "$auto" = 1 ]; then
+	. "$TEST_DNS_TMP/native-forward"
+	set +e; set_forward_dnsmasq "$port"; set -e
+fi
 uci set "smartdns.@smartdns[0].old_enabled=$enabled"
 uci set "smartdns.@smartdns[0].old_port=$port"
 uci set "smartdns.@smartdns[0].old_auto_set_dnsmasq=$auto"
@@ -316,8 +328,27 @@ case "$1" in
 	*) exit 1 ;;
 esac
 EOF
-cp "$tmp/root/etc/init.d/dnsmasq" "$tmp/root/etc/init.d/routepolicy"
-sed -i 's/dnsmasq/routepolicy/g' "$tmp/root/etc/init.d/routepolicy"
+cat >"$tmp/root/etc/init.d/routepolicy" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'routepolicy %s\n' "$*" >>"$TEST_DNS_TMP/service-log"
+case "$1" in
+	enabled) [ "$(cat "$TEST_DNS_TMP/svc/routepolicy.enabled")" = 1 ]; exit ;;
+	enable) printf 1 >"$TEST_DNS_TMP/svc/routepolicy.enabled"; exit ;;
+	disable) printf 0 >"$TEST_DNS_TMP/svc/routepolicy.enabled"; exit ;;
+	start) shift ;;
+	*) exit 1 ;;
+esac
+[ ! -f "$TEST_DNS_TMP/watch-fail" ] || exit 1
+ROUTEPOLICY_INIT_TRANSACTION="$ROUTEPOLICY_LIBEXEC/init-transaction"
+. "$TEST_DNS_REAL_INIT"
+config_load() { :; }
+config_get_bool() { enabled=$(uci -q get routepolicy.main.enabled); }
+procd_open_instance() { :; }
+procd_set_param() { printf '%s\n' "$*" >>"$TEST_DNS_TMP/watch-registration"; }
+procd_close_instance() { printf 1 >"$TEST_DNS_TMP/svc/routepolicy.running"; }
+start_service "$@"
+EOF
 for service in network firewall odhcpd routepolicy-initguard routepolicy-prerecover; do printf '#!/bin/sh\nexit 0\n' >"$tmp/root/etc/init.d/$service"; done
 cat >"$tmp/root/etc/init.d/network" <<'EOF'
 #!/bin/sh
@@ -336,7 +367,7 @@ canonical() {
 }
 baseline() {
 	rm -rf "$tmp/root/etc/routepolicy" "$tmp/root/tmp/routepolicy" "$tmp/root/etc/smartdns" "$tmp/root/var" "$tmp/svc" "$tmp/external"
-	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called" "$tmp/stale-dnsmasq" "$tmp/kill-confirm" "$tmp/kill-policy"
+	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called" "$tmp/stale-dnsmasq" "$tmp/kill-confirm" "$tmp/kill-policy" "$tmp/watch-fail" "$tmp/watch-registration"
 	mkdir -p "$tmp/svc" "$tmp/external" "$tmp/root/etc/smartdns/conf.d" "$tmp/root/proc/sys/kernel/random"
 	printf '100.00 0.00\n' >"$tmp/root/proc/uptime"
 	printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
@@ -365,6 +396,102 @@ restored() {
 	[ "$(cat "$tmp/root/etc/smartdns/user.cache")" = USER-CACHE ]
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 0 ]
 }
+prepare_dns() {
+	output=$("$TX" prepare lan wan wan2 - - - - - - - - "$1" 198.51.100.53)
+	token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+	[ "${#token}" = 32 ]
+}
+confirm_dns() { "$TX" apply "$token" >/dev/null; SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null; }
+# Surplus servers remain owned by the original applied source, after active shrinks.
+baseline 0 0 1 1
+prepare_dns 192.0.2.53,192.0.2.54; confirm_dns
+uci set 'smartdns.rp_init_default_2.user_note=Keep this surplus'; uci commit smartdns
+prepare_dns 192.0.2.53; confirm_dns
+[ "$(uci -q get smartdns.rp_init_default_2.enabled)" = 0 ]
+canonical smartdns >"$tmp/repeated-before"
+prepare_dns 192.0.2.53
+canonical smartdns >"$tmp/repeated-after"; cmp "$tmp/repeated-before" "$tmp/repeated-after"
+confirm_dns
+[ "$(uci -q get smartdns.rp_init_default_2.user_note)" = 'Keep this surplus' ]
+baseline 0 0 1 1
+prepare_dns 192.0.2.53; confirm_dns
+prepare_dns 192.0.2.53,192.0.2.54; confirm_dns
+prepare_dns 192.0.2.53; confirm_dns
+prepare_dns 192.0.2.53; confirm_dns
+[ "$(uci -q get smartdns.rp_init_default_2.enabled)" = 0 ]
+baseline 0 0 1 1; prepare
+uci set smartdns.rp_init_default_1=server; uci set smartdns.rp_init_default_1.routepolicy_init=1
+uci set smartdns.rp_init_default_1.user_note=USER; uci commit smartdns
+canonical smartdns >"$tmp/preview-before"
+if prepare >"$tmp/preview-error" 2>&1; then printf 'preview claimed uncommitted DNS server\n' >&2; exit 1; fi
+canonical smartdns >"$tmp/preview-after"; cmp "$tmp/preview-before" "$tmp/preview-after"
+printf '%s\n' 'init DNS source ownership: passed (2 -> 1 -> 1 and 1 -> 2 -> 1 -> 1, applied source/active, preview rejection, unknown fields)'
+
+# Confirmation registers the real init script watcher under its inherited gate.
+baseline 0 0 1 1; prepare
+if "$tmp/root/etc/init.d/routepolicy" start init-confirmed >"$tmp/watch-rejected" 2>&1; then exit 1; fi
+if ROUTEPOLICY_WRITER_KIND=init ROUTEPOLICY_WRITER_OWNER="$$:1" "$tmp/root/etc/init.d/routepolicy" start init-confirmed >"$tmp/watch-rejected" 2>&1; then exit 1; fi
+if ROUTEPOLICY_WRITER_KIND=init ROUTEPOLICY_WRITER_OWNER="$$:$(rp_process_start "$$")" "$tmp/root/etc/init.d/routepolicy" start init-confirmed >"$tmp/watch-rejected" 2>&1; then exit 1; fi
+"$TX" apply "$token" >/dev/null
+[ "$(cat "$tmp/svc/routepolicy.running")" = 0 ]
+if "$tmp/root/etc/init.d/routepolicy" start init-confirmed >"$tmp/watch-rejected" 2>&1; then exit 1; fi
+if sh -c '. "$ROUTEPOLICY_LIBEXEC/common"; rp_writer_enter init || exit 1; exec "$ROUTEPOLICY_ROOT/etc/init.d/routepolicy" start init-confirmed' >"$tmp/watch-rejected" 2>&1; then exit 1; fi
+: >"$tmp/watch-fail"
+if SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >"$tmp/watch-error" 2>&1; then exit 1; fi
+grep -Fq '确认已保存' "$tmp/watch-error"
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = confirmed ]
+[ "$(cat "$tmp/svc/routepolicy.running")" = 0 ]
+if "$TX" recover >"$tmp/watch-recovery-error" 2>&1; then exit 1; fi
+grep -Fq '确认已保存' "$tmp/watch-recovery-error"
+rm "$tmp/watch-fail"
+"$TX" recover >/dev/null
+[ "$(cat "$tmp/svc/routepolicy.running")" = 1 ]
+grep -Fxq 'command /usr/libexec/routepolicy/watch' "$tmp/watch-registration"
+"$TX" confirm "$token" >/dev/null
+[ "$(grep -c '^command ' "$tmp/watch-registration")" = 1 ]
+mkdir -p "$tmp/watch-lib"
+cp "$REAL_LIB/common" "$tmp/watch-lib/common"
+cat >"$tmp/watch-lib/update" <<'EOF'
+#!/bin/sh
+set -eu
+[ -z "${ROUTEPOLICY_WRITER_OWNER:-}" ] && [ ! -e "/proc/$$/fd/9" ]
+. "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_enter update
+printf updated >"$TEST_DNS_TMP/watch-updated"
+EOF
+chmod +x "$tmp/watch-lib/update"
+uci set routepolicy.main.auto_update=1; uci set routepolicy.main.update_hour=0; uci set routepolicy.main.update_minute=0; uci commit routepolicy
+watch_result=0
+(unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND; exec 9>&-; ROUTEPOLICY_LIBEXEC="$tmp/watch-lib" timeout -k 1 2 "$REAL_LIB/watch") || watch_result=$?
+[ "$watch_result" = 124 ] && [ "$(cat "$tmp/watch-updated")" = updated ]
+printf 'watch-new-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+printf 0 >"$tmp/svc/routepolicy.running"
+"$TX" confirm "$token" >/dev/null
+[ "$(cat "$tmp/svc/routepolicy.running")" = 0 ]
+printf '%s\n' 'init DNS confirmation watcher: passed (pending/forged caller rejection, durable failure, retry, idempotent real init registration)'
+
+# A native restart really deletes conditional forwarding; rollback must only start.
+baseline 1 1 1 1
+uci set 'smartdns.@smartdns[0].auto_set_dnsmasq=1'; uci set 'smartdns.@smartdns[0].old_auto_set_dnsmasq=1'; uci commit smartdns
+uci delete 'dhcp.@dnsmasq[0].server'
+uci add_list 'dhcp.@dnsmasq[0].server=127.0.0.1#6053'
+uci add_list 'dhcp.@dnsmasq[0].server=/corp.example/10.20.0.53'
+uci set 'dhcp.@dnsmasq[0].noresolv=1'; uci set 'dhcp.@dnsmasq[0].rebind_protection=0'; uci set 'dhcp.@dnsmasq[0].domainneeded=0'; uci commit dhcp
+cp "$tmp/root/etc/config/dhcp" "$tmp/native-dhcp-before"
+"$tmp/root/etc/init.d/smartdns" restart
+[ "$(uci -q get 'dhcp.@dnsmasq[0].server')" = '127.0.0.1#6053' ]
+cp "$tmp/native-dhcp-before" "$tmp/root/etc/config/dhcp"
+for package in dhcp smartdns; do canonical "$package" >"$tmp/$package.before"; done
+prepare; : >"$tmp/query-fail"; : >"$tmp/service-log"
+if "$TX" apply "$token" >"$tmp/native-rollback-error" 2>&1; then exit 1; fi
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = rolled_back ]
+restored
+[ "$(uci -q get 'dhcp.@dnsmasq[0].server')" = '127.0.0.1#6053 /corp.example/10.20.0.53' ]
+[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 1111 ]
+grep -Fxq 'smartdns start' "$tmp/service-log"
+if grep -Eq '^smartdns (stop|restart)$' "$tmp/service-log"; then exit 1; fi
+printf '%s\n' 'init DNS native forwarding rollback: passed (real destructive callback control, full DHCP/SmartDNS preservation, original enabled/running)'
+if [ "${1:-}" = --review-fixes ]; then exit 0; fi
 # A discarded preview cannot authorize a later, ordinary user resource.
 printer_rule() {
 	uci set firewall.rp_init_dns=rule

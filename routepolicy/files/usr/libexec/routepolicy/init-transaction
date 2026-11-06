@@ -885,7 +885,12 @@ case "$operation" in
 		;;
 	confirm)
 		lock; check_token "$@"
-		[ "$(read_phase)" != confirmed ] || { status_json; exit 0; }
+		if [ "$(read_phase)" = confirmed ]; then
+			if transaction_same_boot && ! rp_dns_boot_pending; then
+				init_dns_coordinate confirm || fail '确认已保存，但 watcher 启动或缓存清理失败；请重试确认'
+			fi
+			status_json; exit 0
+		fi
 		[ "$(read_phase)" = pending ] || fail '事务不在待确认阶段'
 		if ! transaction_same_boot; then
 			rollback_fields || fail '不能确认上次启动的事务；恢复有冲突，需人工处理'
@@ -905,11 +910,16 @@ case "$operation" in
 		policy_verify_runtime || fail 'RoutePolicy 实际出站策略表与选定角色不一致'
 		if init_dns_owned; then phase confirming && active_publish || fail '确认提升尚未完成；保留记录供恢复收敛'
 		else phase confirmed || fail '不能持久化确认状态'; fi
-		init_dns_coordinate confirm || fail '确认已保存，但应用临时缓存清理失败'
+		init_dns_coordinate confirm || fail '确认已保存，但 watcher 启动或缓存清理失败；请重试确认'
 		if rp_writer_event_pending; then rp_writer_event_wake; fi
 		status_json
 		;;
 	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
+	watch-ready)
+		[ "$#" = 0 ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned &&
+			[ "$(read_phase)" = confirmed ] && transaction_same_boot && ! rp_dns_boot_pending && init_dns_managed &&
+			[ "$(rp_init_active_record)" = "$TX/confirmed-$(cat "$WAL/token")" ] || exit 1
+		;;
 	boot-pending) [ "$#" -eq 0 ] || exit 1; rp_dns_boot_pending ;;
 	guard-needed)
 		rp_dns_boot_pending && exit 0
@@ -945,6 +955,9 @@ case "$operation" in
 		if [ "$operation" = recover-auto ]; then
 			recover_auto_locked || fail '自动恢复有冲突；已保留未知配置与 WAL'
 		else recover_locked || fail '恢复有冲突；已保留未知配置与 WAL'; fi
+		if [ "$operation" != recover-startup ] && [ "$(read_phase)" = confirmed ] && transaction_same_boot && ! rp_dns_boot_pending; then
+			init_dns_coordinate confirm || fail '确认已保存，但 watcher 启动或缓存清理失败；请重试恢复'
+		fi
 		if rp_writer_event_pending; then rp_writer_event_wake; fi
 		status_json
 		;;

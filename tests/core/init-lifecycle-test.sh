@@ -16,6 +16,7 @@ chmod +x "$tmp/routepolicyctl"
 cat >"$tmp/init-transaction" <<'EOF'
 #!/bin/sh
 if [ "$1" = boot-pending ]; then [ "${TEST_BOOT_PENDING:-0}" = 1 ]; exit; fi
+if [ "$1" = watch-ready ]; then [ "${TEST_WATCH_READY:-0}" = 1 ]; exit; fi
 [ "$1" = recover-startup ] || exit 1
 printf '%s\n' "$1" >>"$TEST_RECOVERY_LOG"
 [ "${TEST_RECOVERY_FAIL:-0}" != 1 ]
@@ -42,7 +43,7 @@ run_start() (
 	procd_open_instance() { printf '%s\n' open >>"$TEST_LIFECYCLE_LOG"; }
 	procd_set_param() { printf '%s\n' "$*" >>"$TEST_LIFECYCLE_LOG"; }
 	procd_close_instance() { printf '%s\n' close >>"$TEST_LIFECYCLE_LOG"; }
-	start_service
+	start_service "${2:-}"
 )
 
 : >"$tmp/lifecycle.log"
@@ -87,5 +88,11 @@ grep -Fxq recover-startup "$tmp/recovery.log"
 TEST_BOOT_PENDING=1 run_start 1 >/dev/null
 if grep -Fxq apply "$tmp/lifecycle.log"; then printf 'S95 bypassed boot coordinator\n' >&2; exit 1; fi
 grep -Fxq "command $tmp/watch" "$tmp/lifecycle.log"
+
+if run_start 1 init-confirmed >/dev/null 2>&1; then printf 'unowned watcher admission accepted\n' >&2; exit 1; fi
+: >"$tmp/lifecycle.log"; : >"$tmp/recovery.log"
+TEST_WATCH_READY=1 run_start 1 init-confirmed >/dev/null
+grep -Fxq "command $tmp/watch" "$tmp/lifecycle.log"
+if grep -Fxq apply "$tmp/lifecycle.log" || [ -s "$tmp/recovery.log" ]; then printf 'confirmation repeated recovery/apply\n' >&2; exit 1; fi
 
 printf '%s\n' 'init lifecycle tests: passed'

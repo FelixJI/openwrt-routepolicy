@@ -202,6 +202,9 @@ init_dns_plan() {
 			index=$((index+1)); section="rp_init_${role}_$index"
 			if [ "$(get "smartdns.$section.routepolicy_init")" = 1 ]; then
 				init_dns_server_owned "$section" || fail "SmartDNS 保留段缺少本应用来源记录: $section"
+				# Retain applied ownership in active when a later input removes this server.
+				set_value "smartdns.$section" server
+				set_value "smartdns.$section.routepolicy_init" 1
 				set_value "smartdns.$section.enabled" 0
 			fi
 		done
@@ -355,19 +358,12 @@ $includes
 EOF
 }
 init_dns_server_owned() {
-	local section=$1 record journal
+	local section=$1
 	case "$section" in rp_init_default_[1-4]|rp_init_policy_[1-4]) ;; *) return 1 ;; esac
+	[ "$(uci -q get "smartdns.$section")" = server ] || return 1
 	[ "$(uci -q get "smartdns.$section.routepolicy_init")" = 1 ] || return 1
-	record=$(rp_init_active_record 2>/dev/null) || record=
-	for journal in "${WAL:-$RP_STATE_DIR/init-transaction/current}" "$record"; do
-		[ -n "$journal" ] || continue
-		case "$(cat "$journal/phase" 2>/dev/null)" in applying|pending|confirming|confirmed) ;; *) continue ;; esac
-		[ -f "$journal/candidate" ] && awk -F '\t' -v key="smartdns.$section" '
-			$1=="set"&&$2==key&&$3=="server"{server=1}
-			$1=="set"&&$2==key ".routepolicy_init"&&$3=="1"{owned=1}
-			END{exit !server||!owned}' "$journal/candidate" && return 0
-	done
-	return 1
+	rp_init_section_owned "smartdns.$section" server &&
+		rp_init_section_owned "smartdns.$section.routepolicy_init" 1
 }
 init_dns_audit_uci_line() {
 	local key=$1 optional=${2:-0} value clean newline='
@@ -620,6 +616,9 @@ init_dns_coordinate() {
 				[ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || init_dns_call "$service" "$enabled" >/dev/null || return 1
 				case "$(cat "$WAL/$service-running")" in 1) running=start ;; 0) running=stop ;; *) return 1 ;; esac
 				if [ "$service:$running" = smartdns:stop ]; then init_dns_stop || return 1
+				elif [ "$service" = smartdns ]; then
+					# ubus delete already quiesced SmartDNS; native stop deletes user forwarding lists.
+					init_dns_call smartdns start >/dev/null || return 1
 				elif [ "$running" = start ] && [ -f "$WAL/dns-attempted" ]; then
 					init_dns_call "$service" restart >/dev/null || return 1
 				elif [ "$(init_dns_service_state "$service")" != "$(cat "$WAL/$service-running")" ]; then init_dns_call "$service" "$running" >/dev/null || return 1; fi
@@ -644,7 +643,16 @@ init_dns_coordinate() {
 			;;
 		confirm)
 			temp="$cache.init-$(cat "$WAL/token")"
-			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } && rm -f "$temp"
+			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } && rm -f "$temp" || return 1
+			if [ "$(init_dns_service_state routepolicy)" != 1 ]; then
+				# This watch-only start inherits the gate; procd creates the worker separately.
+				timeout -k 2 15 "$RP_ROOT/etc/init.d/routepolicy" start init-confirmed >"$WAL/watch-result" 2>&1 || return 1
+			fi
+			remaining=10
+			until [ "$(init_dns_service_state routepolicy)" = 1 ]; do
+				[ "$remaining" -gt 0 ] || return 1
+				sleep 1; remaining=$((remaining-1))
+			done
 			;;
 		*) return 1 ;;
 	esac

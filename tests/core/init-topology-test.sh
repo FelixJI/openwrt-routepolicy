@@ -35,6 +35,7 @@ case "$*" in
 	'call network.device status') echo '{"eth3":{"present":true}}' ;;
 	'call service list') echo services ;;
 	'call service list {"name":"smartdns"}') echo '{"smartdns":{"instances":{"main":{"running":false}}}}' ;;
+	'call service list {"name":"dnsmasq"}') echo '{"dnsmasq":{}}' ;;
 	*) exit 1 ;;
 esac
 EOF
@@ -58,7 +59,9 @@ case "$data:$2" in
 	'wan:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_GATEWAY:-10.1.0.1}" ;;
 	'policy:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_POLICY_GATEWAY:-10.2.0.1}" ;;
 	'new_policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.3.0.1 ;;
-	'services:@dnsmasq.instances.*.running'|'services:@.dnsmasq.instances.*.running'|'services:@.dropbear.instances.*.running'|'services:@.odhcpd.instances.*.running') [ "${TEST_SERVICE_DOWN:-0}" != 1 ] && echo true || echo false ;;
+	*:'@dnsmasq.instances.*.running'|*:'@.dnsmasq.instances.*.running')
+		if [ "${TEST_SERVICE_DOWN:-0}" = 1 ] || awk -F '\t' '$1~/^dhcp\.[^.]+\.disabled$/&&$2==1{found=1}END{exit !found}' "$TEST_TOPOLOGY_DIR/config"; then echo false; else echo true; fi ;;
+	'services:@.dropbear.instances.*.running'|'services:@.odhcpd.instances.*.running') [ "${TEST_SERVICE_DOWN:-0}" != 1 ] && echo true || echo false ;;
 	*:'@.interface[*].l3_device') [ -z "${TEST_DYNAMIC_CLAIM:-}" ] || echo "$TEST_DYNAMIC_CLAIM" ;;
 	*:'@.interface[*].device') : ;;
 	*:'@.interface') echo '[]' ;;
@@ -267,7 +270,7 @@ apply_mock_plan() {
 	mock_index=0
 	while IFS="$(printf '\t')" read -r mock_action mock_key mock_value; do
 		mock_index=$((mock_index+1))
-		case "$mock_action:$mock_key" in set:*.*.*|delete:*|list:*) continue ;; esac
+		[ "$mock_action" = set ] || continue
 		mock_entry="$mock_wal/fields/$mock_index"; mkdir -p "$mock_entry"
 		printf '%s' "$mock_key" >"$mock_entry/key"; printf '%s' "$mock_value" >"$mock_entry/expected"
 		printf scalar >"$mock_entry/expected-type"; : >"$mock_entry/attempted"
