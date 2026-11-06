@@ -11,12 +11,55 @@ cp -R "$REAL_LIB/converters" "$tmp/lib/"
 chmod +x "$tmp/lib/"*
 # The parser must preserve anonymous roots, list ordering, spaces and quotes.
 . "$tmp/lib/common"
+. "$tmp/lib/init-dns"
 printf "config smartdns\n\tlist conf_files '/etc/one'\n\tlist conf_files 'two words'\n" >"$tmp/list.uci"
 [ "$(rp_uci_field_data '@smartdns[0]' conf_files <"$tmp/list.uci")" = "$(printf 'list\t/etc/one|two words')" ]
 printf "config smartdns 'root'\n\toption label 'can'\\\\''t'\n" >"$tmp/quote.uci"
 [ "$(rp_uci_field_data root label <"$tmp/quote.uci")" = "$(printf "scalar\tcan't")" ]
 printf "config smartdns\n\tlist conf_files 'ambiguous|value'\n" >"$tmp/bad.uci"
 if rp_uci_field_data '@smartdns[0]' conf_files <"$tmp/bad.uci"; then exit 1; fi
+
+# Refuse only native cache/cron side effects; do not edit either user resource.
+get() { awk -F '\t' -v key="$1" '$1==key{value=$2;found=1}END{if(found)print value}' "$tmp/native-options"; }
+fail() { rp_err "$*"; exit 1; }
+native_reject() {
+	if (init_dns_native_side_effects main "$1") >"$tmp/native-rejected" 2>&1; then exit 1; fi
+	grep -Fq "$2" "$tmp/native-rejected"
+}
+: >"$tmp/native-options"
+init_dns_native_side_effects main 1
+mkdir -p "$tmp/root/etc/smartdns" "$tmp/root/etc/crontabs"
+printf USER-CACHE >"$tmp/root/etc/smartdns/smartdns.cache"
+native_reject 1 '原生回滚启动会删除'
+init_dns_native_side_effects main 0
+printf 'smartdns.main.cache_file\t/etc/smartdns/custom.cache\n' >"$tmp/native-options"
+printf CUSTOM-CACHE >"$tmp/root/etc/smartdns/custom.cache"
+for value in 0 off false no disabled invalid; do
+	printf 'smartdns.main.cache_persist\t%s\n' "$value" >>"$tmp/native-options"
+	native_reject 1 '原生回滚启动会删除'
+done
+for value in 1 on true yes enabled; do
+	printf 'smartdns.main.cache_persist\t%s\n' "$value" >"$tmp/native-options"
+	init_dns_native_side_effects main 1
+	printf 'smartdns.main.enable_auto_update\t%s\n' "$value" >>"$tmp/native-options"
+	native_reject 0 'enable_auto_update 已开启'
+done
+: >"$tmp/native-options"
+for line in '0 5 * * * /etc/init.d/smartdns updatefiles' '# old /etc/initXd/smartdns updatefiles --unused'; do
+	printf '%s\n' "$line" >"$tmp/root/etc/crontabs/root"
+	cp "$tmp/root/etc/crontabs/root" "$tmp/cron-before"
+	native_reject 0 '原生 SmartDNS 自动更新匹配项'
+	cmp "$tmp/cron-before" "$tmp/root/etc/crontabs/root"
+done
+printf '0 5 * * * /usr/bin/other-update\n# smartdns updatefiles\n' >"$tmp/root/etc/crontabs/root"
+cp "$tmp/root/etc/crontabs/root" "$tmp/cron-before"
+init_dns_native_side_effects main 0
+cmp "$tmp/cron-before" "$tmp/root/etc/crontabs/root"
+[ "$(cat "$tmp/root/etc/smartdns/smartdns.cache")" = USER-CACHE ]
+[ "$(cat "$tmp/root/etc/smartdns/custom.cache")" = CUSTOM-CACHE ]
+rm -f "$tmp/root/etc/smartdns/smartdns.cache" "$tmp/root/etc/smartdns/custom.cache" "$tmp/root/etc/crontabs/root"
+printf '%s\n' 'init DNS native cache/cron preflight: passed'
+if [ "${1:-}" = --native-side-effects ]; then exit 0; fi
 
 if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
 	cat >"$tmp/bin/native-uci" <<'EOF'

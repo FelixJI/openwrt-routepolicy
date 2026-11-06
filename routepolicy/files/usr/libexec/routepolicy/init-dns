@@ -68,6 +68,33 @@ init_ipv4_plan() {
 	done
 }
 
+init_dns_native_side_effects() {
+	local root=$1 running=$2 cache cron="$RP_ROOT/etc/crontabs/root" result
+	# Match native config_get_bool(..., 0), including its accepted true aliases.
+	case "$(get "smartdns.$root.cache_persist")" in
+		1|on|true|yes|enabled) ;;
+		*)
+			if [ "$running" = 1 ]; then
+				cache=$(get "smartdns.$root.cache_file"); cache=${cache:-/etc/smartdns/smartdns.cache}
+				case "$cache" in /*) ;; *) fail '原 SmartDNS cache_file 是相对路径，无法证明回滚重启不会删除旧缓存' ;; esac
+				[ ! -f "$RP_ROOT$cache" ] || fail "原 SmartDNS cache_persist 关闭且旧缓存存在: $cache；原生回滚启动会删除它，请先手工处理"
+			fi ;;
+	esac
+	case "$(get "smartdns.$root.enable_auto_update")" in
+		1|on|true|yes|enabled) fail 'SmartDNS enable_auto_update 已开启，原生启动可能改写 root crontab；请先关闭自动更新并检查定时项' ;;
+	esac
+	if [ -e "$cron" ] || [ -L "$cron" ]; then
+		[ -f "$cron" ] && [ -r "$cron" ] || fail '无法安全读取 root crontab 以检查 SmartDNS 原生副作用'
+		# Deliberately use native grep's BRE, including commented matches and dots.
+		result=0; grep -q '/etc/init.d/smartdns updatefiles' "$cron" || result=$?
+		case "$result" in
+			0) fail 'root crontab 有原生 SmartDNS 自动更新匹配项（含注释）；原生启动会删除/改写它，请先手工处理' ;;
+			1) ;;
+			*) fail '读取 root crontab 失败，无法证明原生启动不会修改定时项' ;;
+		esac
+	fi
+}
+
 init_dns_plan() {
 	local roots root dnsmasq port role logical device values item index section group previous data files
 	rp_have dig || fail 'DNS 验证依赖缺失: dig'
@@ -81,6 +108,7 @@ init_dns_plan() {
 	[ "$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')" = 1 ] || fail '需要唯一 dnsmasq 实例；多实例请先明确接入归属'
 	dnsmasq=$roots
 	previous=$(init_dns_service_state smartdns) || fail '无法读取 SmartDNS 原运行状态'
+	init_dns_native_side_effects "$root" "$previous"
 	if [ "$previous" = 1 ]; then
 		for item in port enabled auto_set_dnsmasq; do
 			previous=$(get "smartdns.$root.$item")

@@ -50,7 +50,7 @@ cat >"$tmp/bin/nft" <<'EOF'
 case "$*" in
 	'list table inet routepolicy') echo 'table inet routepolicy { }' ;;
 	'list set inet routepolicy domain_policy4'|'list set inet routepolicy domain_default4')
-		printf 'set x {\n}\n' ;;
+		printf 'set %s {\n type ipv4_addr\n flags timeout\n}\n' "$5" ;;
 	'list set inet routepolicy '*|'list chain inet routepolicy '*) exit 0 ;;
 	'-c -f '*|'-f '*) exit 0 ;;
 	*) exit 1 ;;
