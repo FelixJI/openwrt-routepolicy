@@ -540,7 +540,7 @@ EOF
 				case "$unpublished" in "$tmp/root/etc/routepolicy/managed.d/candidate."*) ;; *) printf 'unexpected timeout artifact\n' >&2; exit 1 ;; esac
 				[ -d "$unpublished" ] && [ ! -L "$unpublished" ] && [ "$(stat -c %a "$unpublished")" = 700 ] && [ -z "$(find "$unpublished" -mindepth 1)" ]
 				grep -Fxq old.example "$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
-				rp_sources_ready
+				(export LIBEXEC="$REAL_LIB"; rp_sources_ready)
 				printf '%s\n' 'source timeout artifact: one private empty unpublished candidate; current/previous remain authoritative'
 			else diff -r "$tmp/managed-$source_case" "$tmp/root/etc/routepolicy/managed.d"; fi
 			restored
