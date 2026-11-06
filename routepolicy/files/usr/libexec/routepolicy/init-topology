@@ -917,7 +917,7 @@ live_rule() {
 }
 
 verify() {
-	local section service services listener setting action key expected nft_snapshot
+	local section services listener setting action key expected nft_snapshot
 	emit_plan | while IFS="$(printf '\t')" read -r action key expected; do
 		if [ "$action" = delete ]; then
 			! uci -q get "$key" >/dev/null 2>&1 || fail "configuration differs from candidate: $key"
@@ -964,10 +964,9 @@ verify() {
 	if [ "$(get "network.$default_if.proto")" = dhcp ]; then live_rule "input_$default_zone" '!fw4: routepolicy-init-default_dhcp_client' 'meta nfproto 2 udp sport 67 udp dport 68 counter accept'; fi
 	if [ "$(get "network.$policy.proto")" = dhcp ]; then live_rule "input_$policy_zone" '!fw4: routepolicy-init-policy_dhcp_client' 'meta nfproto 2 udp sport 67 udp dport 68 counter accept'; fi
 	services=$(ubus call service list) || fail 'service runtime evidence unavailable'
-	for service in odhcpd dropbear; do
-		[ "$service" != odhcpd ] || [ -x "$RP_ROOT/etc/init.d/odhcpd" ] || continue
-		[ "$(field "$services" "@.$service.instances.*.running" | sort -u)" = true ] || fail "service not running or evidence missing: $service"
-	done
+	field "$services" '@' >/dev/null || fail 'service runtime evidence is invalid JSON'
+	# LAN protocol disablement is verified above; global odhcpd may legitimately be stopped.
+	[ "$(field "$services" '@.dropbear.instances.*.running' | sort -u)" = true ] || fail 'service not running or evidence missing: dropbear'
 	listener=$(netstat -lnptu) || fail 'DNS listener evidence unavailable'
 	printf '%s\n' "$listener" | awk -v ip="$access_ip:53" '
 		$4==ip||$4=="0.0.0.0:53" {

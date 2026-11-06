@@ -33,7 +33,9 @@ case "$*" in
 	'call network.interface.rp_init_default status') echo new_policy ;;
 	'call network.interface dump') echo '{"interface":[{"interface":"lan","proto":"static"}]}' ;;
 	'call network.device status') echo '{"eth3":{"present":true}}' ;;
-	'call service list') echo services ;;
+	'call service list')
+		[ "${TEST_UBUS_SERVICE_FAIL:-0}" != 1 ] || exit 1
+		printf '%s\n' "${TEST_SERVICE_JSON:-services}" ;;
 	'call service list {"name":"smartdns"}') echo '{"smartdns":{"instances":{"main":{"running":false}}}}' ;;
 	'call service list {"name":"dnsmasq"}') echo '{"dnsmasq":{}}' ;;
 	*) exit 1 ;;
@@ -42,7 +44,13 @@ EOF
 cat >"$tmp/bin/jsonfilter" <<'EOF'
 #!/bin/sh
 read -r data
+if [ -n "${TEST_SERVICE_JSON:-}" ] && [ "$data" = "$TEST_SERVICE_JSON" ] && [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+	printf '%s\n' "$data" | "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/usr/bin/jsonfilter" "$@"
+	exit $?
+fi
 case "$data:$2" in
+	'{"dropbear":':*) exit 1 ;;
+	'services:@') echo '{}' ;;
 	*:'@.up') echo true ;;
 	*:'@["dns-server"][*]') [ "${TEST_NO_UPSTREAM:-0}" = 1 ] || echo 192.0.2.53 ;;
 	'lan:@.l3_device') echo br-lan ;;
@@ -61,7 +69,11 @@ case "$data:$2" in
 	'new_policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.3.0.1 ;;
 	*:'@dnsmasq.instances.*.running'|*:'@.dnsmasq.instances.*.running')
 		if [ "${TEST_SERVICE_DOWN:-0}" = 1 ] || awk -F '\t' '$1~/^dhcp\.[^.]+\.disabled$/&&$2==1{found=1}END{exit !found}' "$TEST_TOPOLOGY_DIR/config"; then echo false; else echo true; fi ;;
-	'services:@.dropbear.instances.*.running'|'services:@.odhcpd.instances.*.running') [ "${TEST_SERVICE_DOWN:-0}" != 1 ] && echo true || echo false ;;
+	'services:@.dropbear.instances.*.running')
+		if [ "${TEST_SERVICE_DOWN:-0}" = 1 ]; then echo false
+		elif [ "${TEST_DROPBEAR_STATE:-true}" != missing ]; then echo "${TEST_DROPBEAR_STATE:-true}"; fi ;;
+	'services:@.odhcpd.instances.*.running')
+		[ "${TEST_ODHCPD_STATE:-true}" = absent ] || echo "${TEST_ODHCPD_STATE:-true}" ;;
 	*:'@.interface[*].l3_device') [ -z "${TEST_DYNAMIC_CLAIM:-}" ] || echo "$TEST_DYNAMIC_CLAIM" ;;
 	*:'@.interface[*].device') : ;;
 	*:'@.interface') echo '[]' ;;
@@ -291,6 +303,48 @@ multidevice_config() {
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
 }
+optional_service_test() {
+	baseline
+	printf 'dhcp.other.ra\tserver\ndhcp.other.dhcpv6\tserver\ndhcp.other.ndp\trelay\ndhcp.other.user_note\tKEEP\n' >>"$tmp/config"
+	awk -F '\t' '$1~/^dhcp\.other(\.|$)/' "$tmp/config" >"$tmp/other-before"
+	"$tool" plan lan wan policy >"$tmp/optional-plan"
+	apply_mock_plan "$tmp/optional-plan"
+	cp "$tmp/config" "$tmp/optional-config"
+	printf '#!/bin/sh\nprintf "unexpected odhcpd lifecycle action\\n" >>"$TEST_TOPOLOGY_DIR/writes"\nexit 1\n' >"$tmp/odhcpd-installed"
+	chmod +x "$tmp/odhcpd-installed"
+	TEST_ODHCPD_STATE=absent "$tool" verify lan wan policy >"$tmp/verify-odhcpd-absent"
+	cp "$tmp/odhcpd-installed" "$tmp/root/etc/init.d/odhcpd"
+	TEST_ODHCPD_STATE=true "$tool" verify lan wan policy >"$tmp/verify-odhcpd-running"
+	TEST_ODHCPD_STATE=false "$tool" verify lan wan policy >"$tmp/verify-odhcpd-stopped"
+	for setting in ignore ra dhcpv6 ndp; do
+		awk -F '\t' -v key="dhcp.lan.$setting" 'BEGIN{OFS="\t"}$1==key{$2=($1~/\.ignore$/?0:"server")}{print}' "$tmp/optional-config" >"$tmp/config"
+		reject env TEST_ODHCPD_STATE=false "$tool" verify lan wan policy
+		cp "$tmp/optional-config" "$tmp/config"
+	done
+	for rule in dhcp4 dhcp6 ra; do
+		grep -vF "comment \"!fw4: routepolicy-init-$rule\"" "$tmp/nft" >"$tmp/missing-output-rule.nft"
+		reject env TEST_ODHCPD_STATE=false TEST_NFT_FILE="$tmp/missing-output-rule.nft" "$tool" verify lan wan policy
+		awk -v marker="!fw4: routepolicy-init-$rule\"" 'index($0,marker){sub(/jump drop_to_lan/,"accept")}{print}' "$tmp/nft" >"$tmp/allowed-output-rule.nft"
+		reject env TEST_ODHCPD_STATE=false TEST_NFT_FILE="$tmp/allowed-output-rule.nft" "$tool" verify lan wan policy
+	done
+	reject env TEST_ODHCPD_STATE=false TEST_UBUS_SERVICE_FAIL=1 "$tool" verify lan wan policy
+	reject env TEST_ODHCPD_STATE=false TEST_SERVICE_JSON='{"dropbear":' "$tool" verify lan wan policy
+	for state in false missing; do reject env TEST_ODHCPD_STATE=false TEST_DROPBEAR_STATE="$state" "$tool" verify lan wan policy; done
+	if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+		for state in true false; do
+			TEST_SERVICE_JSON="{\"dropbear\":{\"instances\":{\"main\":{\"running\":true}}},\"odhcpd\":{\"instances\":{\"main\":{\"running\":$state}}}}" "$tool" verify lan wan policy >"$tmp/verify-native-services-$state"
+		done
+		TEST_SERVICE_JSON='{"dropbear":{"instances":{"main":{"running":true}}}}' "$tool" verify lan wan policy >"$tmp/verify-native-services-absent"
+		reject env TEST_SERVICE_JSON='{"dropbear":{"instances":{"main":{"running":false}}}}' "$tool" verify lan wan policy
+		reject env TEST_SERVICE_JSON='{"odhcpd":{"instances":{"main":{"running":false}}}}' "$tool" verify lan wan policy
+	fi
+	cmp "$tmp/optional-config" "$tmp/config"
+	awk -F '\t' '$1~/^dhcp\.other(\.|$)/' "$tmp/config" >"$tmp/other-after"; cmp "$tmp/other-before" "$tmp/other-after"
+	[ ! -s "$tmp/writes" ]
+	rm "$tmp/root/etc/init.d/odhcpd"
+	printf '%s\n' 'optional odhcpd runtime: passed (absent/running/stopped, LAN disable and fw4 evidence, ubus/JSON/dropbear rejection, other network preserved, no lifecycle actions)'
+}
+if [ "${1:-}" = --optional-services ]; then optional_service_test; exit 0; fi
 # base614 #17 wrote scalar set fields without expected-type. The optional real
 # baseline planner lets the offline upgrade check use its original candidate too.
 legacy_ownership_test() {
@@ -332,6 +386,7 @@ legacy_ownership_test() {
 }
 legacy_ownership_test
 if [ "${1:-}" = --legacy-upgrade ]; then exit 0; fi
+optional_service_test
 # A candidate with no committed section fields is never ownership evidence.
 for ownership_phase in prepared expired rolled_back applying pending; do
 	baseline
