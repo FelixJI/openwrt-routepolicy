@@ -170,6 +170,11 @@ rp_uint_between() {
 	rp_is_uint "$1" || return 1
 	[ "$1" -ge "$2" ] 2>/dev/null && [ "$1" -le "$3" ] 2>/dev/null
 }
+# iproute2 parses these IDs with base 0; init never silently interprets octal.
+rp_init_routing_id_between() {
+	case ${1-} in ''|0*|*[!0-9]*) return 1 ;; esac
+	rp_uint_between "$1" "$2" "$3"
+}
 rp_is_name() {
 	value=${1-}
 	[ -n "$value" ] && [ "${#value}" -le "${2:-32}" ] || return 1

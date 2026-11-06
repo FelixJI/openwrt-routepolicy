@@ -427,7 +427,7 @@ policy_sync() {
 	case "$policy_required" in 0|1) ;; *) return 1 ;; esac
 	if [ "$policy_required" = 0 ]; then
 		if [ "$policy_mode" = restore ]; then
-			[ ! -f "$WAL/policy-attempted" ] || ROUTEPOLICY_INIT_RESTORE=1 timeout -s KILL 30 sh -c 'exec "$1" teardown' routepolicy-policy-restore "$LIBEXEC/apply" >"$WAL/policy-restore-result" 2>"$WAL/policy-restore-error" || return 1
+			[ ! -f "$WAL/policy-attempted" ] || ROUTEPOLICY_INIT_RESTORE=1 ROUTEPOLICY_INIT_GENERATION="$(cat "$WAL/token")" timeout -s KILL 30 sh -c 'exec "$1" teardown' routepolicy-policy-restore "$LIBEXEC/apply" >"$WAL/policy-restore-result" 2>"$WAL/policy-restore-error" || return 1
 			return 0
 		fi
 		# A DNS initialization activates policy routing in this same transaction.

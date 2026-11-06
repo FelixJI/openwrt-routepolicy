@@ -53,6 +53,7 @@ define Package/routepolicy/install
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/import-legacy $(1)/usr/libexec/routepolicy/import-legacy
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-transaction $(1)/usr/libexec/routepolicy/init-transaction
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-dns $(1)/usr/libexec/routepolicy/init-dns
+	$(INSTALL_DATA) ./files/usr/libexec/routepolicy/init-policy-runtime $(1)/usr/libexec/routepolicy/init-policy-runtime
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-topology $(1)/usr/libexec/routepolicy/init-topology
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/observe $(1)/usr/libexec/routepolicy/observe
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/render $(1)/usr/libexec/routepolicy/render

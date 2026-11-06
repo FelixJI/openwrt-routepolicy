@@ -925,4 +925,15 @@ printf 'dhcp.@dnsmasq[0].enable_tftp	1\n' >>"$tmp/config"
 reject "$tool" plan lan wan policy
 baseline
 [ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
+for setting in route_table:0200 rule_priority:012000; do
+	baseline
+	printf 'routepolicy.main.%s\t%s\n' "${setting%:*}" "${setting#*:}" >>"$tmp/config"
+	cp "$tmp/config" "$tmp/numeric-before"
+	reject "$tool" plan lan wan policy
+	grep -Fq '无前导零的十进制整数' "$tmp/error"
+	cmp "$tmp/config" "$tmp/numeric-before"
+done
+baseline
+"$tool" plan lan wan policy >"$tmp/canonical-id-plan"
+[ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
 printf '%s\n' 'init topology tests: passed'

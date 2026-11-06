@@ -464,6 +464,7 @@ conflicts() {
 	local mark mask priority table rules routes foreign
 	mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
 	priority=$(rp_uci_get main rule_priority 12000); table=$(rp_uci_get main route_table 200)
+	rp_init_routing_id_between "$priority" 1 32765 && rp_init_routing_id_between "$table" 1 252 || fail '初始化 route_table/rule_priority 必须为无前导零的十进制整数'
 	rp_is_mark_bit "$mark" && rp_is_mark_bit "$mask" && [ "$mark" = "$mask" ] && rp_uint_between "$priority" 1 32765 && rp_uint_between "$table" 1 252 || fail 'invalid mark/table settings'
 	rules=$(ip -4 rule show) || fail 'cannot inspect routing rules'
 	[ -z "$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table")" ] || fail 'mark overlaps another routing rule'
