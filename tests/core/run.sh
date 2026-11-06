@@ -12,6 +12,7 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 sh "$HERE/init-dns-listener-test.sh"
 sh "$HERE/init-dns-structure-test.sh"
 sh "$HERE/init-dns-include-test.sh"
+sh "$HERE/init-dns-shutdown-test.sh"
 sh "$HERE/writer-gate-test.sh"
 "$HERE/status-contract-test.sh"
 "$HERE/observe-contract-test.sh"

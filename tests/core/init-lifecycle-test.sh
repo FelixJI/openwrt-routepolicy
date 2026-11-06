@@ -17,6 +17,10 @@ cat >"$tmp/init-transaction" <<'EOF'
 #!/bin/sh
 if [ "$1" = boot-pending ]; then [ "${TEST_BOOT_PENDING:-0}" = 1 ]; exit; fi
 if [ "$1" = watch-ready ]; then [ "${TEST_WATCH_READY:-0}" = 1 ]; exit; fi
+if [ "$1" = shutdown-dns ]; then
+	printf '%s\n' "$1" >>"$TEST_RECOVERY_LOG"
+	[ "${TEST_SHUTDOWN_FAIL:-0}" != 1 ]; exit
+fi
 [ "$1" = recover-startup ] || exit 1
 printf '%s\n' "$1" >>"$TEST_RECOVERY_LOG"
 [ "${TEST_RECOVERY_FAIL:-0}" != 1 ]
@@ -118,6 +122,13 @@ for action in boot restart; do
 	if TEST_START_ACTION=$action run_start 1 init-confirmed >/dev/null 2>&1; then printf '%s bypassed pre-recovery/admission\n' "$action" >&2; exit 1; fi
 	[ "$(cat "$tmp/recovery.log")" = recover-startup ]
 done
+
+: >"$tmp/recovery.log"
+TEST_START_ACTION=shutdown run_start 1 >/dev/null
+[ "$(cat "$tmp/recovery.log")" = shutdown-dns ]
+if TEST_START_ACTION=shutdown TEST_SHUTDOWN_FAIL=1 run_start 1 >/dev/null 2>&1; then
+	printf 'failed shutdown isolation was swallowed\n' >&2; exit 1
+fi
 
 printf '%s\n' 'init lifecycle tests: passed'
 sh "$ROOT/tests/core/init-native-lock-test.sh"

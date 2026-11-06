@@ -970,11 +970,37 @@ if "$TX" recover-early >/dev/null; then exit 1; fi
 baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
 SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
 active="$tmp/root/etc/routepolicy/state/init-transaction/confirmed-$token"
+canonical dhcp >"$tmp/shutdown-dhcp.before"
+"$TX" shutdown-dns >/dev/null
+[ "$(cat "$tmp/svc/smartdns.enabled")" = 0 ]
+canonical dhcp >"$tmp/shutdown-dhcp.after"; cmp "$tmp/shutdown-dhcp.before" "$tmp/shutdown-dhcp.after"
 rm -rf "$tmp/root/tmp/routepolicy"; rm -f "$tmp/policy-running"
 printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
 printf 'confirmed-reboot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
 "$TX" recover-early >/dev/null
 [ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
+# Admission precedes policy writes and native start; it never repairs DHCP drift.
+cp "$tmp/root/etc/config/dhcp" "$tmp/boot-dhcp.good"
+for drift in missing port53 list disabled pending; do
+	cp "$tmp/boot-dhcp.good" "$tmp/root/etc/config/dhcp"
+	case "$drift" in
+		missing) uci delete 'dhcp.@dnsmasq[0].port' ;;
+		port53) uci set 'dhcp.@dnsmasq[0].port=53' ;;
+		list) uci delete 'dhcp.@dnsmasq[0].port'; uci add_list 'dhcp.@dnsmasq[0].port=0' ;;
+		disabled) uci set 'dhcp.@dnsmasq[0].disabled=0' ;;
+		pending) uci set 'dhcp.@dnsmasq[0].port=53' ;;
+	esac
+	[ "$drift" = pending ] || uci commit dhcp
+	cp "$tmp/root/etc/config/dhcp" "$tmp/boot-dhcp.drift"
+	starts_before=$(grep -Ec '^smartdns (start|reload)$' "$tmp/service-log" || true)
+	if "$TX" boot-dns >/dev/null 2>&1; then printf 'boot accepted DHCP drift: %s\n' "$drift" >&2; exit 1; fi
+	[ "$(grep -Ec '^smartdns (start|reload)$' "$tmp/service-log" || true)" = "$starts_before" ]
+	cmp "$tmp/boot-dhcp.drift" "$tmp/root/etc/config/dhcp"
+	[ -f "$active/dns-boot-pending" ] && [ ! -f "$active/dns-boot-ready" ]
+	[ ! -f "$tmp/policy-running" ]
+	[ "$drift" != pending ] || uci revert dhcp
+done
+cp "$tmp/boot-dhcp.good" "$tmp/root/etc/config/dhcp"
 : >"$tmp/policy-fail"
 if "$TX" boot-dns >/dev/null; then exit 1; fi
 [ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")" = 00 ]

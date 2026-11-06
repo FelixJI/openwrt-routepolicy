@@ -226,6 +226,38 @@ init_dns_managed() {
 		[ "$(uci -q get "smartdns.$root.server_flags")" = '-group rp_init_default' ] &&
 		[ "$(uci -q get "smartdns.$root.auto_set_dnsmasq")" = 0 ]
 }
+# An unapplied candidate is never authority for native service side effects.
+init_dns_applied_value() {
+	local key=$1 value=$2 index entry
+	[ -f "$WAL/candidate" ] && [ ! -L "$WAL/candidate" ] && [ -d "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+	index=$(awk -F '\t' -v key="$key" -v value="$value" '$1=="set"&&$2==key&&$3==value{n++;row=NR}END{if(n!=1)exit 1;print row}' "$WAL/candidate") || return 1
+	entry="$WAL/fields/$index"
+	[ -d "$entry" ] && [ ! -L "$entry" ] || return 1
+	for index in key expected attempted; do [ -f "$entry/$index" ] && [ ! -L "$entry/$index" ] || return 1; done
+	[ "$(cat "$entry/key")" = "$key" ] && [ "$(cat "$entry/expected")" = "$value" ] || return 1
+	# Legacy set rows had no expected-type; an explicit bad type remains invalid.
+	if [ -e "$entry/expected-type" ] || [ -L "$entry/expected-type" ]; then
+		[ -f "$entry/expected-type" ] && [ ! -L "$entry/expected-type" ] && [ "$(cat "$entry/expected-type")" = scalar ] || return 1
+	fi
+	read_current "$key" && [ "$FIELD_TYPE" = scalar ] && [ "$FIELD_VALUE" = "$value" ]
+}
+init_dns_managed_admit() {
+	local root port_key item
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned || return 1
+	[ -d "$WAL" ] && [ ! -L "$WAL" ] && [ -f "$WAL/phase" ] && [ ! -L "$WAL/phase" ] || return 1
+	case "$(cat "$WAL/phase")" in applying|pending|confirming|confirmed) ;; *) return 1 ;; esac
+	uci_layout && no_pending && init_dns_managed || return 1
+	root=$(rp_smartdns_single_root) || return 1
+	for item in enabled:1 old_enabled:1 port:53 old_port:53 auto_set_dnsmasq:0 old_auto_set_dnsmasq:0 cache_persist:1 cache_file:/tmp/routepolicy/smartdns.cache server_flags:'-group rp_init_default'; do
+		init_dns_applied_value "smartdns.$root.${item%%:*}" "${item#*:}" || return 1
+	done
+	port_key=$(awk -F '\t' '$1=="set"&&$2~/^dhcp\.[^.]+\.port$/&&$3==0{n++;key=$2}END{if(n!=1)exit 1;print key}' "$WAL/candidate") || return 1
+	init_dns_applied_value "$port_key" 0 && init_dns_applied_value "${port_key%.*}.disabled" 1 || return 1
+	[ -z "$(uci_committed get "smartdns.$root.redirect")" ] || return 1
+	for item in dns_redirect old_dns_redirect; do
+		[ "$(uci_committed get "${port_key%.*}.$item")" != 1 ] || return 1
+	done
+}
 init_dns_service_state() {
 	local service=$1 output
 	output=$(ubus call service list "{\"name\":\"$service\"}") || return 1
@@ -524,7 +556,7 @@ init_dns_coordinate() {
 			else printf '%s' '' >"$WAL/dns-cache-absent" && sync || return 1; fi
 			;;
 		start)
-			init_dns_call smartdns reload && init_dns_call smartdns enable
+			init_dns_managed_admit && init_dns_call smartdns reload && init_dns_call smartdns enable
 			;;
 		policy-prepare)
 			rp_render_smartdns90 "$WAL/dns90-new" || return 1

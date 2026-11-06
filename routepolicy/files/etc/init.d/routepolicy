@@ -16,6 +16,12 @@ ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routep
 # rc.common sources this file before procd.sh acquires the service lock.
 # Recovery may call native enable, so it must finish before taking that lock.
 case "${action:-}" in
+	shutdown)
+		# K82 is queued by path: remove its link before native stop can edit DHCP.
+		if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
+			timeout -k 1 10 "$ROUTEPOLICY_INIT_TRANSACTION" shutdown-dns >/dev/null || exit $?
+		fi
+		;;
 	start|boot|restart)
 		if [ "$action" != start ] || [ "${1:-}" != init-confirmed ]; then
 			if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then

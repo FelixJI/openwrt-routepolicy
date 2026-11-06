@@ -713,6 +713,11 @@ boot_dns_locked() (
 	boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 1
 	[ "$(cat "$WAL/dns-boot-pending")" = "$boot_now" ] && init_dns_managed || return 1
 	load_args && uci_layout && no_pending || return 1
+	if ! init_dns_managed_admit; then
+		printf '%s\n' boot-dns-admission >"$WAL/failed-stage"
+		printf '%s\n' '受管 DNS/DHCP 字段归属或已提交的 port=0、disabled=1 不匹配；未启动原生 SmartDNS，未修复用户配置' >&2
+		return 1
+	fi
 	# S19 may have been queued before S18 quarantined its link; converge explicitly.
 	init_dns_stop &&
 		init_dns_call dnsmasq stop && init_dns_call dnsmasq disable || return 1
@@ -742,6 +747,24 @@ active_boot_early() (
 
 operation=${1:-}; [ "$#" -eq 0 ] || shift
 case "$operation" in
+	shutdown-dns)
+		[ "$#" = 0 ] || fail 'shutdown-dns 不接受参数'
+		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/active" ] && [ ! -L "$TX/active" ]; then exit 0; fi
+		lock
+		# Prefer the current actually applied DNS; a prepared WAL falls back to active.
+		if init_dns_owned && init_dns_managed_admit; then :
+		else
+			shutdown_current=$WAL
+			if ! WAL=$(rp_init_active_record); then
+				WAL=$shutdown_current
+				[ ! -e "$WAL/dns-service-attempted" ] && [ ! -L "$WAL/dns-service-attempted" ] || fail '关机 DNS 字段归属有冲突；未猜测修改配置'
+				exit 0
+			fi
+			init_dns_managed_admit || fail '关机 DNS 字段归属有冲突；未猜测修改配置'
+		fi
+		# Do not stop SmartDNS: rc.common calls service_stopped even if ubus is empty.
+		init_dns_call smartdns disable && [ "$(init_dns_enabled smartdns)" = 0 ] || fail '不能取消原生 SmartDNS 关机回调'
+		;;
 	discover) [ "$#" -eq 0 ] || fail 'discover 不接受参数'; exec "$LIBEXEC/init-topology" discover ;;
 	preview)
 		args_valid "$@" || fail '初始化参数非法'
