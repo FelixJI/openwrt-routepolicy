@@ -47,6 +47,8 @@ case "${1:-}:${2:-}" in
 		;;
 	"get:smartdns.@smartdns[0].enabled") printf '%s\n' 1 ;;
 	"get:smartdns.@smartdns[0].port") printf '%s\n' 6053 ;;
+	get:routepolicy.main.enabled) printf '%s\n' "${TEST_POLICY_ENABLED:-1}" ;;
+	get:routepolicy.main.smartdns_enabled) printf '%s\n' "${TEST_ADAPTER_ENABLED:-1}" ;;
 	"get:smartdns.@server[0].enabled"|"get:smartdns.@server[1].enabled"|"get:smartdns.@server[2].enabled") printf '%s\n' 1 ;;
 	"get:smartdns.@server[0].type"|"get:smartdns.@server[1].type"|"get:smartdns.@server[2].type") printf '%s\n' udp ;;
 	"get:smartdns.@server[0].ip") printf '%s\n' 1.1.1.1 ;;
@@ -54,6 +56,9 @@ case "${1:-}:${2:-}" in
 	"get:smartdns.@server[2].ip") printf '%s\n' 8.8.8.8 ;;
 	"get:smartdns.@server[0].server_group"|"get:smartdns.@server[2].server_group") printf '%s\n' default ;;
 	"get:smartdns.@server[1].server_group") printf '%s\n' policy ;;
+	"get:smartdns.policy1.interface") printf '%s\n' "${TEST_POLICY1_IFACE:-}" ;;
+	"get:smartdns.policy1.addition_arg") printf '%s\n' "${TEST_POLICY1_ADDITION_ARG:-}" ;;
+	"get:smartdns.policy1.routepolicy_bound_device") printf '%s\n' "${TEST_POLICY1_BOUND:-}" ;;
 	batch:) cat >>"$TEST_UCI_LOG" ;;
 	import:smartdns) cat >/dev/null; printf '%s\n' import >>"$TEST_UCI_LOG" ;;
 	commit:smartdns) printf '%s\n' commit >>"$TEST_UCI_LOG" ;;
@@ -62,15 +67,38 @@ esac
 EOF
 chmod +x "$tmp/bin/uci"
 
+cat >"$tmp/bin/ubus" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = call ] || exit 0
+case "${2:-}" in
+	network.interface.wan) printf '{"l3_device":"eth0"}\n' ;;
+	network.interface.lan) printf '{"l3_device":"br-lan"}\n' ;;
+	service) printf '{"dnsmasq":{"instances":{"main":{"running":true}}}}\n' ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/bin/ubus"
+
+cat >"$tmp/bin/jsonfilter" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = -e ] || exit 0
+case "$2" in
+	'@.l3_device') sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ;;
+	'@.dnsmasq.instances.*.running') sed -n 's/.*"running":\(true\|false\).*/\1/p' ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/bin/jsonfilter"
+
 mkdir -p "$tmp/root/etc/init.d"
 cat >"$tmp/root/etc/init.d/smartdns" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_SMARTDNS_LOG"
 mkdir -p "$ROUTEPOLICY_ROOT/var/etc/smartdns"
-printf '%s\n' \
-	'conf-file /etc/smartdns/conf.d/90-routepolicy.conf' \
-	'conf-file /etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf' \
-	>"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
+{
+	if [ "${TEST_POLICY_ENABLED:-1}:${TEST_ADAPTER_ENABLED:-1}" = 1:1 ]; then printf '%s\n' 'conf-file /etc/smartdns/conf.d/90-routepolicy.conf'; fi
+	printf '%s\n' 'conf-file /etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'
+} >"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
 [ "${TEST_SMARTDNS_RELOAD_FAIL:-0}" != 1 ]
 EOF
 chmod +x "$tmp/root/etc/init.d/smartdns"
@@ -187,6 +215,117 @@ if {
 	exit 1
 fi
 
+# 官方 init 脚本的 load_server 不读取 server.interface，只把 addition_arg 附加到
+# server 行；结构化接口字段必须解析为字面设备并通过受管理的 -interface 落地，
+# 并随受管值一并持久化私有归属标记 routepolicy_bound_device。
+grep -Fq "set smartdns.policy1.addition_arg='-interface eth0'" "$tmp/uci.log" || {
+	printf '%s\n' 'structured interface field did not materialize the -interface binding' >&2
+	exit 1
+}
+grep -Fq "set smartdns.policy1.routepolicy_bound_device='-interface eth0'" "$tmp/uci.log" || {
+	printf '%s\n' 'managed binding was installed without the private ownership marker' >&2
+	exit 1
+}
+
+out=$(TEST_SMARTDNS_ROOTS=1 PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \
+	"$CTL" smartdns-status --json)
+version=$(printf '%s\n' "$out" | sed -n 's/.*"version":"\([0-9][0-9]*\)".*/\1/p')
+[ -n "$version" ]
+
+# $1=候选接口字段；$2/$3/$4=既有 interface/addition_arg/routepolicy_bound_device
+policy1_candidate() {
+	printf 'version\t%s\ninitialize\t0\n' "$version"
+	printf 'server.policy1.enabled\t1\nserver.policy1.type\thttps\nserver.policy1.ip\thttps://dns.example/dns-query\nserver.policy1.port\t443\nserver.policy1.server_group\tpolicy\nserver.policy1.interface\t%s\n' "${1:-}"
+}
+policy1_save() {
+	TEST_SMARTDNS_ROOTS=1 TEST_POLICY1_IFACE="${2:-}" TEST_POLICY1_ADDITION_ARG="${3:-}" TEST_POLICY1_BOUND="${4:-}" \
+		TEST_UCI_LOG="$tmp/uci.log" PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \
+		"$CTL" smartdns-save --json
+}
+policy1_apply() {
+	: >"$tmp/uci.log"
+	TEST_SMARTDNS_ROOTS=1 TEST_POLICY1_IFACE="${1:-}" TEST_POLICY1_ADDITION_ARG="${2:-}" TEST_POLICY1_BOUND="${3:-}" \
+		TEST_UCI_LOG="$tmp/uci.log" TEST_SMARTDNS_LOG="$tmp/smartdns.log" \
+		PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" \
+		"$CTL" smartdns-apply --json
+}
+policy1_reject() {
+	if policy1_candidate "$1" | policy1_save "$1" "$2" "$3" "$4" >"$tmp/reject.json" 2>"$tmp/reject.err"; then
+		printf '%s\n' "binding request '$1' with state '$2|$3|$4' unexpectedly accepted" >&2
+		exit 1
+	fi
+	grep -Fq '"ok":false' "$tmp/reject.json"
+	grep -Fq "$5" "$tmp/reject.err"
+}
+
+# 重复应用：归属一致的受管绑定不重写（幂等）
+policy1_candidate wan | policy1_save wan wan '-interface eth0' '-interface eth0' >"$tmp/save.json"
+grep -Fq '"ok":true' "$tmp/save.json"
+policy1_apply wan '-interface eth0' '-interface eth0' >"$tmp/apply.json"
+grep -Fq '"ok":true' "$tmp/apply.json"
+grep -Fq "set smartdns.policy1.interface='wan'" "$tmp/uci.log"
+if grep -q 'addition_arg' "$tmp/uci.log" || grep -q 'routepolicy_bound_device' "$tmp/uci.log"; then
+	printf '%s\n' 'an already matching managed binding was rewritten on repeated apply' >&2
+	exit 1
+fi
+
+# 变更逻辑接口：归属一致的整段受管绑定替换为新设备
+policy1_candidate lan | policy1_save lan wan '-interface eth0' '-interface eth0' >/dev/null
+policy1_apply wan '-interface eth0' '-interface eth0' >/dev/null
+grep -Fq "set smartdns.policy1.addition_arg='-interface br-lan'" "$tmp/uci.log"
+grep -Fq "set smartdns.policy1.routepolicy_bound_device='-interface br-lan'" "$tmp/uci.log"
+
+# 变更且保留用户前缀：逐字节保留用户参数，仅替换受管后缀
+policy1_candidate lan | policy1_save lan wan '-http-host api.example.com -interface eth0' '-http-host api.example.com -interface eth0' >/dev/null
+policy1_apply wan '-http-host api.example.com -interface eth0' '-http-host api.example.com -interface eth0' >/dev/null
+grep -Fq "set smartdns.policy1.addition_arg='-http-host api.example.com -interface br-lan'" "$tmp/uci.log"
+grep -Fq "set smartdns.policy1.routepolicy_bound_device='-http-host api.example.com -interface br-lan'" "$tmp/uci.log"
+
+# 纯用户参数：原样保留并追加受管绑定
+policy1_candidate wan | policy1_save wan '' '-exclude-default-group' '' >/dev/null
+policy1_apply '' '-exclude-default-group' '' >/dev/null
+grep -Fq "set smartdns.policy1.addition_arg='-exclude-default-group -interface eth0'" "$tmp/uci.log"
+grep -Fq "set smartdns.policy1.routepolicy_bound_device='-exclude-default-group -interface eth0'" "$tmp/uci.log"
+
+# 清空本应用安装的整段绑定：必须真正删除，不得暗中保留
+policy1_candidate '' | policy1_save '' wan '-interface eth0' '-interface eth0' >"$tmp/clear.json"
+grep -Fq '"ok":true' "$tmp/clear.json"
+policy1_apply wan '-interface eth0' '-interface eth0' >/dev/null
+grep -Fxq 'delete smartdns.policy1.interface' "$tmp/uci.log"
+grep -Fxq 'delete smartdns.policy1.addition_arg' "$tmp/uci.log"
+grep -Fxq 'delete smartdns.policy1.routepolicy_bound_device' "$tmp/uci.log"
+
+# 清空时保留用户前缀：只删除受管后缀与归属标记
+policy1_candidate '' | policy1_save '' wan '-http-host api.example.com -interface eth0' '-http-host api.example.com -interface eth0' >/dev/null
+policy1_apply wan '-http-host api.example.com -interface eth0' '-http-host api.example.com -interface eth0' >/dev/null
+grep -Fq "set smartdns.policy1.addition_arg='-http-host api.example.com'" "$tmp/uci.log"
+grep -Fxq 'delete smartdns.policy1.routepolicy_bound_device' "$tmp/uci.log"
+
+# 手写同值但没有归属标记：一律视为用户所有，清空与重复设置都不改写、不认领
+policy1_candidate '' | policy1_save '' '' '-interface eth0' '' >"$tmp/foreign-clear.json"
+grep -Fq '"ok":true' "$tmp/foreign-clear.json"
+policy1_apply '' '-interface eth0' '' >/dev/null
+grep -Fxq 'delete smartdns.policy1.interface' "$tmp/uci.log"
+if grep -q 'addition_arg' "$tmp/uci.log" || grep -q 'routepolicy_bound_device' "$tmp/uci.log"; then
+	printf '%s\n' 'a handwritten same-value binding without the marker was deleted while clearing' >&2
+	exit 1
+fi
+policy1_candidate wan | policy1_save wan '' '-interface eth0' '' >/dev/null
+policy1_apply '' '-interface eth0' '' >/dev/null
+if grep -q 'addition_arg' "$tmp/uci.log" || grep -q 'routepolicy_bound_device' "$tmp/uci.log"; then
+	printf '%s\n' 'a handwritten same-value binding without the marker was claimed by a matching request' >&2
+	exit 1
+fi
+
+# 无法归属且无法证明安全的既有内容：请求绑定时写前拒绝，且不落候选
+policy1_reject wan '' '-exclude-default-group -interface eth9' '' '无法安全合并'
+[ ! -e "$tmp/root/tmp/routepolicy/smartdns-candidate.tsv" ]
+for unsafe_addition_arg in "can't merge" '-interface' '-interface=eth0' '--interface eth0' '-interface eth0 -interface eth1' 'foo"bar' 'abc #comment' "$(printf 'one\ntwo')"; do
+	policy1_reject wan '' "$unsafe_addition_arg" '' '无法安全合并'
+done
+policy1_reject usbwan '' '' '' '无法解析为合法实际设备'
+policy1_reject 'wan;reboot' '' '' '' '必须为空或合法逻辑接口名'
+
 printf '%s\n' '192.168.1.10 nas nas.lan storage.lan' '2001:db8::10 nas6 nas6.lan' | \
 	ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-write-local-hosts --json >"$tmp/hosts-write.json"
 grep -Fq '"ok":true' "$tmp/hosts-write.json"
@@ -220,4 +359,41 @@ grep -Fxq import "$tmp/uci.log"
 [ -s "$tmp/root/tmp/routepolicy/smartdns-candidate.tsv" ]
 [ -s "$tmp/root/tmp/routepolicy/local-hosts-candidate.list" ]
 
+# The policy switch and the 90 adapter switch both gate policy DNS generation.
+for switches in 1:1 0:1 1:0 0:0; do
+	TEST_POLICY_ENABLED=${switches%:*} TEST_ADAPTER_ENABLED=${switches#*:}
+	export TEST_POLICY_ENABLED TEST_ADAPTER_ENABLED
+	out=$(TEST_SMARTDNS_ROOTS=1 PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-status --json)
+	version=$(printf '%s\n' "$out" | sed -n 's/.*"version":"\([0-9][0-9]*\)".*/\1/p')
+	printf 'version\t%s\ninitialize\t0\nport\t6053\n' "$version" | TEST_SMARTDNS_ROOTS=1 TEST_UCI_LOG="$tmp/uci.log" PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >/dev/null
+	: >"$tmp/uci.log"
+	TEST_SMARTDNS_ROOTS=1 TEST_UCI_LOG="$tmp/uci.log" TEST_SMARTDNS_LOG="$tmp/smartdns.log" PATH="$tmp/bin:$PATH" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-apply --json >/dev/null
+	if [ "$switches" = 1:1 ]; then
+		grep -Fq "add_list smartdns.main.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/uci.log"
+	else
+		if grep -Fq "add_list smartdns.main.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/uci.log"; then exit 1; fi
+		[ ! -e "$tmp/root/etc/smartdns/conf.d/90-routepolicy.conf" ]
+	fi
+done
+unset TEST_POLICY_ENABLED TEST_ADAPTER_ENABLED
+
+# Initialization's persistent lock and pending phase exclude independent writes.
+mkdir -p "$tmp/root/etc/routepolicy/state/init-transaction/current"
+for phase in prepared applying pending rolling_back conflict confirming; do
+	printf '%s\n' "$phase" >"$tmp/root/etc/routepolicy/state/init-transaction/current/phase"
+	if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
+	grep -Fq '初始化事务' "$tmp/locked.json"
+done
+printf confirmed >"$tmp/root/etc/routepolicy/state/init-transaction/current/phase"
+: >"$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
+if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
+grep -Fq '初始化事务' "$tmp/locked.json"
+rm "$tmp/root/etc/routepolicy/state/init-transaction/current/dns-boot-pending"
+token=11111111111111111111111111111111
+record="$tmp/root/etc/routepolicy/state/init-transaction/confirmed-$token"
+mkdir "$record"; printf '%s\n' "$token" >"$record/token"
+printf confirmed >"$record/phase"; : >"$record/dns-boot-pending"
+printf '%s\n' "$token" >"$tmp/root/etc/routepolicy/state/init-transaction/active"
+if printf 'version\t1\ninitialize\t1\n' | ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$CTL" smartdns-save --json >"$tmp/locked.json"; then exit 1; fi
+grep -Fq '初始化事务' "$tmp/locked.json"
 printf '%s\n' 'SmartDNS management tests: passed'

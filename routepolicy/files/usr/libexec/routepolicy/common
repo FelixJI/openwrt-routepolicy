@@ -71,12 +71,76 @@ rp_is_smartdns_server_ref() {
 	printf '%s\n' "$value" | LC_ALL=C grep -Eq '^@server\[[0-9]+\]$'
 }
 
+# Decode libuci's quoted export without evaluating configuration as shell code.
+# Lists use | internally; ambiguous/control-containing values fail before any write.
+rp_uci_field_data() {
+	awk -v section="$1" -v option="$2" '
+		function unquote(s, out,i,c) {
+			if(substr(s,1,1)!=q || substr(s,length(s),1)!=q){bad=1;return ""}
+			s=substr(s,2,length(s)-2);out=""
+			for(i=1;i<=length(s);i++) {
+				c=substr(s,i,1)
+				if(c==q) {if(substr(s,i,4)!=q "\\" q q){bad=1;return ""}i+=3}
+				out=out c
+			}
+			if(out~/[[:cntrl:]|]/){bad=1;return ""}return out
+		}
+		BEGIN{q=sprintf("%c",39)}
+		$1=="config" {
+			type=$2;gsub(q,"",type);name=$3;gsub(q,"",name)
+			ref="@" type "[" count[type]++ "]";selected=(section==name||section==ref)
+		}
+		selected && ($1=="option"||$1=="list") {
+			name=$2;gsub(q,"",name);if(name!=option)next
+			line=$0;sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/,"",line)
+			value=unquote(line)
+			if(n && (kind!="list"||$1!="list"))bad=1
+			data=data (n?"|":"") value;kind=$1;n++
+		}
+		END{if(bad||!n||length(data)>4096)exit 1;print (kind=="list"?"list":"scalar") "\t" data}'
+}
+
+# Rebuild rules atomically while retaining the two DNS producer set objects.
+# Their live members and kernel expiry times survive concurrent DNS answers.
+rp_nft_rebuild() {
+	nft_source=$1 nft_target=$2
+	for nft_name in domain_policy4 domain_default4; do
+		nft_schema=$(nft list set inet routepolicy "$nft_name") || return 1
+		printf '%s\n' "$nft_schema" | grep -Eq 'type ipv4_addr([ ;]|$)' &&
+			printf '%s\n' "$nft_schema" | grep -Eq 'flags timeout([ ;]|$)|^[[:space:]]*timeout [1-9][0-9]*(ms|[smhd])' || return 1
+	done
+	: >"$nft_target" || return 1
+	for nft_name in prerouting dns_prerouting output classify source_prerouting source_postrouting; do
+		if nft list chain inet routepolicy "$nft_name" >/dev/null 2>&1; then
+			printf 'flush chain inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
+		fi
+	done
+	for nft_name in prerouting dns_prerouting output classify source_prerouting source_postrouting; do
+		if nft list chain inet routepolicy "$nft_name" >/dev/null 2>&1; then
+			printf 'delete chain inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
+		fi
+	done
+	for nft_name in static_policy4 static_default4 source_ingress4 source_egress4; do
+		if nft list set inet routepolicy "$nft_name" >/dev/null 2>&1; then
+			printf 'delete set inet routepolicy %s\n' "$nft_name" >>"$nft_target" || return 1
+		fi
+	done
+	awk '
+		BEGIN {chains=" prerouting dns_prerouting output classify source_prerouting source_postrouting ";sets=" static_policy4 static_default4 source_ingress4 source_egress4 "}
+		depth==1 && NF && $1 !~ /^[}#]/ {
+			keep=($1=="chain"&&index(chains," " $2 " "))||($1=="set"&&index(sets," " $2 " "))
+			object=1
+		}
+		{line=$0;depth+=gsub(/\{/,"",line)-gsub(/}/,"",line);if(!object||keep)print;if(depth==1)object=0;if(depth<0)bad=1}
+		END{if(depth||bad)exit 1}' "$nft_source" >>"$nft_target"
+}
+
 rp_smartdns_fragment_loaded() {
 	fragment=$1
 	configured_fragment=${fragment#"$RP_ROOT"}
 	[ -f "$RP_SMARTDNS_GENERATED" ] && [ ! -L "$RP_SMARTDNS_GENERATED" ] || return 1
 	awk -v wanted="$configured_fragment" '
-		$1 == "conf-file" || $1 == "conf_file" { if ($2 == wanted) found=1 }
+		$1 == "conf-file" || $1 == "conf_file" { path=$2; q=sprintf("%c",39); if(substr(path,1,1)==q&&substr(path,length(path),1)==q)path=substr(path,2,length(path)-2); if (path == wanted) found=1 }
 		$1 == "conf-file=" wanted || $1 == "conf_file=" wanted { found=1 }
 		END { exit !found }
 	' "$RP_SMARTDNS_GENERATED"
@@ -105,6 +169,11 @@ rp_is_uint() { case ${1-} in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 rp_uint_between() {
 	rp_is_uint "$1" || return 1
 	[ "$1" -ge "$2" ] 2>/dev/null && [ "$1" -le "$3" ] 2>/dev/null
+}
+# iproute2 parses these IDs with base 0; init never silently interprets octal.
+rp_init_routing_id_between() {
+	case ${1-} in ''|0*|*[!0-9]*) return 1 ;; esac
+	rp_uint_between "$1" "$2" "$3"
 }
 rp_is_name() {
 	value=${1-}
@@ -373,4 +442,201 @@ rp_output_error() {
 	else
 		rp_err "$message"
 	fi
+}
+
+rp_smartdns_init_probes() {
+	printf '%s\n' '# routepolicy initialization probes' \
+		'domain-rules /routepolicy-init-default.test/ -nameserver rp_init_default -speed-check-mode none' \
+		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none'
+}
+
+# A confirmed DNS contract survives replacement of the reviewable candidate WAL.
+rp_init_confirmed_record() {
+	case "$1" in active|source) ;; *) return 1 ;; esac
+	active_tx="$RP_STATE_DIR/init-transaction"
+	[ ! -L "$active_tx" ] && [ -f "$active_tx/$1" ] && [ ! -L "$active_tx/$1" ] || return 1
+	active_token=$(cat "$active_tx/$1") || return 1
+	[ "${#active_token}" = 32 ] || return 1
+	case "$active_token" in *[!0-9a-f]*) return 1 ;; esac
+	active_record="$active_tx/confirmed-$active_token"
+	[ -d "$active_record" ] && [ ! -L "$active_record" ] && [ ! -L "$active_record/token" ] && [ ! -L "$active_record/phase" ] &&
+		[ "$(cat "$active_record/token")" = "$active_token" ] && [ "$(cat "$active_record/phase")" = confirmed ] || return 1
+	printf '%s\n' "$active_record"
+}
+rp_init_active_record() { rp_init_confirmed_record active; }
+rp_init_source_record() { rp_init_confirmed_record source; }
+rp_init_section_owned() (
+	section_key=$1 section_type=$2
+	section_active=$(rp_init_active_record) || section_active=
+	section_source=$(rp_init_source_record) || section_source=
+	for section_record in "$RP_STATE_DIR/init-transaction/current" "$section_active" "$section_source"; do
+		[ -n "$section_record" ] && [ -d "$section_record" ] && [ ! -L "$section_record" ] || continue
+		[ -f "$section_record/phase" ] && [ ! -L "$section_record/phase" ] || continue
+		case "$(cat "$section_record/phase")" in
+			pending|confirming|confirmed) ;;
+			applying)
+				# This existing stage follows all successful field commits, before the
+				# real planner verifies the runtime. attempted alone precedes commit.
+				[ -f "$section_record/stage" ] && [ ! -L "$section_record/stage" ] && [ "$(cat "$section_record/stage")" = runtime-verify ] || continue ;;
+			*) continue ;;
+		esac
+		[ -f "$section_record/candidate" ] && [ ! -L "$section_record/candidate" ] && [ -d "$section_record/fields" ] && [ ! -L "$section_record/fields" ] || continue
+		# Candidate rows locate entries only; actual applied field evidence authorizes them.
+		section_entries=$(awk -F '\t' -v key="$section_key" -v type="$section_type" '$1=="set"&&$2==key&&$3==type{print NR}' "$section_record/candidate") || continue
+		for section_index in $section_entries; do
+			section_entry="$section_record/fields/$section_index"
+			[ -d "$section_entry" ] && [ ! -L "$section_entry" ] || continue
+			for section_file in key expected attempted; do
+				[ -f "$section_entry/$section_file" ] && [ ! -L "$section_entry/$section_file" ] || continue 2
+			done
+			# base614 set entries were scalar but had no expected-type file. The
+			# set candidate, actual attempted entry and trusted phase remain required.
+			section_expected_type=scalar
+			if [ -e "$section_entry/expected-type" ] || [ -L "$section_entry/expected-type" ]; then
+				[ -f "$section_entry/expected-type" ] && [ ! -L "$section_entry/expected-type" ] || continue
+				section_expected_type=$(cat "$section_entry/expected-type") || continue
+			fi
+			[ "$(cat "$section_entry/key")" = "$section_key" ] && [ "$(cat "$section_entry/expected")" = "$section_type" ] && [ "$section_expected_type" = scalar ] && exit 0
+		done
+	done
+	exit 1
+)
+
+rp_dns_boot_pending() {
+	[ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ] && return 0
+	active_pending=$(rp_init_active_record) || return 1
+	[ -f "$active_pending/dns-boot-pending" ]
+}
+
+# One kernel gate covers initialization, candidate publication and runtime writers.
+rp_process_start() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	rp_proc_stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	printf '%s\n' "${rp_proc_stat##*) }" | awk '{if($20~/^[0-9]+$/)print $20;else exit 1}'
+}
+rp_writer_fd_locked() {
+	[ ! -L "$RP_STATE_DIR/init-transaction/lock" ] || return 1
+	[ "$(readlink "/proc/$1/fd/9" 2>/dev/null)" = "$RP_STATE_DIR/init-transaction/lock" ] || return 1
+	awk '$1=="lock:"&&$3=="FLOCK"&&$5=="WRITE"{found=1}END{exit !found}' "/proc/$1/fdinfo/9" 2>/dev/null || return 1
+	rp_fd_inode=$(awk '$1=="ino:"{print $2}' "/proc/$1/fdinfo/9") || return 1
+	[ "$rp_fd_inode" = "$(ls -di "$RP_STATE_DIR/init-transaction/lock" | awk '{print $1}')" ]
+}
+rp_writer_owned() {
+	case "${ROUTEPOLICY_WRITER_OWNER:-}" in *:*) ;; *) return 1 ;; esac
+	rp_owner_pid=${ROUTEPOLICY_WRITER_OWNER%:*}; rp_owner_start=${ROUTEPOLICY_WRITER_OWNER#*:}
+	[ "$(rp_process_start "$rp_owner_pid")" = "$rp_owner_start" ] &&
+		rp_writer_fd_locked "$rp_owner_pid" && rp_writer_fd_locked "$$"
+}
+rp_local_lock() {
+	rp_local_path=$1
+	if ! mkdir "$rp_local_path" 2>/dev/null; then
+		rp_writer_owned && rp_local_lock_reap "$rp_local_path" && mkdir "$rp_local_path" || return 1
+	fi
+	printf 'routepolicy-writer-v1 %s %s\n' "$$" "$(rp_process_start "$$")" >"$rp_local_path/owner" || { rmdir "$rp_local_path"; return 1; }
+}
+rp_local_unlock() {
+	rm -f "$1/owner"
+	rmdir "$1" 2>/dev/null || true
+}
+rp_local_lock_reap() {
+	rp_old_path=$1
+	[ -d "$rp_old_path" ] && [ ! -L "$rp_old_path" ] && [ -f "$rp_old_path/owner" ] && [ ! -L "$rp_old_path/owner" ] || return 1
+	read -r rp_old_version rp_old_pid rp_old_start rp_old_extra <"$rp_old_path/owner" || return 1
+	[ "$rp_old_version" = routepolicy-writer-v1 ] || return 1
+	case "$rp_old_pid:$rp_old_start" in *[!0-9:]*) return 1 ;; esac
+	[ -n "$rp_old_pid" ] && [ -n "$rp_old_start" ] && [ -z "$rp_old_extra" ] || return 1
+	if [ "$(rp_process_start "$rp_old_pid")" = "$rp_old_start" ]; then
+		rp_old_stat=$(cat "/proc/$rp_old_pid/stat" 2>/dev/null) || return 1
+		case "${rp_old_stat##*) }" in Z\ *|X\ *) ;; *) return 1 ;; esac
+	fi
+	# A dead shell alone is insufficient: its inherited synchronous writers must drain.
+	rp_writer_idle || return 1
+	[ "$(find "$rp_old_path" -mindepth 1 -maxdepth 1 | wc -l)" = 1 ] || return 1
+	rm "$rp_old_path/owner" && rmdir "$rp_old_path"
+}
+rp_writer_drain_legacy() {
+	for rp_old_lock in apply.lock update.lock smartdns-apply.lock import.lock; do
+		rp_old_path="$RP_RUN_DIR/$rp_old_lock"
+		[ ! -e "$rp_old_path" ] && [ ! -L "$rp_old_path" ] && continue
+		rp_local_lock_reap "$rp_old_path" || return 1
+	done
+}
+rp_writer_enter() {
+	rp_writer_role=$1
+	if [ -n "${ROUTEPOLICY_WRITER_OWNER:-}" ]; then
+		rp_writer_owned || { rp_err 'writer owner 已失效或未继承真实写锁'; return 1; }
+		[ "$rp_writer_role" != init ] || [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] || return 1
+	else
+		for rp_gate_path in "$RP_ETC" "$RP_STATE_DIR" "$RP_STATE_DIR/init-transaction" "$RP_RUN_DIR"; do
+			[ ! -L "$rp_gate_path" ] && { [ ! -e "$rp_gate_path" ] || [ -d "$rp_gate_path" ]; } || return 1
+		done
+		mkdir -p "$RP_STATE_DIR/init-transaction" "$RP_RUN_DIR" && chmod 700 "$RP_STATE_DIR/init-transaction" || return 1
+		[ ! -L "$RP_STATE_DIR/init-transaction/lock" ] || return 1
+		exec 9>"$RP_STATE_DIR/init-transaction/lock"
+		chmod 600 "$RP_STATE_DIR/init-transaction/lock" || return 1
+		if [ "${operation:-}" = recover-startup ] || [ "${operation:-}" = recover-early ]; then
+			flock -w 180 9 || return 1
+		else flock -n 9 || { rp_err '另一个配置或运行态写入正在进行'; return 1; }; fi
+		ROUTEPOLICY_WRITER_OWNER="$$:$(rp_process_start "$$")"
+		ROUTEPOLICY_WRITER_KIND=$rp_writer_role
+		export ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND
+		rp_writer_drain_legacy || { rp_err '已有 apply/update/SmartDNS writer 尚未退出或旧锁归属未知'; return 1; }
+	fi
+	if [ "$rp_writer_role" != init ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" != init ]; then
+		if [ -e "$RP_STATE_DIR/init-transaction/active" ] || [ -L "$RP_STATE_DIR/init-transaction/active" ]; then rp_init_active_record >/dev/null || return 1; fi
+		case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in absent|expired|confirmed|rolled_back) ;; *) rp_err '初始化事务尚未完成'; return 1 ;; esac
+		! rp_dns_boot_pending || { rp_err '已确认 DNS 启动尚未验证'; return 1; }
+	fi
+	if [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ]; then
+		ROUTEPOLICY_DNS_DEFER=1; export ROUTEPOLICY_DNS_DEFER
+	else ROUTEPOLICY_INIT_RESTORE=0; ROUTEPOLICY_DNS_DEFER=0; export ROUTEPOLICY_INIT_RESTORE ROUTEPOLICY_DNS_DEFER; fi
+}
+# Only synchronous writers inherit FD9. Native services and their callbacks never do.
+rp_native_run() {
+	rp_native_timeout=$1; shift
+	timeout -k 2 "$rp_native_timeout" sh -c '
+		unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND ROUTEPOLICY_INIT_RESTORE ROUTEPOLICY_INIT_GENERATION ROUTEPOLICY_DNS_DEFER
+		exec 9>&-
+		exec "$@"' routepolicy-native "$@"
+}
+rp_native_service() { rp_native_run 15 "$RP_ROOT/etc/init.d/$1" "$2"; }
+
+# Intent-only hotplug writes never wait for the configuration gate held by netifd.
+rp_writer_event_mark() {
+	[ ! -L "$RP_RUN_DIR" ] || return 1
+	mkdir -p "$RP_RUN_DIR" || return 1
+	[ ! -L "$RP_RUN_DIR/events.pending" ] || return 1
+	rp_event_tmp=$(mktemp "$RP_RUN_DIR/.event.XXXXXX") || return 1
+	mv "$rp_event_tmp" "$RP_RUN_DIR/events.pending" || { rm -f "$rp_event_tmp"; return 1; }
+	rp_writer_event_wake
+}
+rp_writer_event_wake() {
+	# Reuse the existing named procd guard; it acquires the gate outside this callback.
+	[ ! -x "$RP_ROOT/etc/init.d/routepolicy-initguard" ] || rp_native_run 3 "$RP_ROOT/etc/init.d/routepolicy-initguard" start event >/dev/null 2>&1 || true
+}
+rp_writer_event_take() {
+	for rp_event_file in events.pending events.inflight; do
+		[ ! -L "$RP_RUN_DIR/$rp_event_file" ] && { [ ! -e "$RP_RUN_DIR/$rp_event_file" ] || [ -f "$RP_RUN_DIR/$rp_event_file" ]; } || return 1
+	done
+	if [ -f "$RP_RUN_DIR/events.pending" ]; then mv "$RP_RUN_DIR/events.pending" "$RP_RUN_DIR/events.inflight" || return 1; fi
+	[ -f "$RP_RUN_DIR/events.inflight" ]
+}
+rp_writer_event_done() { rm -f "$RP_RUN_DIR/events.inflight"; }
+rp_writer_event_pending() { [ -f "$RP_RUN_DIR/events.pending" ] || [ -f "$RP_RUN_DIR/events.inflight" ]; }
+
+# Reuse admission only while the kernel still proves the inherited owner.
+rp_writer_idle() {
+	rp_writer_ancestors=" $$ "
+	rp_writer_parent=$$
+	while [ "$rp_writer_parent" -gt 1 ]; do
+		rp_writer_stat=$(cat "/proc/$rp_writer_parent/stat" 2>/dev/null) || break
+		rp_writer_parent=$(printf '%s\n' "${rp_writer_stat##*) }" | awk '{print $2}')
+		case "$rp_writer_parent" in ''|*[!0-9]*) return 1 ;; esac
+		rp_writer_ancestors="$rp_writer_ancestors$rp_writer_parent "
+	done
+	for rp_peer_fd in /proc/[0-9]*/fd/9; do
+		rp_peer_pid=${rp_peer_fd#/proc/};rp_peer_pid=${rp_peer_pid%%/*}
+		case "$rp_writer_ancestors" in *" $rp_peer_pid "*) continue ;; esac
+		if rp_writer_fd_locked "$rp_peer_pid"; then return 1; fi
+	done
 }

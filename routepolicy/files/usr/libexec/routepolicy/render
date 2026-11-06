@@ -3,6 +3,7 @@
 set -eu
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
+rp_writer_enter render || { rp_output_error render '写入门禁忙或初始化尚未完成'; exit 1; }
 
 rp_ensure_dirs
 work=$(mktemp -d "$RP_RUN_DIR/render.XXXXXX") || exit 1
@@ -72,11 +73,18 @@ emit_prerouting_rules() {
 	emitter=$1
 	"$emitter" prerouting "iifname != \"$lan_device\" return comment \"routepolicy: non-LAN\""
 	if [ "$dns_redirect" = 1 ]; then
-		"$emitter" prerouting 'meta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment "routepolicy: DNS redirect"'
+		# DNS reaches the local listener after dstnat, without a policy reply mark.
+		"$emitter" prerouting "meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 counter ct mark set ct mark & $inv meta mark set meta mark & $inv return comment \"routepolicy: DNS redirect classification bypass\""
 	fi
 	"$emitter" prerouting "ct mark & $mask != 0 meta mark set (meta mark & $inv) | $mark counter return comment \"routepolicy: established policy connection\""
 	"$emitter" prerouting "ct mark & $mask == 0 meta mark set meta mark & $inv comment \"routepolicy: clear default connection mark\""
 	"$emitter" prerouting 'jump classify comment "routepolicy: classify LAN destination"'
+}
+
+emit_dns_redirect_rules() {
+	emitter=$1
+	[ "$dns_redirect" = 1 ] || return 0
+	"$emitter" dns_prerouting "iifname \"$lan_device\" meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 counter redirect to :53 comment \"routepolicy: DNS redirect\""
 }
 
 emit_output_rules() {
@@ -170,6 +178,12 @@ EOF
 	emit_prerouting_rules emit_full_rule
 	cat <<EOF
 	}
+	chain dns_prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+EOF
+	emit_dns_redirect_rules emit_full_rule
+	cat <<EOF
+	}
 	chain output {
 		type route hook output priority mangle; policy accept;
 EOF
@@ -207,12 +221,14 @@ EOF
 	if [ -s "$RP_RUN_DIR/lists/ipv4-default.list" ]; then printf 'add element inet routepolicy static_default4 { '; elements "$RP_RUN_DIR/lists/ipv4-default.list"; printf ' }\n'; fi
 	cat <<EOF
 flush chain inet routepolicy prerouting
+flush chain inet routepolicy dns_prerouting
 flush chain inet routepolicy output
 flush chain inet routepolicy classify
 flush chain inet routepolicy source_prerouting
 flush chain inet routepolicy source_postrouting
 EOF
 	emit_prerouting_rules emit_update_rule
+	emit_dns_redirect_rules emit_update_rule
 	emit_output_rules emit_update_rule
 	emit_classify_rules emit_update_rule
 	emit_source_rules emit_update_rule source_prerouting ingress

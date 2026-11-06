@@ -3,17 +3,34 @@
 set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
+[ "$#" = 0 ] || { [ "$#" = 1 ] && [ "$1" = scheduled ]; } || { rp_output_error update '更新参数非法'; exit 1; }
+rp_writer_enter update || { rp_output_error update '写入门禁忙或初始化尚未完成'; exit 1; }
+
+if [ "${1:-}" = scheduled ]; then
+	# Recheck and consume the daily attempt only after acquiring the shared writer gate.
+	[ "$(rp_uci_get main enabled 0)" = 1 ] && [ "$(rp_uci_get main auto_update 1)" = 1 ] || exit 0
+	now_date=$(date +%Y-%m-%d)
+	now_hour=$(date +%H | sed 's/^0//'); [ -n "$now_hour" ] || now_hour=0
+	now_minute=$(date +%M | sed 's/^0//'); [ -n "$now_minute" ] || now_minute=0
+	target_hour=$(rp_uci_get main update_hour 4)
+	target_minute=$(rp_uci_get main update_minute 17)
+	last_date=; [ ! -f "$RP_STATE_DIR/last-update-attempt-day" ] || last_date=$(sed -n '1p' "$RP_STATE_DIR/last-update-attempt-day")
+	rp_schedule_due "$now_date" "$now_hour" "$now_minute" "$target_hour" "$target_minute" "$last_date" || exit 0
+	attempt="$RP_STATE_DIR/.last-update-attempt-day.$$"
+	printf '%s\n' "$now_date" >"$attempt" && mv -f "$attempt" "$RP_STATE_DIR/last-update-attempt-day" || { rp_output_error update '不能记录定时更新尝试'; exit 1; }
+fi
 
 validation=$(ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" 2>&1)
 if [ "$?" -ne 0 ]; then rp_output_error update "更新前校验失败: $validation"; exit 1; fi
 rp_have curl || { rp_output_error update '缺少 curl'; exit 1; }
 rp_ensure_dirs
 lock="$RP_RUN_DIR/update.lock"
-mkdir "$lock" 2>/dev/null || { rp_output_error update '另一个更新操作正在进行'; exit 1; }
-candidate=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX") || { rmdir "$lock"; exit 1; }
-work=$(mktemp -d "$RP_RUN_DIR/update.XXXXXX") || { rm -rf "$candidate"; rmdir "$lock"; exit 1; }
-cleanup() { rm -rf "$work"; [ ! -d "$candidate" ] || rm -rf "$candidate"; rmdir "$lock" 2>/dev/null || true; }
-trap cleanup EXIT HUP INT TERM
+rp_local_lock "$lock" || { rp_output_error update '另一个更新操作正在进行'; exit 1; }
+candidate=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX") || { rp_local_unlock "$lock"; exit 1; }
+work=$(mktemp -d "$RP_RUN_DIR/update.XXXXXX") || { rm -rf "$candidate"; rp_local_unlock "$lock"; exit 1; }
+cleanup() { rm -rf "$work"; [ ! -d "$candidate" ] || rm -rf "$candidate"; rp_local_unlock "$lock"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 sections=$(rp_source_sections)
 [ -n "$sections" ] || { rp_output_error update '没有配置清单来源'; exit 1; }

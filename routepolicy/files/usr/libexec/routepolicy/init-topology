@@ -55,7 +55,7 @@ discover() {
 	elif conflict_check=$(conflicts 2>&1); then json_string clear
 	else json_string "$conflict_check"; runtime_ok=0; fi
 	printf ',"dhcp_clients":'; json_string "$(uci -q show network 2>/dev/null | grep -E '\.proto=.?(dhcp|dhcpv6)' || true)"
-	printf ',"warning":'; json_string 'New IPv6 forwarding connections through this router are rejected by the plan; existing conntrack sessions are not forcibly cut off. IPv6 management is preserved. External RA and direct L2 IPv6 bypass require upstream/client configuration; no external path is claimed blocked.'
+	printf ',"warning":'; json_string 'New IPv6 forwarding connections through this router are rejected by the plan; existing conntrack sessions are not forcibly cut off. Selected interfaces become IPv4-only; IPv4 management is preserved. External RA and direct L2 IPv6 bypass require upstream/client configuration; no external path is claimed blocked.'
 	printf '},"ok":'; [ -z "$missing" ] && [ "$runtime_ok" = 1 ] && printf true || printf false
 	printf '}\n'
 }
@@ -102,6 +102,7 @@ zone_devices() {
 	local section=$1 selected=$2 logical raw up device devices="$2"
 	[ -n "$section" ] || { printf '%s\n' "$selected"; return; }
 	for logical in $(get "firewall.$section.network"); do
+		[ "$(get "network.$logical.disabled")" != 1 ] || continue
 		ident "$logical" || fail 'zone device set: unsupported logical interface'
 		raw=$(rp_interface_json "$logical") || fail "zone device set: missing netifd evidence for $logical"
 		up=$(field "$raw" '@.up')
@@ -250,9 +251,10 @@ link_unclaimed() {
 own_section() {
 	local existing
 	existing=$(get "$1")
-	# A pre-existing object is never adopted on the strength of its prefix alone.
-	[ -z "$existing" ] || [ "$operation" != plan ] || fail "reserved section already exists: $1"
+	# A preview, prefix or marker cannot adopt a pre-existing user resource.
+	[ -z "$existing" ] || rp_init_section_owned "$1" "$existing" || fail "reserved section already exists: $1; no applied ownership evidence（无法证明已应用归属，配置已保留）"
 }
+
 check_rp_filter() {
 	local global device specific effective
 	global=$(cat "$RP_ROOT/proc/sys/net/ipv4/conf/all/rp_filter" 2>/dev/null) || fail 'cannot inspect global rp_filter'
@@ -267,8 +269,11 @@ check_rp_filter() {
 }
 
 parse() {
-	[ "$#" -eq 3 ] || [ "$#" -eq 11 ] || fail 'expected ACCESS DEFAULT POLICY [NEW_ROLE DEVICE PROTO IP PREFIX GATEWAY MANAGEMENT_IP MANAGEMENT_PREFIX]'
+	[ "$#" -eq 3 ] || [ "$#" -eq 11 ] || [ "$#" -eq 13 ] || fail 'expected ACCESS DEFAULT POLICY [NEW_ROLE DEVICE PROTO IP PREFIX GATEWAY MANAGEMENT_IP MANAGEMENT_PREFIX]'
 	access=$1 default_if=$2 policy=$3
+	# Consumed by the sourced DNS planner.
+	# shellcheck disable=SC2034
+	dns_default=${12:--} dns_policy=${13:--}
 	shift 3
 	new_role=${1:--} new_device=${2:--} new_proto=${3:--} new_ip=${4:--} new_prefix=${5:--} new_gateway=${6:--} management_ip=${7:--} management_prefix=${8:--}
 	pre_apply=0
@@ -459,6 +464,7 @@ conflicts() {
 	local mark mask priority table rules routes foreign
 	mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
 	priority=$(rp_uci_get main rule_priority 12000); table=$(rp_uci_get main route_table 200)
+	rp_init_routing_id_between "$priority" 1 32765 && rp_init_routing_id_between "$table" 1 252 || fail '初始化 route_table/rule_priority 必须为无前导零的十进制整数'
 	rp_is_mark_bit "$mark" && rp_is_mark_bit "$mask" && [ "$mark" = "$mask" ] && rp_uint_between "$priority" 1 32765 && rp_uint_between "$table" 1 252 || fail 'invalid mark/table settings'
 	rules=$(ip -4 rule show) || fail 'cannot inspect routing rules'
 	[ -z "$(rp_mark_conflicts "$mark" "$mask" "$priority" "$table")" ] || fail 'mark overlaps another routing rule'
@@ -800,6 +806,7 @@ rule() {
 }
 emit_plan() {
 	local section role selected zone zone_section
+	set_value routepolicy.main.enabled 1
 	set_value routepolicy.main.lan_interface "$access"
 	set_value routepolicy.main.default_interface "$default_if"
 	set_value routepolicy.main.policy_interface "$policy"
@@ -866,6 +873,8 @@ emit_plan() {
 	set_value firewall.rp_init_ra.icmp_type router-advertisement
 	rule redirects - "$access_zone" ipv4 icmp DROP
 	set_value firewall.rp_init_redirects.icmp_type redirect
+	init_ipv4_plan
+	[ "$operation" != plan ] || init_dns_plan
 }
 
 live_rule() {
@@ -909,9 +918,11 @@ live_rule() {
 }
 
 verify() {
-	local section service services listener setting action key expected nft_snapshot
+	local section services listener setting action key expected nft_snapshot
 	emit_plan | while IFS="$(printf '\t')" read -r action key expected; do
-		[ "$action" = set ] && [ "$(get "$key")" = "$expected" ] || fail "configuration differs from candidate: $key"
+		if [ "$action" = delete ]; then
+			! uci -q get "$key" >/dev/null 2>&1 || fail "configuration differs from candidate: $key"
+		else [ "$action" = set ] && [ "$(get "$key")" = "$expected" ] || fail "configuration differs from candidate: $key"; fi
 	done
 	[ "$management_ip" = - ] || [ "$(runtime "$access" '@["ipv4-address"][0].address')" = "$management_ip" ] || fail 'new management address is not active'
 	for section in $dhcp_sections; do
@@ -920,6 +931,11 @@ verify() {
 	done
 	check_rp_filter "$access_device" "$default_device" "$policy_device"
 	default_route_guard verify
+	for device in "$access_device" "$default_device" "$policy_device"; do
+		if [ -d "$RP_ROOT/proc/sys/net/ipv6" ]; then
+			[ "$(cat "$RP_ROOT/proc/sys/net/ipv6/conf/$device/disable_ipv6" 2>/dev/null)" = 1 ] || fail "IPv6 仍在受管理设备启用: $device"
+		fi
+	done
 	[ "$(cat "$RP_ROOT/proc/sys/net/ipv4/ip_forward")" = 1 ] || fail 'IPv4 forwarding is disabled'
 	fw4 check >/dev/null 2>&1 || fail 'fw4 validation failed'
 	nft_snapshot=$(nft -n list table inet fw4) || fail 'running fw4 table unavailable'
@@ -949,10 +965,9 @@ verify() {
 	if [ "$(get "network.$default_if.proto")" = dhcp ]; then live_rule "input_$default_zone" '!fw4: routepolicy-init-default_dhcp_client' 'meta nfproto 2 udp sport 67 udp dport 68 counter accept'; fi
 	if [ "$(get "network.$policy.proto")" = dhcp ]; then live_rule "input_$policy_zone" '!fw4: routepolicy-init-policy_dhcp_client' 'meta nfproto 2 udp sport 67 udp dport 68 counter accept'; fi
 	services=$(ubus call service list) || fail 'service runtime evidence unavailable'
-	for service in dnsmasq odhcpd dropbear; do
-		[ "$service" != odhcpd ] || [ -x "$RP_ROOT/etc/init.d/odhcpd" ] || continue
-		[ "$(field "$services" "@.$service.instances.*.running" | sort -u)" = true ] || fail "service not running or evidence missing: $service"
-	done
+	field "$services" '@' >/dev/null || fail 'service runtime evidence is invalid JSON'
+	# LAN protocol disablement is verified above; global odhcpd may legitimately be stopped.
+	[ "$(field "$services" '@.dropbear.instances.*.running' | sort -u)" = true ] || fail 'service not running or evidence missing: dropbear'
 	listener=$(netstat -lnptu) || fail 'DNS listener evidence unavailable'
 	printf '%s\n' "$listener" | awk -v ip="$access_ip:53" '
 		$4==ip||$4=="0.0.0.0:53" {
@@ -963,6 +978,7 @@ verify() {
 	printf '{"ok":true,"operation":"verify","management_address":"%s","ipv6_policy":"reject-new-forwarding-connections; preserve-existing-conntrack-and-management","ipv6_external_bypass":"requires-upstream-client-configuration","packet_evidence":"EVIDENCE_MISSING"}\n' "$access_ip"
 }
 
+. "$LIBEXEC/init-dns"
 operation=${1:-}; [ "$#" -gt 0 ] && shift
 case "$operation" in
 	discover) [ "$#" -eq 0 ] || fail 'discover takes no arguments'; discover ;;

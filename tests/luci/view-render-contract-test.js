@@ -156,7 +156,7 @@ const settings = loadView(path.join(
 ));
 
 assert.strictEqual(settings.render(), 'rendered');
-assert.match(currentMap.description, /初始化期间.*其他页面或 SSH.*确认成功或回滚完成/);
+assert.match(currentMap.description, /初始化期间.*其他页面或 SSH.*SmartDNS.*确认成功或回滚完成.*冲突检查/);
 assert.deepStrictEqual(
 	renderedOptions.filter(function(option) { return option instanceof NetworkSelect; }).map(function(option) { return option.option; }),
 	[ 'lan_interface', 'default_interface', 'policy_interface' ]

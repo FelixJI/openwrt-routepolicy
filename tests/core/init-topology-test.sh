@@ -3,15 +3,20 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-topology.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-mkdir -p "$tmp/bin" "$tmp/root/proc/sys/net/ipv4/conf" "$tmp/root/sys/class/net/eth3/device"
+mkdir -p "$tmp/bin" "$tmp/root/proc/sys/net/ipv4/conf" "$tmp/root/sys/class/net/eth3/device" "$tmp/root/etc/init.d" "$tmp/root/usr/sbin"
 export TEST_TOPOLOGY_DIR=$tmp ROUTEPOLICY_ROOT="$tmp/root"
 export ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy"
 export PATH="$tmp/bin:$PATH"
 tool="$ROUTEPOLICY_LIBEXEC/init-topology"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/root/etc/init.d/smartdns"
+cp "$tmp/root/etc/init.d/smartdns" "$tmp/root/usr/sbin/smartdns"
+chmod +x "$tmp/root/etc/init.d/smartdns" "$tmp/root/usr/sbin/smartdns"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/bin/dig"
 cat >"$tmp/bin/uci" <<'EOF'
 #!/bin/sh
 [ "${1:-}" != -q ] || shift
 case "$1" in
+	export) exit 0 ;;
 	get) awk -F '\t' -v key="$2" '$1==key{print $2;found=1}END{exit !found}' "$TEST_TOPOLOGY_DIR/config" ;;
 	show) awk -F '\t' -v p="$2." 'index($1,p)==1{if($1 ~ /\.[^.]+\./)printf "%s=\047%s\047\n",$1,$2;else printf "%s=%s\n",$1,$2}' "$TEST_TOPOLOGY_DIR/config" ;;
 	*) printf 'unexpected UCI write: %s\n' "$*" >>"$TEST_TOPOLOGY_DIR/writes"; exit 1 ;;
@@ -28,15 +33,26 @@ case "$*" in
 	'call network.interface.rp_init_default status') echo new_policy ;;
 	'call network.interface dump') echo '{"interface":[{"interface":"lan","proto":"static"}]}' ;;
 	'call network.device status') echo '{"eth3":{"present":true}}' ;;
-	'call service list') echo services ;;
+	'call service list')
+		[ "${TEST_UBUS_SERVICE_FAIL:-0}" != 1 ] || exit 1
+		printf '%s\n' "${TEST_SERVICE_JSON:-services}" ;;
+	'call service list {"name":"smartdns"}') echo '{"smartdns":{"instances":{"main":{"running":false}}}}' ;;
+	'call service list {"name":"dnsmasq"}') echo '{"dnsmasq":{}}' ;;
 	*) exit 1 ;;
 esac
 EOF
 cat >"$tmp/bin/jsonfilter" <<'EOF'
 #!/bin/sh
 read -r data
+if [ -n "${TEST_SERVICE_JSON:-}" ] && [ "$data" = "$TEST_SERVICE_JSON" ] && [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+	printf '%s\n' "$data" | "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/usr/bin/jsonfilter" "$@"
+	exit $?
+fi
 case "$data:$2" in
+	'{"dropbear":':*) exit 1 ;;
+	'services:@') echo '{}' ;;
 	*:'@.up') echo true ;;
+	*:'@["dns-server"][*]') [ "${TEST_NO_UPSTREAM:-0}" = 1 ] || echo 192.0.2.53 ;;
 	'lan:@.l3_device') echo br-lan ;;
 	'wan:@.l3_device') echo eth1 ;;
 	'policy:@.l3_device') echo eth2 ;;
@@ -51,7 +67,13 @@ case "$data:$2" in
 	'wan:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_GATEWAY:-10.1.0.1}" ;;
 	'policy:@.route[@.target="0.0.0.0"].nexthop') echo "${TEST_POLICY_GATEWAY:-10.2.0.1}" ;;
 	'new_policy:@.route[@.target="0.0.0.0"].nexthop') echo 10.3.0.1 ;;
-	'services:@dnsmasq.instances.*.running'|'services:@.dnsmasq.instances.*.running'|'services:@.dropbear.instances.*.running'|'services:@.odhcpd.instances.*.running') [ "${TEST_SERVICE_DOWN:-0}" != 1 ] && echo true || echo false ;;
+	*:'@dnsmasq.instances.*.running'|*:'@.dnsmasq.instances.*.running')
+		if [ "${TEST_SERVICE_DOWN:-0}" = 1 ] || awk -F '\t' '$1~/^dhcp\.[^.]+\.disabled$/&&$2==1{found=1}END{exit !found}' "$TEST_TOPOLOGY_DIR/config"; then echo false; else echo true; fi ;;
+	'services:@.dropbear.instances.*.running')
+		if [ "${TEST_SERVICE_DOWN:-0}" = 1 ]; then echo false
+		elif [ "${TEST_DROPBEAR_STATE:-true}" != missing ]; then echo "${TEST_DROPBEAR_STATE:-true}"; fi ;;
+	'services:@.odhcpd.instances.*.running')
+		[ "${TEST_ODHCPD_STATE:-true}" = absent ] || echo "${TEST_ODHCPD_STATE:-true}" ;;
 	*:'@.interface[*].l3_device') [ -z "${TEST_DYNAMIC_CLAIM:-}" ] || echo "$TEST_DYNAMIC_CLAIM" ;;
 	*:'@.interface[*].device') : ;;
 	*:'@.interface') echo '[]' ;;
@@ -141,6 +163,7 @@ exit 0
 EOF
 chmod +x "$tmp/bin/"*
 baseline() {
+	rm -rf "$tmp/root/etc/routepolicy/state/init-transaction"
 	cat >"$tmp/config" <<'EOF'
 network.lan	interface
 network.lan.proto	static
@@ -151,12 +174,13 @@ network.wan.device	eth1
 network.policy	interface
 network.policy.proto	dhcp
 network.policy.device	eth2
+dhcp.@dnsmasq[0]	dnsmasq
 dhcp.lan	dhcp
 dhcp.lan.interface	lan
 dhcp.lan.ignore	0
 dhcp.other	dhcp
 dhcp.other.interface	other
-dhcp.other.ignore	0
+dhcp.other.ignore	1
 firewall.@zone[0]	zone
 firewall.@zone[0].name	lan
 firewall.@zone[0].network	lan
@@ -251,6 +275,18 @@ reject() {
 	if "$@" >"$tmp/rejected" 2>"$tmp/error"; then printf 'unexpected success: %s\n' "$*" >&2; exit 1; fi
 }
 apply_mock_plan() {
+	# The mock commit publishes the same section-field evidence as an applied WAL.
+	mock_wal="$tmp/root/etc/routepolicy/state/init-transaction/current"
+	mkdir -p "$mock_wal/fields"; cp "$1" "$mock_wal/candidate"
+	printf 'pending\n' >"$mock_wal/phase"
+	mock_index=0
+	while IFS="$(printf '\t')" read -r mock_action mock_key mock_value; do
+		mock_index=$((mock_index+1))
+		[ "$mock_action" = set ] || continue
+		mock_entry="$mock_wal/fields/$mock_index"; mkdir -p "$mock_entry"
+		printf '%s' "$mock_key" >"$mock_entry/key"; printf '%s' "$mock_value" >"$mock_entry/expected"
+		printf scalar >"$mock_entry/expected-type"; : >"$mock_entry/attempted"
+	done <"$1"
 	awk -F '\t' '$1=="set"{print $2 "\t" $3}' "$1" >>"$tmp/config"
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
@@ -267,6 +303,104 @@ multidevice_config() {
 	awk -F '\t' '{if(!($1 in v))keys[++n]=$1;v[$1]=$2}END{for(i=1;i<=n;i++)print keys[i] "\t" v[keys[i]]}' "$tmp/config" >"$tmp/config.new"
 	mv "$tmp/config.new" "$tmp/config"
 }
+optional_service_test() {
+	baseline
+	printf 'dhcp.other.ra\tserver\ndhcp.other.dhcpv6\tserver\ndhcp.other.ndp\trelay\ndhcp.other.user_note\tKEEP\n' >>"$tmp/config"
+	awk -F '\t' '$1~/^dhcp\.other(\.|$)/' "$tmp/config" >"$tmp/other-before"
+	"$tool" plan lan wan policy >"$tmp/optional-plan"
+	apply_mock_plan "$tmp/optional-plan"
+	cp "$tmp/config" "$tmp/optional-config"
+	printf '#!/bin/sh\nprintf "unexpected odhcpd lifecycle action\\n" >>"$TEST_TOPOLOGY_DIR/writes"\nexit 1\n' >"$tmp/odhcpd-installed"
+	chmod +x "$tmp/odhcpd-installed"
+	TEST_ODHCPD_STATE=absent "$tool" verify lan wan policy >"$tmp/verify-odhcpd-absent"
+	cp "$tmp/odhcpd-installed" "$tmp/root/etc/init.d/odhcpd"
+	TEST_ODHCPD_STATE=true "$tool" verify lan wan policy >"$tmp/verify-odhcpd-running"
+	TEST_ODHCPD_STATE=false "$tool" verify lan wan policy >"$tmp/verify-odhcpd-stopped"
+	for setting in ignore ra dhcpv6 ndp; do
+		awk -F '\t' -v key="dhcp.lan.$setting" 'BEGIN{OFS="\t"}$1==key{$2=($1~/\.ignore$/?0:"server")}{print}' "$tmp/optional-config" >"$tmp/config"
+		reject env TEST_ODHCPD_STATE=false "$tool" verify lan wan policy
+		cp "$tmp/optional-config" "$tmp/config"
+	done
+	for rule in dhcp4 dhcp6 ra; do
+		grep -vF "comment \"!fw4: routepolicy-init-$rule\"" "$tmp/nft" >"$tmp/missing-output-rule.nft"
+		reject env TEST_ODHCPD_STATE=false TEST_NFT_FILE="$tmp/missing-output-rule.nft" "$tool" verify lan wan policy
+		awk -v marker="!fw4: routepolicy-init-$rule\"" 'index($0,marker){sub(/jump drop_to_lan/,"accept")}{print}' "$tmp/nft" >"$tmp/allowed-output-rule.nft"
+		reject env TEST_ODHCPD_STATE=false TEST_NFT_FILE="$tmp/allowed-output-rule.nft" "$tool" verify lan wan policy
+	done
+	reject env TEST_ODHCPD_STATE=false TEST_UBUS_SERVICE_FAIL=1 "$tool" verify lan wan policy
+	reject env TEST_ODHCPD_STATE=false TEST_SERVICE_JSON='{"dropbear":' "$tool" verify lan wan policy
+	for state in false missing; do reject env TEST_ODHCPD_STATE=false TEST_DROPBEAR_STATE="$state" "$tool" verify lan wan policy; done
+	if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+		for state in true false; do
+			TEST_SERVICE_JSON="{\"dropbear\":{\"instances\":{\"main\":{\"running\":true}}},\"odhcpd\":{\"instances\":{\"main\":{\"running\":$state}}}}" "$tool" verify lan wan policy >"$tmp/verify-native-services-$state"
+		done
+		TEST_SERVICE_JSON='{"dropbear":{"instances":{"main":{"running":true}}}}' "$tool" verify lan wan policy >"$tmp/verify-native-services-absent"
+		reject env TEST_SERVICE_JSON='{"dropbear":{"instances":{"main":{"running":false}}}}' "$tool" verify lan wan policy
+		reject env TEST_SERVICE_JSON='{"odhcpd":{"instances":{"main":{"running":false}}}}' "$tool" verify lan wan policy
+	fi
+	cmp "$tmp/optional-config" "$tmp/config"
+	awk -F '\t' '$1~/^dhcp\.other(\.|$)/' "$tmp/config" >"$tmp/other-after"; cmp "$tmp/other-before" "$tmp/other-after"
+	[ ! -s "$tmp/writes" ]
+	rm "$tmp/root/etc/init.d/odhcpd"
+	printf '%s\n' 'optional odhcpd runtime: passed (absent/running/stopped, LAN disable and fw4 evidence, ubus/JSON/dropbear rejection, other network preserved, no lifecycle actions)'
+}
+if [ "${1:-}" = --optional-services ]; then optional_service_test; exit 0; fi
+# base614 #17 wrote scalar set fields without expected-type. The optional real
+# baseline planner lets the offline upgrade check use its original candidate too.
+legacy_ownership_test() {
+	baseline
+	"${TEST_BASE17_TOPOLOGY:-$tool}" plan lan wan policy >"$tmp/base17-plan"
+	apply_mock_plan "$tmp/base17-plan"
+	printf 'confirmed\n' >"$mock_wal/phase"
+	printf '0123456789abcdef0123456789abcdef\n' >"$mock_wal/token"
+	for legacy_field in "$mock_wal"/fields/*; do
+		[ -d "$legacy_field" ] || continue
+		rm "$legacy_field/expected-type"
+		printf scalar >"$legacy_field/type"; printf 0 >"$legacy_field/existed"; : >"$legacy_field/old"
+	done
+	cp "$tmp/config" "$tmp/legacy-config"
+	if ! "$tool" plan lan wan policy >"$tmp/upgrade-plan" 2>"$tmp/upgrade-error"; then
+		cat "$tmp/upgrade-error" >&2; printf 'legacy applied scalar WAL rejected\n' >&2; exit 1
+	fi
+	cmp "$tmp/config" "$tmp/legacy-config"
+	legacy_index=$(awk -F '\t' '$2=="firewall.rp_init_default4"{print NR;exit}' "$mock_wal/candidate")
+	legacy_entry="$mock_wal/fields/$legacy_index"
+	for legacy_type in scalar list 0 ''; do
+		printf '%s' "$legacy_type" >"$legacy_entry/expected-type"
+		if [ "$legacy_type" = scalar ]; then "$tool" plan lan wan policy >"$tmp/upgrade-control"
+		else reject "$tool" plan lan wan policy; fi
+		cmp "$tmp/config" "$tmp/legacy-config"
+	done
+	rm "$legacy_entry/expected-type"
+	printf scalar >"$tmp/legacy-scalar"; ln -s "$tmp/legacy-scalar" "$legacy_entry/expected-type"
+	reject "$tool" plan lan wan policy; rm "$legacy_entry/expected-type"
+	rm "$legacy_entry/attempted"; reject "$tool" plan lan wan policy; : >"$legacy_entry/attempted"
+	for legacy_phase in prepared expired rolled_back applying; do
+		printf '%s\n' "$legacy_phase" >"$mock_wal/phase"
+		reject "$tool" plan lan wan policy; cmp "$tmp/config" "$tmp/legacy-config"
+	done
+	printf 'confirmed\n' >"$mock_wal/phase"
+	"$tool" plan lan wan policy >"$tmp/upgrade-final"
+	cmp "$tmp/config" "$tmp/legacy-config"
+	printf '%s\n' 'legacy section ownership: passed (base17 scalar WAL, explicit types, attempted/phase/symlink protection, unchanged configuration)'
+}
+legacy_ownership_test
+if [ "${1:-}" = --legacy-upgrade ]; then exit 0; fi
+optional_service_test
+# A candidate with no committed section fields is never ownership evidence.
+for ownership_phase in prepared expired rolled_back applying pending; do
+	baseline
+	"$tool" plan lan wan policy >"$tmp/preview"
+	wal="$tmp/root/etc/routepolicy/state/init-transaction/current"
+	mkdir -p "$wal/fields"; cp "$tmp/preview" "$wal/candidate"
+	printf '%s\n' "$ownership_phase" >"$wal/phase"
+	printf 'firewall.rp_init_dns\trule\nfirewall.rp_init_dns.name\tLiving Room Printer\nfirewall.rp_init_dns.dest_port\t9100\nfirewall.rp_init_dns.target\tREJECT\n' >>"$tmp/config"
+	cp "$tmp/config" "$tmp/before"
+	reject "$tool" plan lan wan policy
+	grep -Fq 'reserved section already exists: firewall.rp_init_dns' "$tmp/error"
+	cmp "$tmp/config" "$tmp/before"
+done
+printf '%s\n' 'topology section provenance: passed (unwritten previews cannot adopt printer rules)'
 baseline
 cp "$tmp/config" "$tmp/before"
 "$tool" discover >"$tmp/discover"
@@ -761,5 +895,45 @@ reject env TEST_MANAGEMENT_IP=192.168.1.2 TEST_ACCESS_PREFIX=30 TEST_LOCAL_ADDRE
 grep -Fq 'EVIDENCE_MISSING' "$tmp/error"
 baseline
 TEST_MANAGEMENT_IP=10.17.1.1 TEST_ACCESS_PREFIX=1 TEST_LOCAL_ADDRESS_LINES='2: br-lan inet 10.17.1.1/1 scope global' TEST_ACCESS_GATEWAY=10.17.1.2 TEST_POLICY_ADDRESS=203.0.113.2 TEST_POLICY_GATEWAY=203.0.113.1 TEST_DEFAULT_DEVICE=br-lan TEST_DEFAULT_GATEWAY=10.17.1.2 TEST_FAIL_LOCAL_FIB=1 TEST_EXPECT_FIB_SOURCE=1.0.0.0 "$tool" plan lan lan policy >"$tmp/wide-source"
+# The direct DNS/IPv4-only plan is explicit and refuses unrelated duties.
+baseline
+"$tool" plan lan wan policy >"$tmp/dns-direct"
+grep -Fq 'set	dhcp.@dnsmasq[0].port	0' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.port	53' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.bind_device_name	br-lan' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.force_aaaa_soa	1' "$tmp/dns-direct"
+grep -Fq 'set	smartdns.rp_init.cache_file	/tmp/routepolicy/smartdns.cache' "$tmp/dns-direct"
+reject env TEST_NO_UPSTREAM=1 "$tool" plan lan wan policy
+TEST_NO_UPSTREAM=1 "$tool" plan lan wan policy - - - - - - - - '192.0.2.53#5353,192.0.2.54' '198.51.100.53#53' >"$tmp/dns-explicit"
+grep -Fq 'set	smartdns.rp_init_default_1.port	5353' "$tmp/dns-explicit"
+for invalid in '127.0.0.1' '224.0.0.1' '192.0.2.53#0' '192.0.2.53#65536' '192.0.2.53,,192.0.2.54'; do
+	reject "$tool" plan lan wan policy - - - - - - - - "$invalid" 198.51.100.53
+done
+printf 'network.wan6	interface\nnetwork.wan6.proto	dhcpv6\nnetwork.wan6.device	@wan\n' >>"$tmp/config"
+"$tool" plan lan wan policy >"$tmp/ipv4-only"
+grep -Fq 'set	network.wan6.disabled	1' "$tmp/ipv4-only"
+grep -Fq 'set	network.wan6.auto	0' "$tmp/ipv4-only"
+baseline
+printf 'network.foreign	interface\nnetwork.foreign.proto	static\nnetwork.foreign.device	eth1\n' >>"$tmp/config"
+reject "$tool" plan lan wan policy
+baseline
+sed 's/dhcp.other.ignore	1/dhcp.other.ignore	0/' "$tmp/config" >"$tmp/config.new"; mv "$tmp/config.new" "$tmp/config"
+reject "$tool" plan lan wan policy
+grep -Fq '其他 DHCP' "$tmp/error"
+baseline
+printf 'dhcp.@dnsmasq[0].enable_tftp	1\n' >>"$tmp/config"
+reject "$tool" plan lan wan policy
+baseline
+[ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
+for setting in route_table:0200 rule_priority:012000; do
+	baseline
+	printf 'routepolicy.main.%s\t%s\n' "${setting%:*}" "${setting#*:}" >>"$tmp/config"
+	cp "$tmp/config" "$tmp/numeric-before"
+	reject "$tool" plan lan wan policy
+	grep -Fq '无前导零的十进制整数' "$tmp/error"
+	cmp "$tmp/config" "$tmp/numeric-before"
+done
+baseline
+"$tool" plan lan wan policy >"$tmp/canonical-id-plan"
 [ ! -e "$tmp/writes" ] || { cat "$tmp/writes" >&2; exit 1; }
 printf '%s\n' 'init topology tests: passed'

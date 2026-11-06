@@ -1,5 +1,6 @@
 #!/bin/sh
-
+# OpenWrt ash supports function-local variables.
+# shellcheck disable=SC3043
 set -eu
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
@@ -10,121 +11,143 @@ case "$mode" in
 	live-save|live-restore) [ "$#" -eq 2 ] || exit 2 ;;
 	*) exit 2 ;;
 esac
+rp_writer_enter warm-state || { rp_output_error warm-state '写入门禁忙或初始化尚未完成'; exit 1; }
 rp_ensure_dirs
 
-live_snapshot_set() {
-	set_name=$1
-	target=$2
-	raw="$RP_RUN_DIR/live-$set_name.raw.$$"
-	parsed="$RP_RUN_DIR/live-$set_name.parsed.$$"
-	if ! nft list set inet routepolicy "$set_name" >"$raw" 2>/dev/null; then
-		rm -f "$raw" "$parsed"
-		return 1
-	fi
-	awk '
-		function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+if [ "$#" = 2 ]; then
+	snapshot=$2
+	case "$snapshot" in "$RP_RUN_DIR"/*) ;; *) exit 2 ;; esac
+	case "/${snapshot#"$RP_RUN_DIR/"}/" in *'/../'*|*'/./'*|*'//'*) exit 2 ;; esac
+	parent=$(dirname "$snapshot")
+	while [ "$parent" != "$RP_RUN_DIR" ]; do
+		[ ! -L "$parent" ] || exit 1
+		parent=$(dirname "$parent")
+	done
+	[ ! -L "$snapshot" ] || exit 1
+fi
+
+uptime_ms() {
+	LC_ALL=C awk 'NR==1 && NF==2 && $1~/^[0-9]+\.[0-9][0-9]$/ && $2~/^[0-9]+\.[0-9][0-9]$/ && $1<10000000000 {printf "%.0f\n",$1*1000;ok=1} END{exit !ok||NR!=1}' "$RP_ROOT/proc/uptime"
+}
+boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || boot=
+if ! printf '%s\n' "$boot" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || ! started=$(uptime_ms 2>/dev/null); then
+	rp_err 'warm-state: boot/monotonic time unavailable; snapshot skipped'
+	case "$mode" in save|live-save) exit 1 ;; *) exit 0 ;; esac
+fi
+work=$(mktemp -d "$RP_RUN_DIR/warm-state.XXXXXX")
+new=
+trap 'rm -rf "$work"; [ -z "$new" ] || rm -f "$new"' EXIT HUP INT TERM
+
+capture_set() {
+	local set_name=$1
+	nft list set inet routepolicy "$set_name" >"$work/raw" 2>/dev/null || return 1
+	LC_ALL=C awk -v set_name="$set_name" -v mode="$mode" '
+		function duration(text, total,part,value,unit,rank,previous,multiplier) {
+			previous=6
+			while(length(text)) {
+				if(!match(text,/^[0-9]+(ms|d|h|m|s)/))return -1
+				part=substr(text,1,RLENGTH);text=substr(text,RLENGTH+1)
+				value=part;sub(/[^0-9].*/,"",value);unit=part;sub(/^[0-9]+/,"",unit)
+				rank=(unit=="d"?5:unit=="h"?4:unit=="m"?3:unit=="s"?2:1)
+				multiplier=(unit=="d"?86400000:unit=="h"?3600000:unit=="m"?60000:unit=="s"?1000:1)
+				if(rank>=previous||length(value)>16||(value+0)>9007199254740991/multiplier)return -1
+				previous=rank;total+=value*multiplier
+				if(total>9007199254740991)return -1
+			}
+			return total+0
+		}
 		{
 			line=$0
-			if (!inside) {
-				if (line !~ /elements[[:space:]]*=[[:space:]]*\{/) next
-				sub(/^.*elements[[:space:]]*=[[:space:]]*\{/, "", line)
-				inside=1
-			}
+			if(!inside){if(line!~/elements[[:space:]]*=[[:space:]]*\{/)next;sub(/^.*elements[[:space:]]*=[[:space:]]*\{/,"",line);inside=1}
 			text=text " " line
-			if (line ~ /}/) { sub(/}.*/, "", text); inside=0 }
+			if(line~/}/){sub(/}.*/,"",text);inside=0}
 		}
 		END {
-			n=split(text, element, ",")
-			for (i=1; i<=n; i++) {
-				entry=trim(element[i])
-				if (entry == "") continue
-				fields=split(entry, token, /[[:space:]]+/)
-				ip=token[1]; expires=""
-				for (j=2; j<fields; j++) if (token[j] == "expires") { expires=token[j+1]; break }
-				printf "%s\t%s\n", ip, expires
+			if(inside)exit 1
+			n=split(text,entry,",")
+			for(i=1;i<=n;i++) {
+				gsub(/^[[:space:]]+|[[:space:]]+$/,"",entry[i]);if(entry[i]=="")continue
+				fields=split(entry[i],token,/[[:space:]]+/)
+				if(split(token[1],octet,".")!=4)exit 1
+				for(j=1;j<=4;j++)if(octet[j]!~/^[0-9]+$/||length(octet[j])>3||(octet[j]+0)>255)exit 1
+				if(fields==3&&token[2]=="expires")ttl=duration(token[3])
+				else if(fields==5&&token[2]=="timeout"&&token[4]=="expires"&&duration(token[3])>=0)ttl=duration(token[5])
+				else exit 1
+				if(ttl<0)exit 1
+				if(ttl>0) {
+					if(mode=="save"&&kept>=4096)continue
+					printf "%s\t%s\t%.0f\n",set_name,token[1],ttl;kept++
+				}
 			}
 		}
-	' "$raw" >"$parsed"
-	rm -f "$raw"
-	valid=1
-	tab=$(printf '\t')
-	while IFS="$tab" read -r ipaddr expires; do
-		[ -n "$ipaddr" ] || continue
-		if ! rp_is_ipv4 "$ipaddr"; then valid=0; break; fi
-		if [ -n "$expires" ]; then
-			case "$expires" in [0-9]*[!0-9dhms]*) valid=0; break ;; [0-9]*) ;; *) valid=0; break ;; esac
-			printf 'add element inet routepolicy %s { %s timeout %s }\n' "$set_name" "$ipaddr" "$expires" >>"$target"
-		else
-			printf 'add element inet routepolicy %s { %s }\n' "$set_name" "$ipaddr" >>"$target"
+	' "$work/raw"
+}
+save_snapshot() {
+	local target=$1 set_name
+	shift
+	[ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || return 1
+	new=$(mktemp "$target.XXXXXX") || return 1
+	printf 'routepolicy-warm-v1\t%s\t%s\n' "$boot" "$started" >"$new" || return 1
+	for set_name do
+		if ! capture_set "$set_name" >>"$new"; then
+			rp_err "warm-state: $set_name has unavailable/invalid expires evidence; snapshot not replaced"
+			return 1
 		fi
-	done <"$parsed"
-	rm -f "$parsed"
-	[ "$valid" -eq 1 ]
+	done
+	mv -f "$new" "$target" || return 1
+	new=
 }
+case "$mode" in
+	save)
+		save_snapshot "$RP_STATE_DIR/warm-domain_policy4.list" domain_policy4
+		save_snapshot "$RP_STATE_DIR/warm-domain_default4.list" domain_default4
+		exit 0 ;;
+	live-save) save_snapshot "$snapshot" domain_policy4 domain_default4; exit 0 ;;
+esac
 
-if [ "$mode" = live-save ]; then
-	snapshot=$2
-	case "$snapshot" in "$RP_RUN_DIR"/*) ;; *) exit 2 ;; esac
-	[ ! -L "$snapshot" ] || exit 1
-	new="$snapshot.new.$$"
-	trap 'rm -f "$new"' EXIT HUP INT TERM
-	umask 077
-	: >"$new"
-	live_snapshot_set domain_policy4 "$new" && live_snapshot_set domain_default4 "$new" || exit 1
-	mv -f "$new" "$snapshot"
-	trap - EXIT HUP INT TERM
-	exit 0
-fi
-
+read_snapshot() {
+	local file=$1 expected_set=$2
+	[ -f "$file" ] && [ ! -L "$file" ] || return 1
+	LC_ALL=C awk -F '\t' -v boot="$boot" -v now="$started" -v expected_set="$expected_set" '
+		function uint(value){return value~/^(0|[1-9][0-9]*)$/&&length(value)<=16&&(value+0)<=9007199254740991}
+		NR==1 {
+			if(NF!=3||$1!="routepolicy-warm-v1"||$2!=boot||!uint($3)||$3>now)exit 1
+			captured=$3;next
+		}
+		{
+			if(NF!=3||($1!="domain_policy4"&&$1!="domain_default4")||(expected_set!=""&&$1!=expected_set)||!uint($3))exit 1
+			if(split($2,octet,".")!=4)exit 1
+			for(i=1;i<=4;i++)if(octet[i]!~/^[0-9]+$/||length(octet[i])>3||(octet[i]+0)>255)exit 1
+			if(seen[$1,$2]++)exit 1
+			printf "%s\t%s\t%.0f\t%s\n",$1,$2,captured,$3
+		}
+		END{if(NR==0)exit 1}
+	' "$file" >"$work/part"
+}
+: >"$work/values"
 if [ "$mode" = live-restore ]; then
-	snapshot=$2
-	case "$snapshot" in "$RP_RUN_DIR"/*) ;; *) exit 2 ;; esac
-	[ -f "$snapshot" ] && [ ! -L "$snapshot" ] || exit 1
-	[ -s "$snapshot" ] || exit 0
-	nft -c -f "$snapshot" >/dev/null 2>&1 && nft -f "$snapshot" >/dev/null 2>&1
-	exit $?
+	if read_snapshot "$snapshot" ''; then cat "$work/part" >>"$work/values"
+	else rp_err 'warm-state: invalid/legacy/other-boot live snapshot skipped'; fi
+else
+	for set_name in domain_policy4 domain_default4; do
+		file="$RP_STATE_DIR/warm-$set_name.list"
+		[ -e "$file" ] || [ -L "$file" ] || continue
+		if read_snapshot "$file" "$set_name"; then cat "$work/part" >>"$work/values"
+		else rp_err "warm-state: invalid/legacy/other-boot $set_name snapshot skipped"; fi
+	done
 fi
-
-snapshot_set() {
-	set_name=$1; target="$RP_STATE_DIR/warm-$set_name.list"
-	raw="$RP_RUN_DIR/warm-$set_name.raw.$$"; normalized="$RP_STATE_DIR/.warm-$set_name.$$"
-	trap 'rm -f "$raw" "$normalized"' EXIT HUP INT TERM
-	nft list set inet routepolicy "$set_name" 2>/dev/null |
-		tr ',{}' '\n  ' |
-		awk '{ for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){print $i;break} }' |
-		sed -n '1,4096p' >"$raw"
-	if [ -s "$raw" ] && "$LIBEXEC/converters/plain-ipv4" "$raw" >"$normalized" 2>/dev/null; then
-		chmod 0600 "$normalized"; mv -f "$normalized" "$target"
-	else
-		rm -f "$normalized"
-		: >"$raw"; chmod 0600 "$raw"; mv -f "$raw" "$target"
-	fi
-	rm -f "$raw"
-	trap - EXIT HUP INT TERM
+[ -s "$work/values" ] || exit 0
+render_restore() {
+	# /proc/uptime truncates to 10ms; round restoration up to avoid renewing that fraction.
+	LC_ALL=C awk -F '\t' -v now="$1" '{remaining=$4-(now+10-$3);if(remaining>0)printf "add element inet routepolicy %s { %s timeout %.0fms }\n",$1,$2,remaining}' "$work/values" >"$work/restore.nft"
 }
-
-if [ "$mode" = save ]; then
-	snapshot_set domain_policy4
-	snapshot_set domain_default4
-	exit 0
+render_restore "$started"
+[ -s "$work/restore.nft" ] || exit 0
+nft -c -f "$work/restore.nft" >/dev/null 2>&1 || exit 1
+if ! current=$(uptime_ms 2>/dev/null) || [ "$current" -lt "$started" ]; then
+	rp_err 'warm-state: monotonic time moved backwards; restore skipped'; exit 0
 fi
-
-batch="$RP_RUN_DIR/warm-restore.nft.$$"
-trap 'rm -f "$batch"' EXIT HUP INT TERM
-: >"$batch"
-for set_name in domain_policy4 domain_default4; do
-	file="$RP_STATE_DIR/warm-$set_name.list"
-	[ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || continue
-	normalized="$RP_RUN_DIR/warm-$set_name.normalized.$$"
-	if ! ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/plain-ipv4" "$file" >"$normalized" 2>/dev/null; then rm -f "$normalized"; continue; fi
-	printf 'add element inet routepolicy %s { ' "$set_name" >>"$batch"
-	first=1
-	while IFS= read -r ipaddr; do
-		[ "$first" -eq 1 ] && first=0 || printf ', ' >>"$batch"
-		printf '%s timeout 10m' "$ipaddr" >>"$batch"
-	done <"$normalized"
-	printf ' }\n' >>"$batch"
-	rm -f "$normalized"
-done
-[ -s "$batch" ] || exit 0
-nft -c -f "$batch" >/dev/null 2>&1 && nft -f "$batch" >/dev/null 2>&1
+# Syntax checking can take time; commit only the still-valid subset with aged TTLs.
+render_restore "$current"
+[ -s "$work/restore.nft" ] || exit 0
+nft -f "$work/restore.nft" >/dev/null 2>&1

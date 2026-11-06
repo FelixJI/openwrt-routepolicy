@@ -45,6 +45,8 @@ grep -Fq 'nft-syntax-test.sh' tests/core/run.sh || fail 'core 测试未执行真
 grep -Fq 'nftables shellcheck' .github/workflows/build.yml || fail '构建工作流未安装 nft 语法检查器'
 grep -Fq 'nftables shellcheck' .github/workflows/release.yml || fail '发布工作流未安装 nft 语法检查器'
 if grep -R -Fq 'luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy' .github tests/luci/README.md; then fail 'CI 或测试说明仍引用错误的 rpcd exec 路径'; fi
+grep -Fq '+bind-dig' routepolicy/Makefile || fail '双协议 DNS 查询验证缺少 bind-dig 依赖'
+grep -Fq 'files/usr/libexec/routepolicy/init-dns' routepolicy/Makefile || fail '核心包未安装初始化 DNS 协调模块'
 grep -Fq 'smartdns-control' routepolicy/Makefile || fail '核心包未安装 SmartDNS 深模块'
 grep -Fq 'files/usr/libexec/routepolicy/observe' routepolicy/Makefile || fail '核心包未安装 observation 深模块'
 grep -Fq '/etc/routepolicy/user.d/local-hosts.list' routepolicy/Makefile || fail '本地主机文件未声明为 conffile'

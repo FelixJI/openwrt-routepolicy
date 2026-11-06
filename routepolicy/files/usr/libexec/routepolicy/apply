@@ -5,20 +5,158 @@ LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
 
 mode=${1:-apply}
-case "$mode" in apply|teardown) ;; *) rp_die '内部 apply 模式非法' ;; esac
+case "$mode" in apply|teardown|event|reconcile-event) ;; *) rp_die '内部 apply 模式非法' ;; esac
+if [ "$mode" = event ]; then rp_writer_event_mark; exit $?; fi
+rp_writer_enter apply || { rp_output_error apply '写入门禁忙或初始化尚未完成'; exit 1; }
+# Kernel writers stay bounded even if their invoking shell is killed.
+nft() { timeout -s KILL 15 nft "$@"; }
+ip() { timeout -s KILL 10 ip "$@"; }
+if [ "$mode" = reconcile-event ]; then
+	rp_writer_event_take || exit 0
+	if [ "$(rp_uci_get main enabled 0)" != 1 ]; then rp_writer_event_done; exit 0; fi
+	if ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply"; then rp_writer_event_done; exit 0; else exit 1; fi
+fi
+rp_ensure_dirs
+lock="$RP_RUN_DIR/apply.lock"
+rp_local_lock "$lock" || { rp_output_error apply '另一个应用操作正在进行'; exit 1; }
+trap 'rp_local_unlock "$lock"' EXIT
+trap 'exit 1' HUP INT TERM
 
 remove_owned_rule() {
 	priority=$1 mark=$2 mask=$3 table=$4
 	ip -4 rule del priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || true
 }
 
+# ip-full reports an absent IPv4 FIB as RC 2, rather than a successful empty dump.
+# Other failures, including the same text with a different RC, remain failures.
+read_policy_routes() {
+	policy_routes=$(LC_ALL=C ip -4 route show table "$1" 2>&1)
+	policy_routes_rc=$?
+	[ "$policy_routes_rc" -ne 0 ] || return 0
+	[ "$policy_routes_rc" -eq 2 ] &&
+		printf '%s\n' "$policy_routes" | grep -Fxq 'Error: ipv4: FIB table does not exist.' &&
+		printf '%s\n' "$policy_routes" | awk '$0!="Error: ipv4: FIB table does not exist."&&$0!="Dump terminated"&&$0!="Dump terminated."{exit 1}' || return 1
+	policy_routes=
+}
+
+# An old boot's schema-1 record cannot authorize deletion of this boot's objects.
+# Only the authenticated initialization rollback may retire its stale metadata,
+# after independent successful reads prove that all relevant kernel objects vanished.
+retire_crossboot_metadata() {
+	# A verified current-boot intent is stronger than the old WAL boot alone.
+	[ "${IPR_RECOVERED:-0}" != 1 ] || return 1
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && [ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ] || return 1
+	restore_wal="$RP_STATE_DIR/init-transaction/current"
+	[ -e "$restore_wal" ] || [ -L "$restore_wal" ] || return 1
+	for restore_path in "$RP_STATE_DIR/init-transaction" "$restore_wal"; do
+		[ -d "$restore_path" ] && [ ! -L "$restore_path" ] || return 2
+	done
+	[ -f "$restore_wal/boot-id" ] && [ ! -L "$restore_wal/boot-id" ] || return 2
+	restore_boot=$(cat "$restore_wal/boot-id") && running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 2
+	for restore_id in "$restore_boot" "$running_boot"; do
+		printf '%s\n' "$restore_id" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || return 2
+	done
+	[ "$restore_boot" != "$running_boot" ] || return 1
+	rp_writer_owned || return 2
+	for restore_file in phase policy-active policy-attempted token candidate; do
+		[ -f "$restore_wal/$restore_file" ] && [ ! -L "$restore_wal/$restore_file" ] || return 2
+	done
+	[ "$(cat "$restore_wal/phase")" = rolling_back ] || return 2
+	restore_required=$(cat "$restore_wal/policy-active") || return 2
+	case "$restore_required:$mode" in 0:teardown|1:apply) ;; *) return 2 ;; esac
+	restore_token=$(cat "$restore_wal/token") || return 2
+	[ "${#restore_token}" -eq 32 ] || return 2
+	case "$restore_token" in *[!0-9a-f]*) return 2 ;; esac
+	[ "$mode" != apply ] || [ "${ROUTEPOLICY_INIT_GENERATION:-}" = "$restore_token" ] || return 2
+	table=$(rp_uci_get main route_table 200); priority=$(rp_uci_get main rule_priority 12000)
+	mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
+	rp_uint_between "$table" 1 252 && rp_uint_between "$priority" 1 32765 &&
+		rp_is_mark_bit "$mark" && [ "$mark" = "$mask" ] || return 2
+	if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ]; then
+		[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] || return 2
+		awk -F= '$1~/^(schema|route_table|rule_priority|mark|mark_mask|policy_interface)$/{if(NF!=2||seen[$1]++)bad=1;n++} END{exit bad||n!=6}' "$RP_STATE_DIR/applied" || return 2
+		[ "$(rp_state_get schema)" = 1 ] && [ "$(rp_state_get route_table)" = "$table" ] &&
+			[ "$(rp_state_get rule_priority)" = "$priority" ] && [ "$(rp_state_get mark)" = "$mark" ] &&
+			[ "$(rp_state_get mark_mask)" = "$mask" ] || return 2
+		restore_interface=$(awk -F '\t' '$1=="set"&&$2=="routepolicy.main.policy_interface"&&NF==3{print $3}' "$restore_wal/candidate") || return 2
+		rp_is_name "$restore_interface" 32 || return 2
+		if [ "$(rp_state_get policy_interface)" != "$restore_interface" ]; then
+			# An earlier rollback may already have restored the original enabled policy.
+			[ "$restore_required" = 1 ] && [ "$(rp_state_get policy_interface)" = "$(rp_uci_get main policy_interface '')" ] || return 2
+		fi
+	fi
+	# A catalog restored from the old WAL belongs to the original DNS configuration.
+	# Preserve that exact copy; an unknown publication may belong to this boot.
+	if [ -e "$RP_ACTIVE_DIR" ] || [ -L "$RP_ACTIVE_DIR" ]; then
+		[ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ] || return 2
+		restore_entries=$(find "$RP_ACTIVE_DIR" -mindepth 1 ! -type f) && [ -z "$restore_entries" ] || return 2
+		restore_entries=$(find "$RP_ACTIVE_DIR" -mindepth 1 ! -name generation ! -name domain-policy.list ! -name domain-default.list) && [ -z "$restore_entries" ] || return 2
+		for restore_file in generation domain-policy.list domain-default.list; do
+			[ -f "$RP_ACTIVE_DIR/$restore_file" ] && [ ! -L "$RP_ACTIVE_DIR/$restore_file" ] || return 2
+		done
+		if [ "$restore_required" = 1 ] && [ "$(cat "$RP_ACTIVE_DIR/generation")" = "$restore_token" ]; then
+			# /tmp is cleared by cold boot. This token publication is this recovery's
+			# commit, unlike persistent policy-restore-result from a previous boot.
+			[ "$(rp_state_get policy_interface)" = "$(rp_uci_get main policy_interface '')" ] || return 2
+			[ ! -L "$restore_wal/dns-active-old" ] || return 2
+			if [ -e "$restore_wal/dns-active-old" ]; then
+				[ -d "$restore_wal/dns-active-old" ] && [ -f "$restore_wal/dns-active-old/generation" ] && [ ! -L "$restore_wal/dns-active-old/generation" ] || return 2
+				restore_old_generation=$(cat "$restore_wal/dns-active-old/generation") || return 2
+				case "$restore_old_generation" in ''|*[!A-Za-z0-9_.-]*|?????????????????????????????????????????????????????????????????*) return 2 ;; esac
+				[ "$restore_old_generation" != "$restore_token" ] || return 2
+			fi
+			# policy_sync still verifies the live policy; do not reapply or clean it.
+			return 3
+		fi
+		for restore_path in "$RP_ACTIVE_DIR" "$restore_wal/dns-active-old"; do
+			[ -d "$restore_path" ] && [ ! -L "$restore_path" ] || return 2
+			restore_entries=$(find "$restore_path" -mindepth 1 ! -type f) && [ -z "$restore_entries" ] || return 2
+			restore_entries=$(find "$restore_path" -mindepth 1 ! -name generation ! -name domain-policy.list ! -name domain-default.list) && [ -z "$restore_entries" ] || return 2
+		done
+		for restore_file in generation domain-policy.list domain-default.list; do
+			cmp -s "$RP_ACTIVE_DIR/$restore_file" "$restore_wal/dns-active-old/$restore_file" || return 2
+		done
+	fi
+	restore_rules=$(ip -4 -N rule show) || return 2
+	printf '%s\n' "$restore_rules" | awk -v p="$priority:" -v t="$table" 'NF&&$1!~/^[0-9]+:$/{bad=1}$1==p{bad=1}{for(i=1;i<NF;i++)if(($i=="lookup"||$i=="table")&&$(i+1)==t)bad=1}END{exit bad}' || return 2
+	read_policy_routes "$table" && [ -z "$policy_routes" ] || return 2
+	restore_tables=$(nft list tables) || return 2
+	printf '%s\n' "$restore_tables" | awk 'NF&&(NF!=3||$1!="table"||$3=="routepolicy"){bad=1}END{exit bad}' || return 2
+	rm -f "$RP_STATE_DIR/applied" || return 2
+	[ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] || return 2
+}
+
+. "$LIBEXEC/init-policy-runtime"
+ipr_context || { rp_output_error apply "${IPR_ERROR:-初始化运行态意图的门禁或 WAL 身份无效}"; exit 1; }
+ipr_recover || { rp_output_error apply "${IPR_ERROR:-初始化运行态与写前意图不一致；已保留未知对象和恢复证据}"; exit 1; }
+if retire_crossboot_metadata; then
+	# Consumed by the private runtime-intent helper before its first write.
+	# shellcheck disable=SC2034
+	IPR_CROSSBOOT_EMPTY=1
+	if [ "$mode" = teardown ]; then
+		ipr_finish || { rp_output_error apply '跨启动元数据清理后，初始化意图未能退休；请重试恢复'; exit 1; }
+		rp_output_ok apply '跨启动恢复：内核运行态已消失，仅移除旧 applied 记录'
+		exit 0
+	fi
+else
+	restore_result=$?
+	if [ "$restore_result" -eq 3 ]; then
+		ipr_finish || { rp_output_error apply '本启动原策略已发布，但初始化意图未能退休；请重试恢复'; exit 1; }
+		rp_output_ok apply '本启动已发布原策略；保留运行态供恢复校验'; exit 0
+	fi
+	[ "$restore_result" -eq 1 ] || { rp_output_error apply '跨启动恢复归属或空运行态无法证明；已保留全部对象与 applied 状态'; exit 1; }
+fi
+
 if [ "$mode" = teardown ]; then
+	if [ "$IPR_CONTEXT" = 1 ] && [ "$IPR_ACTIVE" = 0 ] && [ ! -e "$IPR_INTENT" ] && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ]; then
+		ipr_legacy_empty || { rp_output_error apply '旧初始化缺少运行态归属证据，无法证明零残留；已保留现场，未猜测清理'; exit 1; }
+	fi
 	rp_ensure_dirs
 	nft_present=0
 	if nft list table inet routepolicy >/dev/null 2>&1; then
 		nft_present=1
 		if [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
-			"$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
+			timeout -s KILL 10 "$LIBEXEC/warm-state" save >/dev/null 2>&1 || true
 		fi
 	fi
 	# Stop must remove what was actually applied, even when UCI identifiers were
@@ -40,7 +178,7 @@ if [ "$mode" = teardown ]; then
 	smartdns_backup="$RP_SMARTDNS_FILE.teardown.$$"
 	smartdns_uci_backup="$RP_RUN_DIR/smartdns.teardown.$$.uci"
 	uci -q export smartdns >"$smartdns_uci_backup" 2>/dev/null || : >"$smartdns_uci_backup"
-	if [ -e "$RP_SMARTDNS_FILE" ]; then
+	if [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ "${ROUTEPOLICY_INIT_RESTORE:-0}" != 1 ] && [ -e "$RP_SMARTDNS_FILE" ]; then
 		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		[ ! -e "$smartdns_backup" ] || { rp_output_error apply 'SmartDNS teardown 候选路径冲突'; exit 1; }
@@ -51,23 +189,23 @@ if [ "$mode" = teardown ]; then
 			rp_output_error apply '无法移除 SmartDNS 片段登记；已恢复原片段'
 			exit 1
 		fi
-		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1; then
+		if [ -x "$RP_ROOT/etc/init.d/smartdns" ] && ! rp_native_service smartdns reload >/dev/null 2>&1; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
 			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
-			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+			rp_native_service smartdns reload >/dev/null 2>&1 || true
 			rp_output_error apply 'SmartDNS 重载失败；已恢复原片段且未拆除策略规则'
 			exit 1
 		fi
 		if rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 			mv "$smartdns_backup" "$RP_SMARTDNS_FILE" >/dev/null 2>&1 || true
 			[ ! -s "$smartdns_uci_backup" ] || { uci -q import smartdns <"$smartdns_uci_backup" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; }
-			"$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+			rp_native_service smartdns reload >/dev/null 2>&1 || true
 			rp_output_error apply 'SmartDNS 实际生成配置仍加载 90 片段；已回滚'
 			exit 1
 		fi
 	fi
 	cleanup_failed=
-	if [ "$have_applied" -eq 1 ]; then
+	if [ "$have_applied" -eq 1 ] && [ "$IPR_RECOVERED" != 1 ]; then
 		remove_owned_rule "$priority" "$mark" "$mask" "$table"
 		if rules_after=$(ip -4 rule show 2>/dev/null); then
 			if printf '%s\n' "$rules_after" | awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" \
@@ -78,8 +216,8 @@ if [ "$mode" = teardown ]; then
 			cleanup_failed='无法验证策略 ip rule 是否已删除'
 		fi
 		ip -4 route flush table "$table" >/dev/null 2>&1 || true
-		if routes_after=$(ip -4 route show table "$table" 2>/dev/null); then
-			[ -z "$routes_after" ] || cleanup_failed="${cleanup_failed:+$cleanup_failed；}策略路由表仍有残留"
+		if read_policy_routes "$table"; then
+			[ -z "$policy_routes" ] || cleanup_failed="${cleanup_failed:+$cleanup_failed；}策略路由表仍有残留"
 		else
 			cleanup_failed="${cleanup_failed:+$cleanup_failed；}无法验证策略路由表是否已清空"
 		fi
@@ -101,15 +239,20 @@ if [ "$mode" = teardown ]; then
 		rp_output_error apply 'applied 状态不完整或不合法；未猜测清理任何策略路由表，且已保留状态供人工诊断'
 		exit 1
 	fi
-	[ "$have_applied" -eq 0 ] || rm -f "$RP_STATE_DIR/applied"
-	if [ -e "$RP_ACTIVE_DIR" ]; then
+	if [ "$have_applied" -eq 1 ] && ! { rm -f "$RP_STATE_DIR/applied" && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ]; }; then
+		rp_output_error apply '无法移除已清理的 applied 记录；未退休初始化意图'
+		exit 1
+	fi
+	if [ -e "$RP_ACTIVE_DIR" ] || [ -L "$RP_ACTIVE_DIR" ]; then
 		if [ -d "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ]; then
-			rm -rf "$RP_ACTIVE_DIR"
+			rm -rf "$RP_ACTIVE_DIR" || { rp_output_error apply '无法移除已知 active catalog；未退休初始化意图'; exit 1; }
+			[ ! -e "$RP_ACTIVE_DIR" ] && [ ! -L "$RP_ACTIVE_DIR" ] || { rp_output_error apply '已知 active catalog 删除后仍存在；未退休初始化意图'; exit 1; }
 		else
 			rp_output_error apply 'active catalog 不是安全目录；未删除该路径'
 			exit 1
 		fi
 	fi
+	ipr_finish || { rp_output_error apply '清理已完成，但未能移除初始化写前意图；请重试恢复'; exit 1; }
 	if [ "$owned_state_found" -eq 1 ]; then
 		rp_output_ok apply '停用清理完成：已删除 RoutePolicy 自有表、规则、路由和 SmartDNS 片段'
 	else
@@ -118,6 +261,7 @@ if [ "$mode" = teardown ]; then
 	exit 0
 fi
 
+[ ! -L "$RP_STATE_DIR/applied" ] && { [ ! -e "$RP_STATE_DIR/applied" ] || [ -f "$RP_STATE_DIR/applied" ]; } || { rp_output_error apply 'applied 不是安全普通文件；未执行内核写入'; exit 1; }
 validation=$(ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" 2>&1)
 if [ "$?" -ne 0 ]; then
 	rp_output_error apply "应用前校验失败: $validation"
@@ -131,12 +275,7 @@ if [ "$enabled" != 1 ]; then
 fi
 
 rp_ensure_dirs
-lock="$RP_RUN_DIR/apply.lock"
-if ! mkdir "$lock" 2>/dev/null; then
-	rp_output_error apply '另一个应用操作正在进行'
-	exit 1
-fi
-work=$(mktemp -d "$RP_RUN_DIR/apply.XXXXXX") || { rmdir "$lock"; exit 1; }
+work=$(mktemp -d "$RP_RUN_DIR/apply.XXXXXX") || exit 1
 active_had_previous=0
 active_published=0
 active_swap_started=0
@@ -147,7 +286,7 @@ cleanup() {
 		[ ! -d "$work/active.previous" ] || mv "$work/active.previous" "$RP_ACTIVE_DIR" >/dev/null 2>&1 || true
 	fi
 	rm -rf "$work"
-	rmdir "$lock" 2>/dev/null || true
+	rp_local_unlock "$lock"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -170,7 +309,7 @@ old_source_idle_timeout=$(rp_state_get source_idle_timeout 2>/dev/null) || old_s
 old_source_max_entries=$(rp_state_get source_max_entries 2>/dev/null) || old_source_max_entries=
 old_managed_devices=$(rp_state_get managed_devices 2>/dev/null) || old_managed_devices=
 
-if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/render" >"$work/render.log" 2>&1; then
+if ! ROUTEPOLICY_OUTPUT=text timeout -s KILL 30 "$LIBEXEC/render" >"$work/render.log" 2>&1; then
 	rp_output_error apply "候选配置生成失败: $(tr '\n' ';' <"$work/render.log")"
 	exit 1
 fi
@@ -187,7 +326,7 @@ else
 	: >"$active_new/domain-policy.list"
 	: >"$active_new/domain-default.list"
 fi
-active_generation="$(date -u +%Y%m%dT%H%M%SZ).$$"
+active_generation=${ROUTEPOLICY_INIT_GENERATION:-$(date -u +%Y%m%dT%H%M%SZ).$$}
 case "$active_generation" in ''|*[!A-Za-z0-9_.-]*|?????????????????????????????????????????????????????????????????*) rp_output_error apply '无法生成安全的 active catalog generation'; exit 1 ;; esac
 printf '%s\n' "$active_generation" >"$active_new/generation"
 chmod 0600 "$active_new/generation" "$active_new/domain-policy.list" "$active_new/domain-default.list"
@@ -223,7 +362,7 @@ live_snapshot=
 for object in \
 	'set domain_policy4' 'set domain_default4' 'set static_policy4' 'set static_default4' \
 	'set source_ingress4' 'set source_egress4' \
-	'chain prerouting' 'chain output' 'chain classify' \
+	'chain prerouting' 'chain dns_prerouting' 'chain output' 'chain classify' \
 	'chain source_prerouting' 'chain source_postrouting'; do
 	type=${object%% *}; name=${object#* }
 	nft "list" "$type" inet routepolicy "$name" >/dev/null 2>&1 || incremental=0
@@ -240,12 +379,12 @@ if [ "$incremental" -eq 1 ]; then
 	candidate="$RP_RUN_DIR/update.nft"
 else
 	if nft list table inet routepolicy >"$work/nft.previous" 2>/dev/null; then
-		live_snapshot="$work/live-snapshot.nft"
-		if ! "$LIBEXEC/warm-state" live-save "$live_snapshot" >"$work/live-save.log" 2>&1; then
-			rp_output_error apply "无法在完整事务前保存动态集合 live snapshot: $(tr '\n' ';' <"$work/live-save.log")"
+		# Keep the producer sets themselves: no snapshot race and no TTL renewal.
+		if ! rp_nft_rebuild "$RP_NFT_FILE" "$work/nft.full"; then
+			rp_output_error apply '旧动态 DNS 集合缺失或类型不兼容；已保留原运行态，请先恢复两个 ipv4_addr/timeout 集合后重试'
 			exit 1
 		fi
-		{ printf 'delete table inet routepolicy\n'; cat "$RP_NFT_FILE"; } >"$work/nft.full"
+		live_snapshot=retained
 		candidate="$work/nft.full"
 	else
 		: >"$work/nft.previous.absent"
@@ -284,8 +423,9 @@ uci -q export smartdns >"$work/smartdns.uci.previous" 2>/dev/null || : >"$work/s
 restore_previous() {
 	restore_active || true
 	if [ -s "$work/nft.previous" ]; then
-		{ printf 'delete table inet routepolicy\n'; cat "$work/nft.previous"; } >"$work/nft.restore"
-		nft -f "$work/nft.restore" >/dev/null 2>&1 || true
+		if rp_nft_rebuild "$work/nft.previous" "$work/nft.restore"; then
+			nft -f "$work/nft.restore" >/dev/null 2>&1 || true
+		fi
 	else
 		nft delete table inet routepolicy >/dev/null 2>&1 || true
 	fi
@@ -306,30 +446,31 @@ restore_previous() {
 	else
 		rm -f "$RP_SMARTDNS_FILE"
 	fi
-	if [ -s "$work/smartdns.uci.previous" ]; then
+	if [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ -s "$work/smartdns.uci.previous" ]; then
 		uci -q import smartdns <"$work/smartdns.uci.previous" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true
 	fi
 }
 
 failed=
+ipr_prepare || { rp_output_error apply "${IPR_ERROR:-不能持久化可信初始化运行态写前意图；未执行本次内核写入}"; exit 1; }
 if ! nft -f "$candidate" >"$work/nft-apply.log" 2>&1; then
 	failed="nft 原子事务失败: $(tr '\n' ';' <"$work/nft-apply.log")"
 fi
 
-if [ -z "$failed" ] && [ "$incremental" -eq 0 ]; then
-	if [ -n "$live_snapshot" ]; then
-		if ! "$LIBEXEC/warm-state" live-restore "$live_snapshot" >"$work/live-restore.log" 2>&1; then
-			failed="动态集合 live snapshot 恢复失败: $(tr '\n' ';' <"$work/live-restore.log")"
-		fi
-	elif [ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
-		if ! "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
-			printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
-		fi
+if [ -z "$failed" ] && [ "$incremental" -eq 0 ] && [ -z "$live_snapshot" ] && \
+	[ "$(rp_uci_get main warm_restore 1)" = 1 ]; then
+	if ! timeout -s KILL 10 "$LIBEXEC/warm-state" restore >"$work/warm-restore.log" 2>&1; then
+		printf '%s warm restore skipped after validation failure\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$RP_STATE_DIR/last-error"
 	fi
 fi
 
 if [ -z "$failed" ]; then
-	if ! ip -4 rule show | awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" '$1==p&&index($0,m)>0&&($0~("lookup "t"([[:space:]]|$)")||$0~("table "t"([[:space:]]|$)")){found=1} END{exit !found}'; then
+	if [ "$IPR_ENABLED" = 1 ]; then
+		# The real init gate and persisted before-rule already proved ownership.
+		if [ "$IPR_RULE_NOW" = 0 ]; then
+			ip -4 rule add priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || failed='无法安装策略 ip rule'
+		fi
+	elif ! ip -4 rule show | awk -v p="$priority:" -v m="$mark/$mask" -v t="$table" '$1==p&&index($0,m)>0&&($0~("lookup "t"([[:space:]]|$)")||$0~("table "t"([[:space:]]|$)")){found=1} END{exit !found}'; then
 		ip -4 rule add priority "$priority" fwmark "$mark/$mask" lookup "$table" >/dev/null 2>&1 || failed='无法安装策略 ip rule'
 	fi
 fi
@@ -342,12 +483,14 @@ if [ -z "$failed" ]; then
 fi
 if [ -z "$failed" ]; then
 	ip -4 route del table "$table" default metric 10 >/dev/null 2>&1 || true
-	if [ "$old_table" = "$table" ] && rp_is_device "$old_policy_device" && printf '%s\n' "$old_policy_cidr" | grep -Eq '^[0-9.]+/[0-9]+$'; then
+	if [ "$IPR_ENABLED" = 1 ]; then
+		ipr_remove_old_connected || failed='无法删除写前已记录的旧连接路由'
+	elif [ "$old_table" = "$table" ] && rp_is_device "$old_policy_device" && printf '%s\n' "$old_policy_cidr" | grep -Eq '^[0-9.]+/[0-9]+$'; then
 		ip -4 route del table "$table" "$old_policy_cidr" dev "$old_policy_device" metric 10 >/dev/null 2>&1 || true
 	fi
-	if rp_interface_up "$policy_if" && rp_is_device "$policy_device"; then
+	if [ -z "$failed" ] && ipr_policy_online && rp_is_device "$policy_device"; then
 		if rp_is_ipv4 "$policy_address" && rp_uint_between "$policy_prefix" 0 32; then
-			policy_cidr=$(rp_network_cidr "$policy_address" "$policy_prefix")
+			[ "$IPR_ENABLED" = 1 ] || policy_cidr=$(rp_network_cidr "$policy_address" "$policy_prefix")
 			ip -4 route replace table "$table" "$policy_cidr" dev "$policy_device" scope link src "$policy_address" metric 10 >/dev/null 2>&1 || failed='无法安装策略接口直连路由'
 		else
 			failed='策略接口在线但缺少合法 IPv4 地址/前缀'
@@ -379,7 +522,7 @@ else
 	fi
 fi
 
-if [ -z "$failed" ]; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ]; then
 	if [ "$smartdns_enabled" = 1 ]; then
 		rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1 || failed='无法登记 SmartDNS 适配片段'
 	else
@@ -387,22 +530,22 @@ if [ -z "$failed" ]; then
 	fi
 fi
 
-if [ -z "$failed" ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && { [ "$smartdns_enabled" = 1 ] || [ "$smartdns_changed" = 1 ]; }; then
 	if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
-		"$RP_ROOT/etc/init.d/smartdns" reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
+		rp_native_service smartdns reload >"$work/smartdns-reload.log" 2>&1 || failed="SmartDNS 重载失败: $(tr '\n' ';' <"$work/smartdns-reload.log")"
 	fi
 fi
 
-if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 1 ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 	failed='SmartDNS 实际生成配置未加载 90 片段'
 fi
-if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 0 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
+if [ -z "$failed" ] && [ "${ROUTEPOLICY_DNS_DEFER:-0}" != 1 ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ] && [ "$smartdns_enabled" = 0 ] && rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE"; then
 	failed='SmartDNS 实际生成配置仍加载已关闭的 90 片段'
 fi
 
 if [ -n "$failed" ]; then
 	restore_previous
-	[ -x "$RP_ROOT/etc/init.d/smartdns" ] && "$RP_ROOT/etc/init.d/smartdns" reload >/dev/null 2>&1 || true
+	[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || { [ -x "$RP_ROOT/etc/init.d/smartdns" ] && rp_native_service smartdns reload >/dev/null 2>&1 || true; }
 	rp_output_error apply "$failed；已尝试恢复应用前状态"
 	exit 1
 fi
@@ -415,7 +558,8 @@ if rp_is_uint "$old_table" && rp_is_uint "$old_priority" && rp_is_hex32 "$old_ma
 fi
 
 umask 077
-cat >"$RP_STATE_DIR/applied" <<EOF
+applied_new=$(mktemp "$RP_STATE_DIR/applied.XXXXXX") || { rp_output_error apply '无法创建 applied 发布候选；未报告成功'; exit 1; }
+cat >"$applied_new" <<EOF
 schema=$RP_SCHEMA_VERSION
 route_table=$table
 rule_priority=$priority
@@ -429,6 +573,16 @@ source_idle_timeout=$source_idle_timeout
 source_max_entries=$source_max_entries
 managed_devices=$managed_devices
 EOF
-date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-apply"
+applied_write_rc=$?
+if [ "$applied_write_rc" -ne 0 ] || ! {
+chmod 600 "$applied_new" && sync &&
+[ ! -L "$RP_STATE_DIR/applied" ] && { [ ! -e "$RP_STATE_DIR/applied" ] || [ -f "$RP_STATE_DIR/applied" ]; } &&
+mv -f "$applied_new" "$RP_STATE_DIR/applied" && sync; }; then
+	rm -f "$applied_new"
+	rp_output_error apply 'applied 原子发布失败；未报告成功'
+	exit 1
+fi
 active_committed=1
+ipr_finish || { rp_output_error apply 'applied 已发布，但初始化意图清理失败；请重试恢复'; exit 1; }
+date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-apply"
 rp_output_ok apply "已应用；nft 使用$([ "$incremental" -eq 1 ] && printf '增量事务并保留动态集合' || printf '完整原子事务')"

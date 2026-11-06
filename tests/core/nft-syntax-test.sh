@@ -22,6 +22,14 @@ TEST_ROUTE_LOCAL_TRAFFIC=1 TEST_SOURCE_ACCOUNTING=1 \
 rules="$tmp/tmp/routepolicy/rules.nft"
 if [ "$(id -u)" -eq 0 ]; then
 	nft -c -f "$rules"
+	if [ "${TEST_NFT_ISOLATED:-0}" = 1 ]; then
+		if nft list table inet routepolicy >/dev/null 2>&1; then
+			printf 'isolated commit test requires an empty routepolicy table namespace\n' >&2; exit 1
+		fi
+		# Dry-run accepts some context-invalid expressions that commit rejects.
+		nft -f "$rules"
+		nft delete table inet routepolicy
+	fi
 elif command -v sudo >/dev/null 2>&1; then
 	sudo -- nft -c -f "$rules"
 else

@@ -3,12 +3,14 @@
 set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
+rp_writer_enter rollback || { rp_output_error rollback '写入门禁忙或初始化尚未完成'; exit 1; }
 
 rp_ensure_dirs
 [ -d "$RP_MANAGED_PREVIOUS" ] && [ -n "$(find "$RP_MANAGED_PREVIOUS" -type f -name '*.list' -print -quit 2>/dev/null)" ] || { rp_output_error rollback '没有可回滚的 previous 清单'; exit 1; }
 lock="$RP_RUN_DIR/update.lock"
-mkdir "$lock" 2>/dev/null || { rp_output_error rollback '更新或回滚操作正在进行'; exit 1; }
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
+rp_local_lock "$lock" || { rp_output_error rollback '更新或回滚操作正在进行'; exit 1; }
+trap 'rp_local_unlock "$lock"' EXIT
+trap 'exit 1' HUP INT TERM
 swap="$RP_ETC/managed.d/swap.$$"
 mv "$RP_MANAGED_CURRENT" "$swap" && mv "$RP_MANAGED_PREVIOUS" "$RP_MANAGED_CURRENT" && mv "$swap" "$RP_MANAGED_PREVIOUS" || { rp_output_error rollback '目录原子交换失败'; exit 1; }
 if [ "$(rp_uci_get main enabled 0)" = 1 ] && ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply" >/dev/null 2>&1; then

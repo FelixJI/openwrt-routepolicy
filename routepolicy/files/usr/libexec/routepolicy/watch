@@ -5,8 +5,9 @@ LIBEXEC=${ROUTEPOLICY_LIBEXEC:-/usr/libexec/routepolicy}
 . "$LIBEXEC/common"
 
 trap 'exit 0' TERM INT
-rp_ensure_dirs
+mkdir -p "$RP_RUN_DIR"
 while :; do
+	if rp_writer_event_pending; then "$LIBEXEC/apply" reconcile-event >"$RP_RUN_DIR/event-reconcile.log" 2>&1 || true; fi
 	if [ "$(rp_uci_get main enabled 0)" = 1 ] && [ "$(rp_uci_get main auto_update 1)" = 1 ]; then
 		now_date=$(date +%Y-%m-%d)
 		now_hour=$(date +%H | sed 's/^0//'); [ -n "$now_hour" ] || now_hour=0
@@ -15,9 +16,7 @@ while :; do
 		target_minute=$(rp_uci_get main update_minute 17)
 		last_date=; [ ! -f "$RP_STATE_DIR/last-update-attempt-day" ] || last_date=$(sed -n '1p' "$RP_STATE_DIR/last-update-attempt-day")
 		if rp_schedule_due "$now_date" "$now_hour" "$now_minute" "$target_hour" "$target_minute" "$last_date"; then
-			attempt="$RP_STATE_DIR/.last-update-attempt-day.$$"
-			printf '%s\n' "$now_date" >"$attempt" && mv -f "$attempt" "$RP_STATE_DIR/last-update-attempt-day"
-			if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/update" >"$RP_RUN_DIR/scheduled-update.log" 2>&1; then
+			if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/update" scheduled >"$RP_RUN_DIR/scheduled-update.log" 2>&1; then
 				printf '%s scheduled update failed: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(tr '\n' ';' <"$RP_RUN_DIR/scheduled-update.log")" >"$RP_STATE_DIR/last-error"
 			fi
 		fi

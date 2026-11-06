@@ -14,6 +14,7 @@ case "$name" in
 	*) usage ;;
 esac
 case "$action" in read|write) ;; *) usage ;; esac
+rp_writer_enter user-list || { rp_output_error user-list '写入门禁忙或初始化尚未完成'; exit 1; }
 
 rp_ensure_dirs
 target="$RP_USER_DIR/$name.list"
@@ -39,7 +40,7 @@ raw=$(mktemp "$RP_USER_DIR/.${name}.raw.XXXXXX") || exit 1
 candidate=$(mktemp "$RP_USER_DIR/.${name}.candidate.XXXXXX") || { rm -f "$raw"; exit 1; }
 trap 'rm -f "$raw" "$candidate"' EXIT HUP INT TERM
 dd bs=1024 count=257 of="$raw" 2>/dev/null
-bytes=$(wc -c <"$raw" | tr -d '[:space:]')
+bytes=$(wc -c <"$raw" | tr -d ' \011-\015')
 if [ "$bytes" -gt 262144 ]; then
 	rp_output_error user-list '输入超过 256KiB 限制'
 	exit 1

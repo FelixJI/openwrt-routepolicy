@@ -1,0 +1,9 @@
+#!/bin/sh /etc/rc.common
+# Restore durable fields before the native DNS services are considered at S19.
+# Runtime restoration remains in the existing S94/S95 recovery path.
+# shellcheck disable=SC2034
+START=18
+ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routepolicy/init-transaction}
+start() {
+	"$ROUTEPOLICY_INIT_TRANSACTION" recover-early >/dev/null
+}

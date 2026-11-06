@@ -18,6 +18,13 @@ rules="$tmp/tmp/routepolicy/rules.nft"; smartdns="$tmp/tmp/routepolicy/90-routep
 grep -Fq 'table inet routepolicy' "$rules"
 grep -Fq 'chain prerouting {' "$rules"
 grep -Fq 'type filter hook prerouting priority mangle; policy accept;' "$rules"
+awk '
+	/^[[:space:]]*chain /{chain=$2}
+	/type nat hook prerouting priority dstnat;/{nat[chain]=1}
+	/redirect to :53/ {redirects++;if(!nat[chain])bad=1}
+	END{exit bad||redirects!=1}' "$rules" || {
+	printf 'DNS redirect must belong to one prerouting NAT chain\n' >&2; exit 1
+}
 grep -Fq 'chain output {' "$rules"
 grep -Fq 'type route hook output priority mangle; policy accept;' "$rules"
 grep -Fq 'chain classify {' "$rules"

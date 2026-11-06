@@ -13,10 +13,28 @@ ROUTEPOLICY_APPLY=${ROUTEPOLICY_APPLY:-/usr/libexec/routepolicy/apply}
 ROUTEPOLICY_WATCH=${ROUTEPOLICY_WATCH:-/usr/libexec/routepolicy/watch}
 ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routepolicy/init-transaction}
 
+# rc.common sources this file before procd.sh acquires the service lock.
+# Recovery may call native enable, so it must finish before taking that lock.
+case "${action:-}" in
+	shutdown)
+		# K82 is queued by path: remove its link before native stop can edit DHCP.
+		if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
+			timeout -k 1 10 "$ROUTEPOLICY_INIT_TRANSACTION" shutdown-dns >/dev/null || exit $?
+		fi
+		;;
+	start|boot|restart)
+		if [ "$action" != start ] || [ "${1:-}" != init-confirmed ]; then
+			if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
+				"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || exit $?
+			fi
+		fi
+		;;
+esac
+
 start_service() {
-	# Startup is the reboot boundary; restore unfinished mutations before normal policy apply.
-	if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
-		"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || return 1
+	if [ "${1:-}" = init-confirmed ]; then
+		# Only the live confirmation writer may register watch without applying again.
+		"$ROUTEPOLICY_INIT_TRANSACTION" watch-ready >/dev/null || return 1
 	fi
 	config_load routepolicy
 	enabled=0
@@ -25,7 +43,10 @@ start_service() {
 		printf '%s\n' 'RoutePolicy 未启用；已跳过应用并保持停用'
 		return 0
 	fi
-	"$ROUTEPOLICY_CTL" apply || return 1
+	# The coordinator owns cold boot policy/DNS admission; keep its watcher available.
+	if [ "${1:-}" != init-confirmed ] && ! "$ROUTEPOLICY_INIT_TRANSACTION" boot-pending >/dev/null 2>&1; then
+		"$ROUTEPOLICY_CTL" apply || return 1
+	fi
 	procd_open_instance
 	procd_set_param command "$ROUTEPOLICY_WATCH"
 	procd_set_param respawn 3600 5 0

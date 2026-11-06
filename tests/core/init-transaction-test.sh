@@ -45,7 +45,7 @@ if [ "${1:-}" = --native-uci ]; then
 	exit 0
 fi
 mkdir -p "$tmp/bin" "$tmp/lib" "$tmp/root/etc/init.d" "$tmp/db"
-cp "$REAL_LIB/common" "$REAL_LIB/init-transaction" "$tmp/lib/"
+cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$REAL_LIB/init-transaction" "$tmp/lib/"
 chmod +x "$tmp/lib/init-transaction"
 export TEST_TX_DIR="$tmp" ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
 TEST_NATIVE_UCI_PATH=$(command -v uci 2>/dev/null || true)
@@ -266,13 +266,15 @@ EOF
 cat >"$tmp/lib/apply" <<'EOF'
 #!/bin/sh
 set -eu
-[ ! -e /proc/self/fd/9 ] || { printf '%s\n' 'policy child inherited initialization lock' >&2; exit 1; }
+. "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_enter apply || { printf '%s\n' 'policy child did not inherit authenticated writer ownership' >&2; exit 1; }
 mkdir -p "$ROUTEPOLICY_ROOT/tmp/routepolicy"
 mkdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock" || exit 1
 trap 'rmdir "$ROUTEPOLICY_ROOT/tmp/routepolicy/apply.lock"' EXIT
 policy=$(cat "$TEST_TX_DIR/db/routepolicy.main.policy_interface")
 printf '%s\n' "$policy" >>"$TEST_TX_DIR/policy-apply-calls"
-if { [ "$policy" = wan2 ] && [ -f "$TEST_TX_DIR/policy-apply-fail" ]; } || { [ "$policy" = usbwan ] && [ -f "$TEST_TX_DIR/policy-restore-fail" ]; }; then printf '%s\n' 'fixture policy apply failed' >&2; exit 1; fi
+printf 'fixture policy output: %s\n' "$policy"
+if { [ "$policy" = wan2 ] && [ -f "$TEST_TX_DIR/policy-apply-fail" ]; } || { [ "$policy" = usbwan ] && [ -f "$TEST_TX_DIR/policy-restore-fail" ]; }; then printf 'fixture policy %s failed\n' "$policy" >&2; exit 1; fi
 [ -f "$TEST_TX_DIR/policy-route-stale" ] || printf '%s' "$policy" >"$TEST_TX_DIR/runtime-policy"
 device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
 printf 'schema=1\nroute_table=200\npolicy_interface=%s\npolicy_device=%s\n' "$policy" "$device" >"$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied"
@@ -377,7 +379,7 @@ reset() {
 	rm -f "$tmp/"auto-*
 	rm -f "$tmp/"dhcp-* "$tmp/"policy-* "$tmp/runtime-policy"
 	mkdir -p "$tmp/root/etc/config"
-	for config_package in network dhcp firewall routepolicy; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
+	for config_package in network dhcp firewall routepolicy smartdns; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
 	mkdir -p "$tmp/root/sys/class/net/eth9" "$tmp/physical/eth9" "$tmp/root/proc/sys/kernel/random"
 	rm -f "$tmp/root/sys/class/net/eth9/device"
 	ln -s "$tmp/physical/eth9" "$tmp/root/sys/class/net/eth9/device"
@@ -468,7 +470,18 @@ policy_runtime_tests() {
 		[ "$(cat "$tmp/runtime-policy")" = usbwan ]
 		[ "$(cat "$tmp/db/routepolicy.main.policy_interface")" = usbwan ]
 		"$TX" status | grep -Fq '"failed_stage":"policy-runtime"'
+		if [ "$policy_fault" = policy-apply-fail ]; then
+			grep -Fxq 'fixture policy wan2 failed' "$WAL/policy-error"
+			grep -Fxq 'fixture policy output: wan2' "$WAL/policy-result"
+			grep -Fxq 'fixture policy output: usbwan' "$WAL/policy-restore-result"
+			"$TX" status | grep -Fq 'fixture policy wan2 failed'
+		fi
 	done
+	reset; enable_policy_fixture; touch "$tmp/policy-apply-fail" "$tmp/policy-restore-fail"; prepare_policy
+	bad "$TX" apply "$token"; phase_is conflict
+	grep -Fxq 'fixture policy wan2 failed' "$WAL/policy-error"
+	grep -Fxq 'fixture policy usbwan failed' "$WAL/policy-restore-error"
+	"$TX" status | grep -Fq '"policy_restore_error":"fixture policy usbwan failed'
 	reset; enable_policy_fixture; prepare_policy; "$TX" apply "$token" >/dev/null
 	printf usbwan >"$tmp/runtime-policy"
 	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"; phase_is pending
@@ -486,13 +499,17 @@ policy_runtime_tests() {
 	reset; enable_policy_fixture; prepare_policy
 	mkdir -p "$tmp/root/tmp/routepolicy/apply.lock"
 	touch "$tmp/policy-clock-active"
-	bad "$TX" apply "$token"; phase_is conflict
+	bad "$TX" apply "$token"; phase_is prepared
+	[ ! -f "$tmp/commits" ]
 	[ -d "$tmp/root/tmp/routepolicy/apply.lock" ]
-	rmdir "$tmp/root/tmp/routepolicy/apply.lock"; "$TX" recover >/dev/null; phase_is rolled_back
+	rmdir "$tmp/root/tmp/routepolicy/apply.lock"
 	reset; enable_policy_fixture; prepare_policy
 	mkdir -p "$tmp/root/tmp/routepolicy/apply.lock"; touch "$tmp/policy-clock-active" "$tmp/policy-owner-release"
+	bad "$TX" apply "$token"; phase_is prepared
+	[ -f "$tmp/policy-owner-release" ] && [ ! -f "$tmp/commits" ]
+	rm "$tmp/policy-owner-release" "$tmp/policy-clock-active"; rmdir "$tmp/root/tmp/routepolicy/apply.lock"
 	"$TX" apply "$token" >/dev/null; phase_is pending
-	[ "$(cat "$tmp/runtime-policy")" = wan2 ]; [ ! -f "$tmp/policy-owner-release" ]
+	[ "$(cat "$tmp/runtime-policy")" = wan2 ]
 }
 dhcp_readiness_tests() {
 	dhcp_readiness_test
