@@ -1,10 +1,11 @@
 #!/bin/sh
 set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
-REAL_LIB="$ROOT/routepolicy/files/usr/libexec/routepolicy"
+REAL_LIB="${TEST_INIT_LIBEXEC:-$ROOT/routepolicy/files/usr/libexec/routepolicy}"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-dns.XXXXXX")
 trap '[ -z "${guard_pid:-}" ] || kill "$guard_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 export TEST_DNS_TMP=$tmp ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="$tmp/lib" ROUTEPOLICY_OUTPUT=json
+export TEST_DNS_REAL_APPLY="$REAL_LIB/apply"
 mkdir -p "$tmp/bin" "$tmp/lib" "$tmp/root/etc/config" "$tmp/root/etc/init.d" "$tmp/root/usr/sbin"
 cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$REAL_LIB/init-transaction" "$tmp/lib/"
 cp -R "$REAL_LIB/converters" "$tmp/lib/"
@@ -197,8 +198,12 @@ EOF
 cat >"$tmp/lib/apply" <<'EOF'
 #!/bin/sh
 set -eu
+case "${1:-}" in event|reconcile-event) exec "$TEST_DNS_REAL_APPLY" "$@" ;; esac
 . "$ROUTEPOLICY_LIBEXEC/common"
 rp_writer_enter apply
+rp_local_lock "$RP_RUN_DIR/apply.lock" || exit 1
+trap 'rp_local_unlock "$RP_RUN_DIR/apply.lock"' EXIT
+if [ -f "$TEST_DNS_TMP/kill-policy" ]; then rm "$TEST_DNS_TMP/kill-policy"; kill -KILL "$$"; fi
 [ ! -f "$TEST_DNS_TMP/policy-fail" ] || exit 1
 if [ "${1:-}" = teardown ]; then
 	[ "${ROUTEPOLICY_INIT_RESTORE:-0}" = 1 ]
@@ -213,7 +218,30 @@ rp_render_smartdns90 "$RP_SMARTDNS_FILE"
 [ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1
 printf 'policy_interface=wan2\npolicy_device=eth2\nroute_table=200\n' >"$RP_STATE_DIR/applied"
 : >"$TEST_DNS_TMP/policy-running"
-[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || "$RP_ROOT/etc/init.d/smartdns" reload
+[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_native_service smartdns reload
+EOF
+# FelixJI/smartdns c27671b set_main_dns; relocate its service path and tolerate absent
+# options under this fixture set -e (the native script runs without errexit).
+cat >"$tmp/native-main" <<'EOF'
+set_main_dns()
+{
+	local hostip
+	hostip="$(uci -q get network.lan.ipaddr)"
+	dnsmasq_port="$(uci -q get dhcp.@dnsmasq[0].port || true)"
+	[ -z "$dnsmasq_port" ] && dnsmasq_port="53"
+	[ -z "$hostip" ] && return
+	[ "$dnsmasq_port" = "53" ] && {
+		uci -q set dhcp.@dnsmasq[0].port=0
+		uci -q add_list dhcp.lan.dhcp_option="6,$hostip"
+	}
+	redir_dns="$(uci -q get dhcp.@dnsmasq[0].dns_redirect || true)"
+	[ "$redir_dns" = "1" ] && {
+		uci -q set dhcp.@dnsmasq[0].dns_redirect=0
+		uci -q set dhcp.@dnsmasq[0].old_dns_redirect=1
+	}
+	uci commit dhcp
+	"$ROUTEPOLICY_ROOT/etc/init.d/dnsmasq" reload
+}
 EOF
 cat >"$tmp/root/etc/init.d/smartdns" <<'EOF'
 #!/bin/sh
@@ -235,12 +263,16 @@ printf '%s' "$enabled" >"$TEST_DNS_TMP/svc/$service.running"
 [ "$enabled" = 1 ] || exit 0
 port=$(uci -q get 'smartdns.@smartdns[0].port' || printf 53)
 printf '%s' "$port" >"$TEST_DNS_TMP/svc/smartdns.port"
+if [ "$port" = 53 ]; then
+	. "$TEST_DNS_TMP/native-main"
+	set_main_dns
+fi
 auto=$(uci -q get 'smartdns.@smartdns[0].auto_set_dnsmasq' || printf 1)
 uci set "smartdns.@smartdns[0].old_enabled=$enabled"
 uci set "smartdns.@smartdns[0].old_port=$port"
 uci set "smartdns.@smartdns[0].old_auto_set_dnsmasq=$auto"
 uci commit smartdns
-if [ "$port" = 53 ] && [ "$(cat "$TEST_DNS_TMP/svc/dnsmasq.running")" = 1 ]; then exit 1; fi
+if [ "$port" = 53 ] && [ "$(cat "$TEST_DNS_TMP/svc/dnsmasq.running")" = 1 ] && [ "$(cat "$TEST_DNS_TMP/svc/dnsmasq.port")" = 53 ]; then exit 1; fi
 cache=$(uci -q get 'smartdns.@smartdns[0].cache_file' || true)
 if [ "$cache" = /tmp/routepolicy/smartdns.cache ]; then
 	mkdir -p "$ROUTEPOLICY_ROOT/tmp/routepolicy"
@@ -263,7 +295,11 @@ case "$1" in
 	enable) printf 1 >"$TEST_DNS_TMP/svc/dnsmasq.enabled" ;;
 	disable) printf 0 >"$TEST_DNS_TMP/svc/dnsmasq.enabled" ;;
 	stop) printf 0 >"$TEST_DNS_TMP/svc/dnsmasq.running" ;;
-	start|restart)
+	start|restart|reload)
+		# Native per-instance early return; rc disabled does not block reload_service.
+		case "$(uci -q get 'dhcp.@dnsmasq[0].disabled' || true)" in
+			1|on|true|yes|enabled) printf 0 >"$TEST_DNS_TMP/svc/dnsmasq.running"; exit 0 ;;
+		esac
 		printf 1 >"$TEST_DNS_TMP/svc/dnsmasq.running"
 		[ ! -f "$TEST_DNS_TMP/stale-dnsmasq" ] || exit 0
 		uci -q get 'dhcp.@dnsmasq[0].port' >"$TEST_DNS_TMP/svc/dnsmasq.port" ;;
@@ -290,7 +326,7 @@ canonical() {
 }
 baseline() {
 	rm -rf "$tmp/root/etc/routepolicy" "$tmp/root/tmp/routepolicy" "$tmp/root/etc/smartdns" "$tmp/root/var" "$tmp/svc" "$tmp/external"
-	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called" "$tmp/stale-dnsmasq" "$tmp/kill-confirm"
+	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called" "$tmp/stale-dnsmasq" "$tmp/kill-confirm" "$tmp/kill-policy"
 	mkdir -p "$tmp/svc" "$tmp/external" "$tmp/root/etc/smartdns/conf.d" "$tmp/root/proc/sys/kernel/random"
 	printf '100.00 0.00\n' >"$tmp/root/proc/uptime"
 	printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
@@ -320,6 +356,101 @@ restored() {
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 0 ]
 }
 # Exercise every enabled/running combination for both pre-existing services.
+# Native reload_service starts an rc-disabled daemon; per-instance disabled prevents it.
+baseline 0 0 1 1
+"$tmp/root/etc/init.d/dnsmasq" stop; "$tmp/root/etc/init.d/dnsmasq" disable
+uci set 'dhcp.@dnsmasq[0].port=0'; uci commit dhcp
+. "$tmp/native-main"; set_main_dns
+[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 10 ]
+uci set 'dhcp.@dnsmasq[0].disabled=1'; uci commit dhcp
+"$tmp/root/etc/init.d/dnsmasq" stop
+set_main_dns; "$tmp/root/etc/init.d/dnsmasq" reload
+[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
+for disabled in absent 0 1; do
+	baseline 0 0 1 0
+	if [ "$disabled" != absent ]; then uci set "dhcp.@dnsmasq[0].disabled=$disabled"; uci commit dhcp; fi
+	canonical dhcp >"$tmp/dhcp.before"
+	prepare; "$TX" apply "$token" >/dev/null
+	[ "$(uci -q get 'dhcp.@dnsmasq[0].disabled')" = 1 ]
+	"$TX" recover >/dev/null; restored
+	[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 01 ]
+done
+# Original port53 SmartDNS reload finishes before stopped dnsmasq convergence.
+baseline 1 1 1 0
+uci set 'smartdns.@smartdns[0].port=53'; uci set 'smartdns.@smartdns[0].old_port=53'
+uci set 'dhcp.@dnsmasq[0].port=0'; uci commit smartdns; uci commit dhcp
+printf 53 >"$tmp/svc/smartdns.port"
+for package in dhcp smartdns; do canonical "$package" >"$tmp/$package.before"; done
+prepare; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null; restored
+[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/smartdns.running")" = 011 ]
+for option in dns_redirect old_dns_redirect; do
+	baseline 0 0 1 1; uci set "dhcp.@dnsmasq[0].$option=1"; uci commit dhcp
+	canonical dhcp >"$tmp/user.before"
+	if prepare >/dev/null 2>&1; then exit 1; fi
+	canonical dhcp >"$tmp/user.after"; cmp "$tmp/user.before" "$tmp/user.after"
+done
+# Refuse inconsistent original states before touching a field or user option6.
+baseline 1 1 1 0
+uci delete 'smartdns.@smartdns[0].port'; uci set 'smartdns.@smartdns[0].old_port=53'; uci commit smartdns
+canonical dhcp >"$tmp/user.before"
+if prepare >"$tmp/original-main-error" 2>&1; then exit 1; fi
+grep -Fq 'DHCP option6' "$tmp/original-main-error"
+canonical dhcp >"$tmp/user.after"; cmp "$tmp/user.before" "$tmp/user.after"
+baseline 0 0 1 1; uci set 'dhcp.@dnsmasq[0].disabled=1'; uci commit dhcp
+if prepare >"$tmp/original-main-error" 2>&1; then exit 1; fi
+grep -Fq '不一致原态' "$tmp/original-main-error"
+printf '%s\n' 'init DNS native dnsmasq reload isolation: passed (rc disabled counterexample, UCI disabled, original53 stopped restore)'
+if [ "${1:-}" = --native-reload ]; then exit 0; fi
+if [ "${1:-}" != --killed-policy ]; then
+for argument in '-g rp_init_policy' '--group=rp_init_default' '--gr=rp_init_policy' '-grp_init_default' '-egrp_init_policy' '-g "rp_init_policy"'; do
+	baseline 0 0 1 1
+	uci set smartdns.user.server_group=user_group; uci set "smartdns.user.addition_arg=$argument"; uci commit smartdns
+	canonical smartdns >"$tmp/user.before"
+	if prepare >"$tmp/uci-group-error" 2>&1; then printf 'unsafe native addition_arg accepted: %s\n' "$argument" >&2; exit 1; fi
+	canonical smartdns >"$tmp/user.after"; cmp "$tmp/user.before" "$tmp/user.after"
+done
+for option in ip port tls_host_verify host_name http_host server_group spki_pin set_mark; do
+	baseline 0 0 1 1
+	uci set "smartdns.user.$option=ordinary --group=rp_init_policy"; uci commit smartdns
+	if prepare >"$tmp/uci-group-error" 2>&1; then printf 'unsafe native field accepted: %s\n' "$option" >&2; exit 1; fi
+done
+baseline 0 0 1 1
+uci set smartdns.user.routepolicy_init=1; uci set 'smartdns.user.addition_arg=-g rp_init_policy'; uci commit smartdns
+if prepare >"$tmp/uci-group-error" 2>&1; then exit 1; fi
+baseline 0 0 1 1
+uci set smartdns.user.server_group=user_group; uci set 'smartdns.user.addition_arg=-g ordinary -interface eth1'; uci commit smartdns
+prepare
+uci set 'smartdns.user.addition_arg=--group=rp_init_policy'; uci commit smartdns
+canonical smartdns >"$tmp/user.before"
+if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+[ "$(find "$tmp/root/etc/routepolicy/state/init-transaction/current/fields" -name attempted | wc -l)" = 0 ]
+canonical smartdns >"$tmp/user.after"; cmp "$tmp/user.before" "$tmp/user.after"
+# A managed section still retains unknown native string options. Only the four
+# fields overwritten by the plan may bypass the reserved-group audit.
+baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
+SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
+owned_active=$(cat "$tmp/root/etc/routepolicy/state/init-transaction/active")
+for option in set_mark tls_host_verify host_name http_host spki_pin; do
+	uci set "smartdns.rp_init_policy_1.$option=0 -g rp_init_default"; uci commit smartdns
+	canonical smartdns >"$tmp/user.before"
+	if prepare >"$tmp/owned-group-error" 2>&1; then printf 'unsafe managed native field accepted: %s\n' "$option" >&2; exit 1; fi
+	canonical smartdns >"$tmp/user.after"; cmp "$tmp/user.before" "$tmp/user.after"
+	uci delete "smartdns.rp_init_policy_1.$option"; uci commit smartdns
+done
+# Native renderer semantics: set_mark is appended before our controlled addition_arg.
+if printf '%s\n' 'server 198.51.100.53:53 -group rp_init_policy -set-mark 0 -g rp_init_default -interface eth2' | init_dns_audit_lines 53 br-lan 1 >/dev/null; then exit 1; fi
+uci set smartdns.rp_init_policy_1.set_mark=0; uci commit smartdns
+prepare
+uci set 'smartdns.rp_init_policy_1.set_mark=0 --group=rp_init_default'; uci commit smartdns
+canonical smartdns >"$tmp/user.before"
+if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+[ "$(find "$tmp/root/etc/routepolicy/state/init-transaction/current/fields" -name attempted | wc -l)" = 0 ]
+canonical smartdns >"$tmp/user.after"; cmp "$tmp/user.before" "$tmp/user.after"
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/active")" = "$owned_active" ]
+printf '%s\n' 'init DNS managed native unknown arguments: passed (prepare, generated syntax, pre-write, user values preserved)'
+if [ "${1:-}" = --owned-args ]; then exit 0; fi
+printf '%s\n' 'init DNS native UCI upstream arguments: passed (group aliases, raw native fields, ownership and pre-write recheck)'
+if [ "${1:-}" = --uci-args ]; then exit 0; fi
 baseline 0 0 1 1
 include="$tmp/root/etc/smartdns/custom-a.conf"
 child="$tmp/root/etc/smartdns/nested child.conf"
@@ -341,14 +472,71 @@ if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
 cmp "$tmp/child.before" "$child"; restored
 printf '%s\n' 'init DNS include preflight: passed (prepare and pre-write recheck, no UCI/file changes)'
 if [ "${1:-}" = --include-audit ]; then exit 0; fi
+fi
+# Both teardown (previously disabled) and apply (previously active) restore paths
+# must recover the child marker automatically without weakening active-table checks.
+for previous_policy in 0 1; do
+	baseline 0 0 1 1
+	if [ "$previous_policy" = 1 ]; then
+		uci set routepolicy.main.enabled=1; uci commit routepolicy
+		canonical routepolicy >"$tmp/routepolicy.before"
+		mkdir -p "$tmp/root/etc/routepolicy/state"
+		printf 'policy_interface=wan2\npolicy_device=eth2\nroute_table=200\n' >"$tmp/root/etc/routepolicy/state/applied"
+		: >"$tmp/policy-running"
+	fi
+	prepare; : >"$tmp/kill-policy"
+	if "$TX" apply "$token" >"$tmp/policy-kill.out" 2>&1; then exit 1; fi
+	"$TX" recover-auto >/dev/null
+	[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = rolled_back ]
+	if [ "$previous_policy" = 0 ]; then restored
+	else
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.after"; cmp "$tmp/$package.before" "$tmp/$package.after"; done
+		[ -f "$tmp/policy-running" ]
+		[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.running")" = 01 ]
+	fi
+	[ ! -e "$tmp/root/tmp/routepolicy/apply.lock" ]
+done
+printf '%s\n' 'init DNS killed policy writer recovery: passed (automatic same-owner compensation, originally disabled and active)'
+if [ "${1:-}" = --killed-policy ]; then exit 0; fi
+# An unapplied candidate has no same-boot TTL; explicit recovery only cancels it.
+baseline 0 0 1 1; prepare; preview_token=$token
+printf '3600.00 0.00\n' >"$tmp/root/proc/uptime"
+"$TX" recover-auto >/dev/null
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = prepared ]
+"$TX" apply "$preview_token" >/dev/null; "$TX" recover >/dev/null; restored
+baseline 0 0 1 1; prepare; preview_token=$token
+cp "$tmp/service-log" "$tmp/prepared-services"
+"$TX" recover >/dev/null
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = expired ]
+cmp "$tmp/prepared-services" "$tmp/service-log"; restored
+if "$TX" apply "$preview_token" >/dev/null 2>&1; then exit 1; fi
+baseline 0 0 1 1; prepare; preview_token=$token
+"$REAL_LIB/apply" event >/dev/null
+cp "$tmp/service-log" "$tmp/prepared-services"
+printf 'unapplied-new-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+"$TX" recover-early >/dev/null
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = expired ]
+cmp "$tmp/prepared-services" "$tmp/service-log"; restored
+[ -f "$tmp/root/tmp/routepolicy/events.pending" ]
+"$REAL_LIB/apply" reconcile-event >/dev/null
+[ ! -f "$tmp/root/tmp/routepolicy/events.pending" ]
+if "$TX" apply "$preview_token" >/dev/null 2>&1; then exit 1; fi
+baseline 0 0 1 1; prepare
+: >"$tmp/root/etc/routepolicy/state/init-transaction/current/dns-service-attempted"
+printf 'cannot-prove-unwritten\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+if "$TX" recover-early >/dev/null 2>&1; then exit 1; fi
+[ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = prepared ]
+printf '%s\n' 'init DNS unapplied candidate lifecycle: passed (same-boot preview, explicit cancel, cross-boot and zero-write evidence)'
+if [ "${1:-}" = --review-regressions ]; then exit 0; fi
 matrix_count=0
 if [ "${1:-}" != --boot-smoke ] && [ "${1:-}" != --quiesce-smoke ] && [ "${1:-}" != --lifecycle-smoke ] && [ "${1:-}" != --restore-smoke ]; then
 for se in 0 1; do for sr in 0 1; do for de in 0 1; do for dr in 0 1; do
 	case "${1:-}:$se$sr$de$dr" in --recovery-smoke:0000|--recovery-smoke:0111|--recovery-smoke:1001|--recovery-smoke:1110) ;; --recovery-smoke:*) continue ;; esac
 	baseline "$se" "$sr" "$de" "$dr"; prepare
+	queries_before=0; [ ! -f "$tmp/queries" ] || queries_before=$(wc -l <"$tmp/queries")
 	"$TX" apply "$token" >/dev/null
 	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = 1100 ]
-	[ "$(wc -l <"$tmp/queries")" = 4 ]
+	[ "$(( $(wc -l <"$tmp/queries") - queries_before ))" = 4 ]
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 1 ]
 	"$TX" recover >/dev/null; restored
 	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = "$se$sr$de$dr" ]
@@ -495,10 +683,11 @@ origin=$(cat "$txdir/source"); cp -R "$txdir/confirmed-$origin/fields" "$tmp/ori
 prepare
 [ "$(cat "$txdir/active")" = "$origin" ]
 reboot_services prepared-after-confirm
+"$REAL_LIB/apply" event >/dev/null
 : >"$tmp/policy-fail"; guard_entry
 [ -f "$active/dns-boot-pending" ] && [ "$(cat "$tmp/svc/smartdns.running")" = 0 ]
 "$TX" status >"$tmp/active-status"
-[ "$(jsonfilter -i "$tmp/active-status" -e '@.phase')" = prepared ]
+[ "$(jsonfilter -i "$tmp/active-status" -e '@.phase')" = expired ]
 [ "$(jsonfilter -i "$tmp/active-status" -e '@.active.dns_boot_state')" = retrying ]
 rm "$tmp/policy-fail"; : >"$tmp/query-fail"
 remaining=30
@@ -508,7 +697,10 @@ while [ "$(cat "$active/failed-stage")" != boot-dns-start ]; do
 done
 [ -f "$active/dns-boot-pending" ] && [ "$(cat "$tmp/svc/smartdns.running")" = 0 ]
 rm "$tmp/query-fail"; wait_guard
-[ "$(cat "$txdir/current/phase")" = prepared ]
+[ ! -f "$tmp/root/tmp/routepolicy/events.pending" ] && [ ! -f "$tmp/root/tmp/routepolicy/events.inflight" ]
+[ "$(cat "$txdir/current/phase")" = expired ]
+if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+"$TX" status | grep -Fq '"prepared_expired_reason":"boot-changed"'
 diff -r "$tmp/origin-fields" "$txdir/confirmed-$origin/fields"
 # A repeated apply rollback keeps the first accepted boot and provenance contract.
 prepare; : >"$tmp/query-fail"

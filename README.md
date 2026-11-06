@@ -67,6 +67,8 @@ routepolicyctl init-prepare lan wan policy - - - - - - - -
 
 核对 `init-prepare` 返回的变更和管理入口，保存该次返回的 token。确认要应用时执行 `routepolicyctl init-apply TOKEN`。从接入侧通过 SSH 连接预览中的管理地址，检查管理连接与网络，再执行 `routepolicyctl init-confirm TOKEN`。可从带外控制台运行 `routepolicyctl init-status` 查看状态；待确认期间可用 `routepolicyctl init-recover` 主动回滚。超过确认时限，守卫会回滚本次变更。若状态为 `conflict`，从控制台核对外部改动后再处理。
 
+尚未应用的预览在重启后失效，需要重新执行 `init-prepare`；也可用 `init-recover` 取消未应用的预览。这两种情况不会撤销此前已确认的配置。
+
 初始化仅管理所选接口。受管 LAN 不提供 DHCPv4、RA、DHCPv6 或 NDP 代理；所选旁路由接口按 IPv4 配置，保留出口的 DHCPv4 client。SmartDNS 使用 IPv4 监听并抑制 AAAA 应答。终端仍须通过现有 DHCP 或其网络设置，把网关和 DNS 指向旁路由的接入地址。防火墙继续限制受管 IPv6 转发；这不能阻止终端直接使用其他路由器通告的 IPv6 网关，也不能把过滤 AAAA 当作完整防绕行。
 
 ## 升级

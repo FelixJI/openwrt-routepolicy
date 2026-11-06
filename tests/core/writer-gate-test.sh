@@ -24,6 +24,8 @@ EOF
 cat >"$tmp/bin/uci" <<'EOF'
 #!/bin/sh
 case "$*" in
+	'-q export smartdns')
+		if [ -f "$TEST_WRITER_DIR/timeout-uci" ]; then rm "$TEST_WRITER_DIR/timeout-uci"; sleep 60; fi ;;
 	'-q show routepolicy') printf 'routepolicy.main=main\nroutepolicy.feed=source\n'; exit ;;
 	'-q get routepolicy.feed.enabled') printf '1\n'; exit ;;
 	'-q get routepolicy.feed.url') printf 'https://example.invalid/list\n'; exit ;;
@@ -88,6 +90,32 @@ read -r _release <"$TEST_WRITER_DIR/release"
 ROUTEPOLICY_DNS_DEFER=1 "$ROUTEPOLICY_LIBEXEC/apply"
 EOF
 chmod +x "$tmp/owner"; mkfifo "$tmp/release"
+if [ "${1:-}" = --same-owner-timeout ]; then
+	sh -c '
+		set -eu
+		. "$ROUTEPOLICY_LIBEXEC/common"
+		rp_writer_enter init
+		rp_local_lock "$RP_RUN_DIR/update.lock"
+		: >"$TEST_WRITER_DIR/timeout-uci"
+		set +e
+		timeout -s KILL 3 "$ROUTEPOLICY_LIBEXEC/apply" >"$TEST_WRITER_DIR/initial-timeout.out" 2>&1
+		initial=$?
+		set -e
+		[ "$initial" = 137 ] && [ -f "$RP_RUN_DIR/apply.lock/owner" ]
+		remaining=20
+		until rp_writer_idle; do [ "$remaining" -gt 0 ] || exit 1; sleep 0.05; remaining=$((remaining-1)); done
+		# Even a dead local owner cannot be reaped while another inherited child survives.
+		sleep 1 & descendant=$!
+		if ROUTEPOLICY_INIT_RESTORE=1 "$ROUTEPOLICY_LIBEXEC/apply" teardown >/dev/null 2>&1; then exit 1; fi
+		[ -f "$RP_RUN_DIR/apply.lock/owner" ]
+		wait "$descendant"
+		ROUTEPOLICY_INIT_RESTORE=1 "$ROUTEPOLICY_LIBEXEC/apply" teardown >/dev/null
+		[ ! -e "$RP_RUN_DIR/apply.lock" ] && [ -f "$RP_RUN_DIR/update.lock/owner" ]
+		rp_local_unlock "$RP_RUN_DIR/update.lock"
+	'
+	printf 'same-owner timeout recovery: passed\n'
+	exit 0
+fi
 if [ "${1:-}" = --dns-defer-only ]; then
 	sh -c '
 		set -eu
@@ -175,4 +203,5 @@ rm "$tmp/nft-hang"
 "$apply" >/dev/null
 [ ! -e "$tmp/late-write" ]
 sh "$0" --dns-defer-only
+sh "$0" --same-owner-timeout
 printf '%s\n' 'writer gate: passed (real apply callers, teardown, events, nested publication, timeout and parent death)'

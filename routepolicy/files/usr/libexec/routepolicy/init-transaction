@@ -31,6 +31,7 @@ lock() {
 	if [ ! -e "$WAL" ] && [ -d "$TX/previous" ]; then
 		mv "$TX/previous" "$WAL" && sync || fail '不能恢复准备事务记录'
 	fi
+	prepared_finish_locked || fail 'prepared 记录不能证明零变更；已保留候选与门禁'
 	if [ "${operation:-}" = recover-early ]; then
 		case "$(read_phase)" in confirmed|confirming)
 			if init_dns_managed; then init_dns_coordinate quarantine-boot || fail '不能隔离已确认或提升中的 DNS 自启动'; fi ;;
@@ -44,6 +45,24 @@ lock() {
 			if init_dns_owned; then active_publish || fail '不能收敛已有确认接管合同'; fi ;;
 	esac
 	if [ -e "$TX/active" ] || [ -L "$TX/active" ]; then rp_init_active_record >/dev/null || fail '已确认接管合同路径或内容不安全'; fi
+}
+prepared_finish_locked() {
+	[ "$(read_phase)" = prepared ] || return 0
+	prepared_reason=
+	if [ "${operation:-}" = recover ]; then prepared_reason=cancelled-unapplied
+	elif [ -f "$WAL/prepared-boot-id" ] && [ ! -L "$WAL/prepared-boot-id" ]; then
+		prepared_boot=$(cat "$WAL/prepared-boot-id") && prepared_running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 1
+		[ -n "$prepared_boot" ] && [ -n "$prepared_running_boot" ] || return 1
+		[ "$prepared_boot" = "$prepared_running_boot" ] || prepared_reason=boot-changed
+	fi
+	[ -n "$prepared_reason" ] || return 0
+	[ ! -L "$WAL/fields" ] && { [ ! -e "$WAL/fields" ] || [ -d "$WAL/fields" ]; } || return 1
+	if [ -d "$WAL/fields" ]; then [ -z "$(find "$WAL/fields" -name attempted)" ] || return 1; fi
+	for prepared_marker in link-attempted dns-service-attempted dns-attempted policy-attempted dns90-attempted dns-cache-move dns-boot-quarantined stage; do
+		[ ! -e "$WAL/$prepared_marker" ] && [ ! -L "$WAL/$prepared_marker" ] || return 1
+	done
+	# No resource was touched: invalidate the candidate, never run rollback/service writers.
+	printf '%s\n' "$prepared_reason" >"$WAL/prepared-expired-reason" && phase expired
 }
 active_publish() {
 	# shellcheck disable=SC3043
@@ -152,7 +171,7 @@ plan_valid() {
 		{
 			key=$2
 			if(key ~ /^routepolicy\.main\.(lan_interface|default_interface|policy_interface|smartdns_policy_group|smartdns_enabled|enabled)$/) next
-			if(key ~ /^dhcp\.([A-Za-z0-9_]+|@dnsmasq\[[0-9]+\])\.port$/) next
+			if(key ~ /^dhcp\.([A-Za-z0-9_]+|@dnsmasq\[[0-9]+\])\.(port|disabled)$/) next
 			if(key ~ /^smartdns\.([A-Za-z0-9_]+|@smartdns\[[0-9]+\])\.(enabled|port|tcp_server|ipv6_server|bind_device|bind_device_name|auto_set_dnsmasq|old_enabled|old_port|old_auto_set_dnsmasq|cache_persist|cache_file|force_aaaa_soa|tls_server|doh_server|seconddns_enabled|server_flags|conf_files)$/) next
 			if(key ~ /^smartdns\.rp_init(_(client_rule|domain_rule|ip_rule))?$/) next
 			if(key ~ /^smartdns\.rp_init_(default|policy)_[1-4](\.(routepolicy_init|enabled|type|ip|port|server_group|exclude_default_group|addition_arg))?$/) next
@@ -434,9 +453,6 @@ policy_sync() {
 		[ "$policy_remaining" -ge "$policy_timeout" ] || policy_timeout=$policy_remaining
 	fi
 	policy_wait_started=$(monotonic_now) || return 1
-	if [ -d "$RP_RUN_DIR/apply.lock" ]; then
-		printf '%s\n' 'existing RoutePolicy apply is busy; its lock was preserved' >"$WAL/$policy_log-error"; return 1
-	fi
 	policy_wait_now=$(monotonic_now) || return 1
 	policy_timeout=$((policy_timeout - (policy_wait_now - policy_wait_started + 99) / 100))
 	[ "$policy_timeout" -gt 0 ] || return 1
@@ -628,7 +644,7 @@ rollback_fields() {
 recover_locked() {
 	case "$(read_phase)" in
 		applying|rolling_back|pending) rollback_fields ;;
-		prepared|confirmed|rolled_back|absent) return 0 ;;
+		prepared|expired|confirmed|rolled_back|absent) return 0 ;;
 		conflict) rollback_fields ;;
 		*) phase conflict; return 1 ;;
 	esac
@@ -661,7 +677,7 @@ recover_auto_locked() {
 	case "$(read_phase)" in
 		applying|rolling_back) rollback_fields ;;
 		pending) if pending_recovery_due; then rollback_fields; fi ;;
-		prepared|confirmed|rolled_back|conflict|absent) return 0 ;;
+		prepared|expired|confirmed|rolled_back|conflict|absent) return 0 ;;
 		*) phase conflict; return 1 ;;
 	esac
 }
@@ -671,6 +687,7 @@ status_json() {
 	if [ -f "$WAL/deadline" ]; then printf ',"deadline":"%s"' "$(rp_json_escape "$(cat "$WAL/deadline")")"; fi
 	if [ -f "$WAL/stage" ]; then printf ',"stage":"%s"' "$(rp_json_escape "$(cat "$WAL/stage")")"; fi
 	if [ -f "$WAL/failed-stage" ]; then printf ',"failed_stage":"%s"' "$(rp_json_escape "$(cat "$WAL/failed-stage")")"; fi
+	if [ -f "$WAL/prepared-expired-reason" ]; then printf ',"prepared_expired_reason":"%s"' "$(rp_json_escape "$(cat "$WAL/prepared-expired-reason")")"; fi
 	if [ -f "$WAL/conflicts" ]; then printf ',"conflicts":"%s"' "$(rp_json_escape "$(cat "$WAL/conflicts")")"; fi
 	if [ -s "$WAL/deferred-services" ]; then printf ',"deferred_services":"%s"' "$(rp_json_escape "$(cat "$WAL/deferred-services")")"; fi
 	if [ -s "$WAL/verify-error" ]; then printf ',"verification_error":"%s"' "$(rp_json_escape "$(head -c 4096 "$WAL/verify-error")")"; fi
@@ -740,7 +757,7 @@ case "$operation" in
 		args_valid "$@" || fail '初始化参数非法'
 		lock
 		! rp_dns_boot_pending || fail '已确认接管的启动恢复尚未完成，请稍后重试初始化'
-		case "$(read_phase)" in absent|prepared|confirmed|rolled_back) ;; *) fail '存在未完成事务；请先恢复' ;; esac
+		case "$(read_phase)" in absent|prepared|expired|confirmed|rolled_back) ;; *) fail '存在未完成事务；请先恢复' ;; esac
 		no_pending || fail '存在外部 UCI pending changes'
 		candidate=$(make_plan "$@") || fail '拓扑预检失败'
 		link_preview=$("$LIBEXEC/init-topology" link-plan "$@" 9>&-) || fail '新出口链路预检失败'
@@ -762,6 +779,7 @@ case "$operation" in
 		uci_layout || fail '不能建立隔离 UCI 包命名空间'
 		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能安全保存逐字段基线'
 		smartdns_coordinate prepare || fail 'SmartDNS 协调准备阶段失败'
+		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/prepared-boot-id" && [ -s "$WAL/prepared-boot-id" ] || fail '不能记录候选启动身份'
 		phase prepared || fail '持久化准备状态失败'
 		[ ! -L "$TX/previous" ] || fail '事务旧代目录不安全'
 		rm -rf "$TX/previous" || fail '不能清理旧准备代'
@@ -941,7 +959,9 @@ case "$operation" in
 			case "$(read_phase)" in
 				applying|rolling_back|confirming) "$0" recover-auto >/dev/null 2>&1 || true ;;
 				pending) if pending_recovery_due; then "$0" recover-auto >/dev/null 2>&1 || true; fi ;;
-				prepared) if pending_recovery_due; then guard_stop_if_inactive && exit 0; fi ;;
+				prepared)
+					"$0" recover-auto >/dev/null 2>&1 || true
+					if pending_recovery_due; then guard_stop_if_inactive && exit 0; fi ;;
 				*) guard_stop_if_inactive && exit 0 ;;
 			esac
 			sleep 2

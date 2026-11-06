@@ -110,6 +110,13 @@ init_dns_plan() {
 	roots=$(sections dhcp dnsmasq)
 	[ "$(printf '%s\n' "$roots" | awk 'NF{n++}END{print n+0}')" = 1 ] || fail '需要唯一 dnsmasq 实例；多实例请先明确接入归属'
 	dnsmasq=$roots
+	for item in dns_redirect old_dns_redirect; do
+		[ "$(get "dhcp.$dnsmasq.$item")" != 1 ] || fail "dnsmasq $item=1 会触发原生 SmartDNS DHCP 联动；请先在原生界面处理，用户配置已保留"
+	done
+	case "$(get "dhcp.$dnsmasq.disabled")" in
+		1|on|true|yes|enabled)
+			[ "$(init_dns_service_state dnsmasq)" = 0 ] || fail 'dnsmasq disabled 已开启但进程仍运行；原生 init 无法重建此不一致原态，请先处理' ;;
+	esac
 	previous=$(init_dns_service_state smartdns) || fail '无法读取 SmartDNS 原运行状态'
 	init_dns_native_side_effects "$root" "$previous"
 	if [ "$previous" = 1 ]; then
@@ -118,6 +125,10 @@ init_dns_plan() {
 			[ -n "$previous" ] || { case "$item" in port) previous=53 ;; enabled) previous=0 ;; *) previous=1 ;; esac; }
 			[ "$(get "smartdns.$root.old_$item")" = "$previous" ] || fail "SmartDNS 运行配置与原生 old_$item 不一致；请先在原生界面完成重载"
 		done
+		previous=$(get "smartdns.$root.port"); previous=${previous:-53}
+		if [ "$previous" = 53 ]; then
+			[ "$(get "dhcp.$dnsmasq.port")" = 0 ] || fail '原已运行 SmartDNS 端口53但 dnsmasq.port 非0；原生回滚启动会修改端口与 DHCP option6，请先手工处理'
+		fi
 		if [ "$(get "smartdns.$root.auto_set_dnsmasq")" = 1 ]; then
 			previous=$(get "smartdns.$root.port")
 			if [ "$previous" = 53 ]; then
@@ -142,7 +153,7 @@ init_dns_plan() {
 	port=53
 	previous=$(get "smartdns.$root.server_flags")
 	case "$previous" in ''|'-group rp_init_default') ;; *) fail 'SmartDNS server_flags 已有用户设置，不能安全接管默认上游组' ;; esac
-	# Seed the official init bookkeeping to prevent its legacy dnsmasq auto-edit path.
+	# Seed port-transition bookkeeping; native port53 still unconditionally reloads dnsmasq.
 	for item in enabled:1 port:"$port" tcp_server:1 ipv6_server:0 bind_device:1 bind_device_name:"$access_device" auto_set_dnsmasq:0 old_enabled:1 old_port:"$port" old_auto_set_dnsmasq:0 cache_persist:1 cache_file:/tmp/routepolicy/smartdns.cache force_aaaa_soa:1 tls_server:0 doh_server:0 seconddns_enabled:0; do
 		set_value "smartdns.$root.${item%%:*}" "${item#*:}"
 	done
@@ -155,6 +166,7 @@ init_dns_plan() {
 	done
 	set_value "smartdns.$root.server_flags" '-group rp_init_default'
 	set_value "dhcp.$dnsmasq.port" 0
+	set_value "dhcp.$dnsmasq.disabled" 1
 	data=$(uci -q export smartdns | rp_uci_field_data "$root" conf_files) || {
 		[ -z "$(get "smartdns.$root.conf_files")" ] || fail 'SmartDNS conf_files 包含不能无损处理的值'
 		data=''
@@ -174,7 +186,7 @@ init_dns_plan() {
 		for item in $values; do
 			index=$((index+1)); section="rp_init_${role}_$index"; group="rp_init_$role"
 			previous=$(get "smartdns.$section")
-			[ -z "$previous" ] || { [ "$previous" = server ] && [ "$(get "smartdns.$section.routepolicy_init")" = 1 ]; } || fail "SmartDNS 保留段冲突: $section"
+			[ -z "$previous" ] || { [ "$previous" = server ] && init_dns_server_owned "$section"; } || fail "SmartDNS 保留段冲突: $section"
 			set_value "smartdns.$section" server
 			set_value "smartdns.$section.routepolicy_init" 1
 			set_value "smartdns.$section.enabled" 1
@@ -188,7 +200,10 @@ init_dns_plan() {
 		# A smaller repeated input disables only our previously generated surplus.
 		while [ "$index" -lt 4 ]; do
 			index=$((index+1)); section="rp_init_${role}_$index"
-			[ "$(get "smartdns.$section.routepolicy_init")" != 1 ] || set_value "smartdns.$section.enabled" 0
+			if [ "$(get "smartdns.$section.routepolicy_init")" = 1 ]; then
+				init_dns_server_owned "$section" || fail "SmartDNS 保留段缺少本应用来源记录: $section"
+				set_value "smartdns.$section.enabled" 0
+			fi
 		done
 	done
 	for section in $(rp_smartdns_server_sections); do
@@ -288,12 +303,8 @@ init_dns_original_probe() {
 	done <"$endpoints"
 	[ "$mode" != save ] || mv "$endpoints.new" "$endpoints"
 }
-init_dns_audit_binds() {
-	local config=$1 depth=$2 port=$3 device=$4 user=${5:-0} includes include child
-	[ "$depth" -lt 16 ] && [ -f "$config" ] || return 1
-	# Native getopt_long_only also accepts -gVALUE, --gr=VALUE and quoted arguments.
-	# Reject escapes/continuations and ambiguous quoting instead of guessing native parsing.
-	includes=$(awk -v port="$port" -v device="$device" -v user="$user" '
+init_dns_audit_lines() {
+	awk -v port="$1" -v device="$2" -v user="$3" '
 		function tokens(line, i,c,q,word,n,started,closed,k) {
 			for(k in arg)delete arg[k]
 			for(i=1;i<=length(line);i++) {
@@ -324,7 +335,14 @@ init_dns_audit_binds() {
 			if(key~/^bind/&&(key!~/^bind(-tcp)?$/||(arg[2]!=":" port "@lo"&&arg[2]!=":" port "@" device)||arg[3]!="-group"||arg[4]!="rp_init_default"))bad=1
 			if(key=="conf-file"||key=="conf_file"){if(n<2||arg[2]==""||arg[2]~/[[:cntrl:]]/)bad=1;else print arg[2]}
 		}
-		END{exit bad}' "$config") || { rp_err "SmartDNS include 审计失败: $config"; return 1; }
+		END{exit bad}'
+}
+init_dns_audit_binds() {
+	local config=$1 depth=$2 port=$3 device=$4 user=${5:-0} includes include child
+	[ "$depth" -lt 16 ] && [ -f "$config" ] || return 1
+	# Native getopt_long_only also accepts -gVALUE, --gr=VALUE and quoted arguments.
+	# Reject escapes/continuations and ambiguous quoting instead of guessing native parsing.
+	includes=$(init_dns_audit_lines "$port" "$device" "$user" <"$config") || { rp_err "SmartDNS include 审计失败: $config"; return 1; }
 	[ -n "$includes" ] || return 0
 	while IFS= read -r include; do
 		case "$include" in *'*'*|*'?'*|*'['*|*']'*) rp_err 'SmartDNS include 通配路径无法安全审计，请改为明确文件'; return 1 ;; esac
@@ -336,8 +354,48 @@ init_dns_audit_binds() {
 $includes
 EOF
 }
+init_dns_server_owned() {
+	local section=$1 record journal
+	case "$section" in rp_init_default_[1-4]|rp_init_policy_[1-4]) ;; *) return 1 ;; esac
+	[ "$(uci -q get "smartdns.$section.routepolicy_init")" = 1 ] || return 1
+	record=$(rp_init_active_record 2>/dev/null) || record=
+	for journal in "${WAL:-$RP_STATE_DIR/init-transaction/current}" "$record"; do
+		[ -n "$journal" ] || continue
+		case "$(cat "$journal/phase" 2>/dev/null)" in applying|pending|confirming|confirmed) ;; *) continue ;; esac
+		[ -f "$journal/candidate" ] && awk -F '\t' -v key="smartdns.$section" '
+			$1=="set"&&$2==key&&$3=="server"{server=1}
+			$1=="set"&&$2==key ".routepolicy_init"&&$3=="1"{owned=1}
+			END{exit !server||!owned}' "$journal/candidate" && return 0
+	done
+	return 1
+}
+init_dns_audit_uci_servers() {
+	local section enabled type address option value owned
+	for section in $(rp_smartdns_server_sections); do
+		owned=0; init_dns_server_owned "$section" && owned=1
+		if [ "$owned" = 0 ]; then
+			enabled=$(uci -q get "smartdns.$section.enabled") || enabled=1
+			case "$enabled" in 0|off|false|no|disabled) continue ;; esac
+			type=$(uci -q get "smartdns.$section.type") || type=udp
+			address=$(uci -q get "smartdns.$section.ip") || address=
+			[ -n "$type" ] && [ -n "$address" ] || continue
+		fi
+		# Native load_server appends these values without argument quoting. Ownership
+		# exempts only fields the plan replaces with controlled values, never unknown fields.
+		for option in ip port tls_host_verify host_name http_host server_group spki_pin set_mark addition_arg; do
+			if [ "$owned" = 1 ]; then case "$option" in ip|port|server_group|addition_arg) continue ;; esac; fi
+			value=$(uci -q get "smartdns.$section.$option") || value=
+			[ "${#value}" -le 4095 ] && ! printf '%s' "$value" | LC_ALL=C grep -q '[^ -~]' || return 1
+			printf 'server 192.0.2.1 %s\n' "$value" | init_dns_audit_lines 53 lo 1 >/dev/null || {
+				rp_err "SmartDNS 用户上游保留组/参数审计失败: $section.$option"; return 1;
+			}
+		done
+	done
+}
+
 init_dns_audit_user_files() {
 	local files=$1 device=$2 include exported sections section enabled data
+	init_dns_audit_uci_servers || return 1
 	# Native init also loads enabled client-rule includes and these three fixed files.
 	exported=$(uci -q export smartdns) || return 1
 	sections=$(uci -q show smartdns | sed -n 's/^smartdns\.\([^.=]*\)=client-rule$/\1/p')
@@ -445,6 +503,9 @@ init_dns_coordinate() {
 			printf '%s' '' >"$WAL/dns90-attempted" && sync
 			;;
 		verify)
+			init_dns_audit_uci_servers || return 1
+			section=$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')
+			[ "$(uci -q get "dhcp.$section.disabled")" = 1 ] && [ "$(uci -q get "dhcp.$section.port")" = 0 ] || return 1
 			[ "$(init_dns_service_state smartdns)" = 1 ] && { [ "${operation:-}" = boot-dns ] || [ "$(init_dns_enabled smartdns)" = 1 ]; } &&
 				[ "$(init_dns_service_state dnsmasq)" = 0 ] && [ "$(init_dns_enabled dnsmasq)" = 0 ] && rp_smartdns_fragment_loaded "$path" || return 1
 			if [ "${operation:-}" = boot-dns ]; then
@@ -521,7 +582,8 @@ init_dns_coordinate() {
 			elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
 			# An existing confirmed contract owns cold boot DNS admission after rollback.
 			if rp_dns_boot_pending; then init_dns_restore_bookkeeping; return; fi
-			for service in dnsmasq smartdns; do
+			# Complete native SmartDNS callbacks before the final dnsmasq runtime convergence.
+			for service in smartdns dnsmasq; do
 				case "$(cat "$WAL/$service-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
 				[ "$(init_dns_enabled "$service")" = "$(cat "$WAL/$service-enabled")" ] || init_dns_call "$service" "$enabled" >/dev/null || return 1
 				case "$(cat "$WAL/$service-running")" in 1) running=start ;; 0) running=stop ;; *) return 1 ;; esac

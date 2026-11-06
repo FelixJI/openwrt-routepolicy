@@ -484,26 +484,36 @@ rp_writer_owned() {
 }
 rp_local_lock() {
 	rp_local_path=$1
-	mkdir "$rp_local_path" 2>/dev/null || return 1
+	if ! mkdir "$rp_local_path" 2>/dev/null; then
+		rp_writer_owned && rp_local_lock_reap "$rp_local_path" && mkdir "$rp_local_path" || return 1
+	fi
 	printf 'routepolicy-writer-v1 %s %s\n' "$$" "$(rp_process_start "$$")" >"$rp_local_path/owner" || { rmdir "$rp_local_path"; return 1; }
 }
 rp_local_unlock() {
 	rm -f "$1/owner"
 	rmdir "$1" 2>/dev/null || true
 }
+rp_local_lock_reap() {
+	rp_old_path=$1
+	[ -d "$rp_old_path" ] && [ ! -L "$rp_old_path" ] && [ -f "$rp_old_path/owner" ] && [ ! -L "$rp_old_path/owner" ] || return 1
+	read -r rp_old_version rp_old_pid rp_old_start rp_old_extra <"$rp_old_path/owner" || return 1
+	[ "$rp_old_version" = routepolicy-writer-v1 ] || return 1
+	case "$rp_old_pid:$rp_old_start" in *[!0-9:]*) return 1 ;; esac
+	[ -n "$rp_old_pid" ] && [ -n "$rp_old_start" ] && [ -z "$rp_old_extra" ] || return 1
+	if [ "$(rp_process_start "$rp_old_pid")" = "$rp_old_start" ]; then
+		rp_old_stat=$(cat "/proc/$rp_old_pid/stat" 2>/dev/null) || return 1
+		case "${rp_old_stat##*) }" in Z\ *|X\ *) ;; *) return 1 ;; esac
+	fi
+	# A dead shell alone is insufficient: its inherited synchronous writers must drain.
+	rp_writer_idle || return 1
+	[ "$(find "$rp_old_path" -mindepth 1 -maxdepth 1 | wc -l)" = 1 ] || return 1
+	rm "$rp_old_path/owner" && rmdir "$rp_old_path"
+}
 rp_writer_drain_legacy() {
 	for rp_old_lock in apply.lock update.lock smartdns-apply.lock import.lock; do
 		rp_old_path="$RP_RUN_DIR/$rp_old_lock"
 		[ ! -e "$rp_old_path" ] && [ ! -L "$rp_old_path" ] && continue
-		[ -d "$rp_old_path" ] && [ ! -L "$rp_old_path" ] && [ -f "$rp_old_path/owner" ] && [ ! -L "$rp_old_path/owner" ] || return 1
-		read -r rp_old_version rp_old_pid rp_old_start rp_old_extra <"$rp_old_path/owner" || return 1
-		[ "$rp_old_version" = routepolicy-writer-v1 ] || return 1
-		case "$rp_old_pid:$rp_old_start" in *[!0-9:]*) return 1 ;; esac
-		[ -n "$rp_old_pid" ] && [ -n "$rp_old_start" ] && [ -z "$rp_old_extra" ] || return 1
-		[ "$(rp_process_start "$rp_old_pid")" != "$rp_old_start" ] || return 1
-		# Only remove the exact protocol marker; unknown contents stay busy.
-		[ "$(find "$rp_old_path" -mindepth 1 -maxdepth 1 | wc -l)" = 1 ] || return 1
-		rm "$rp_old_path/owner" && rmdir "$rp_old_path" || return 1
+		rp_local_lock_reap "$rp_old_path" || return 1
 	done
 }
 rp_writer_enter() {
@@ -529,7 +539,7 @@ rp_writer_enter() {
 	fi
 	if [ "$rp_writer_role" != init ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" != init ]; then
 		if [ -e "$RP_STATE_DIR/init-transaction/active" ] || [ -L "$RP_STATE_DIR/init-transaction/active" ]; then rp_init_active_record >/dev/null || return 1; fi
-		case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in absent|confirmed|rolled_back) ;; *) rp_err '初始化事务尚未完成'; return 1 ;; esac
+		case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in absent|expired|confirmed|rolled_back) ;; *) rp_err '初始化事务尚未完成'; return 1 ;; esac
 		! rp_dns_boot_pending || { rp_err '已确认 DNS 启动尚未验证'; return 1; }
 	fi
 	if [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ]; then
