@@ -4,7 +4,9 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/../.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-live-snapshot-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-mkdir -p "$tmp/etc/routepolicy/state" "$tmp/tmp/routepolicy" "$tmp/bin"
+mkdir -p "$tmp/etc/routepolicy/state" "$tmp/tmp/routepolicy" "$tmp/bin" "$tmp/proc/sys/kernel/random"
+printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/proc/sys/kernel/random/boot_id"
+printf '100.00 0.00\n' >"$tmp/proc/uptime"
 
 cat >"$tmp/bin/nft" <<'EOF'
 #!/bin/sh
@@ -40,9 +42,9 @@ TEST_LIVE_CHECK="$tmp/live.checked" TEST_LIVE_APPLY="$tmp/live.applied" \
 	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
 	ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
 	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-save "$snapshot"
-grep -Fxq 'add element inet routepolicy domain_policy4 { 1.1.1.1 timeout 42m30s }' "$snapshot"
-grep -Fxq 'add element inet routepolicy domain_policy4 { 8.8.8.8 timeout 7s }' "$snapshot"
-grep -Fxq 'add element inet routepolicy domain_default4 { 9.9.9.9 timeout 995ms }' "$snapshot"
+grep -Fxq "$(printf 'domain_policy4\t1.1.1.1\t2550000')" "$snapshot"
+grep -Fxq "$(printf 'domain_policy4\t8.8.8.8\t7000')" "$snapshot"
+grep -Fxq "$(printf 'domain_default4\t9.9.9.9\t995')" "$snapshot"
 if grep -Fq 'timeout 10m' "$snapshot"; then
 	printf 'live snapshot replaced the remaining TTL with the warm-state fallback\n' >&2; exit 1
 fi
@@ -51,8 +53,37 @@ TEST_LIVE_CHECK="$tmp/live.checked" TEST_LIVE_APPLY="$tmp/live.applied" \
 	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
 	ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
 	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-restore "$snapshot"
-cmp "$snapshot" "$tmp/live.checked"
-cmp "$snapshot" "$tmp/live.applied"
+grep -Fxq 'add element inet routepolicy domain_policy4 { 1.1.1.1 timeout 2549990ms }' "$tmp/live.applied"
+grep -Fxq 'add element inet routepolicy domain_default4 { 9.9.9.9 timeout 985ms }' "$tmp/live.applied"
+cmp "$tmp/live.checked" "$tmp/live.applied"
+printf '106.00 0.00\n' >"$tmp/proc/uptime"
+TEST_LIVE_CHECK="$tmp/live.checked" TEST_LIVE_APPLY="$tmp/live.applied" PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-restore "$snapshot"
+grep -Fxq 'add element inet routepolicy domain_policy4 { 8.8.8.8 timeout 990ms }' "$tmp/live.applied"
+if grep -Fq 9.9.9.9 "$tmp/live.applied"; then exit 1; fi
+printf '106.50 0.00\n' >"$tmp/proc/uptime"
+TEST_LIVE_CHECK="$tmp/live.checked" TEST_LIVE_APPLY="$tmp/live.applied" PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-restore "$snapshot"
+grep -Fxq 'add element inet routepolicy domain_policy4 { 8.8.8.8 timeout 490ms }' "$tmp/live.applied"
+cp "$snapshot" "$tmp/live.good"; printf 'delete table inet fw4\n' >"$snapshot"; rm "$tmp/live.applied"
+PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-restore "$snapshot" 2>"$tmp/live-skipped"
+[ ! -e "$tmp/live.applied" ]; grep -Fq legacy "$tmp/live-skipped"
+rm "$snapshot"; ln -s "$tmp/live.good" "$snapshot"
+if PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-restore "$snapshot"; then exit 1; fi
+rm "$snapshot"; cp "$tmp/live.good" "$snapshot"
+for unsafe in "$tmp/tmp/routepolicy/../escape" "$tmp/escape"; do
+	if PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+		"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-save "$unsafe"; then exit 1; fi
+done
+ln -s "$tmp/etc" "$tmp/tmp/routepolicy/linked"
+if PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-save "$tmp/tmp/routepolicy/linked/snapshot"; then exit 1; fi
+mkdir "$tmp/tmp/routepolicy/directory"
+if PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+	"$ROOT/routepolicy/files/usr/libexec/routepolicy/warm-state" live-save "$tmp/tmp/routepolicy/directory"; then exit 1; fi
+printf '100.00 0.00\n' >"$tmp/proc/uptime"
 
 mkdir -p "$tmp/etc/config" "$tmp/etc/routepolicy/user.d" \
 	"$tmp/etc/routepolicy/managed.d/current" "$tmp/etc/routepolicy/managed.d/previous"
