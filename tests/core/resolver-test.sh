@@ -51,7 +51,9 @@ restored() {
 	init_resolver_restore
 }
 reset; init_resolver_prepare; init_resolver_install; init_resolver_verify
-if [ "$(id -u)" = 0 ] && command -v runuser >/dev/null && id nobody >/dev/null 2>&1; then runuser -u nobody -- cat "$RP_RESOLVER_FILE" | grep -Fxq 'nameserver 127.0.0.1'; fi
+nonroot_read=skipped
+if [ "$(id -u)" = 0 ] && command -v runuser >/dev/null && id nobody >/dev/null 2>&1; then runuser -u nobody -- cat "$RP_RESOLVER_FILE" | grep -Fxq 'nameserver 127.0.0.1'; nonroot_read=passed; fi
+printf 'resolver nonroot read: %s\n' "$nonroot_read"
 restored
 reset; rm "$RP_RESOLVER_ENTRY"; printf 'search lan\nnameserver 127.0.0.1\nnameserver ::1\n' >"$RP_RESOLVER_ENTRY"; chmod 644 "$RP_RESOLVER_ENTRY"
 cp "$RP_RESOLVER_ENTRY" "$tmp/native.before"
@@ -93,4 +95,16 @@ rm "$RP_RESOLVER_ENTRY"; printf 'new boot external\n' >"$RP_RESOLVER_ENTRY"
 init_resolver_restore; grep -Fxq 'new boot external' "$RP_RESOLVER_ENTRY"
 rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
 init_resolver_prepare boot; init_resolver_origin "$active/origin"; init_resolver_install; init_resolver_verify; restored
-printf '%s\n' 'resolver transaction: passed (standard native/link, modes, nonroot read, four kill boundaries, conflicts, sameboot origin, crossboot no replay, auto preserved)'
+reset; init_resolver_prepare; init_resolver_install
+printf 'confirmed\n' >"$WAL/phase"; cp "$tmp/root/proc/sys/kernel/random/boot_id" "$WAL/boot-id"
+rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
+if init_resolver_prepare || init_resolver_install; then printf 'confirmed before was treated as unfinished install\n' >&2; exit 1; fi
+[ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/resolv.conf.auto ]
+rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/routepolicy.conf "$RP_RESOLVER_ENTRY"; init_resolver_install
+printf '00000000-0000-4000-8000-000000000003\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+rm "$RP_RESOLVER_ENTRY" "$RP_RESOLVER_FILE"; ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
+init_resolver_prepare boot; init_resolver_install; init_resolver_verify
+cp "$tmp/root/proc/sys/kernel/random/boot_id" "$WAL/dns-boot-ready"
+rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
+if init_resolver_install; then printf 'ready boot before was treated as unfinished install\n' >&2; exit 1; fi
+printf '%s\n' 'resolver transaction: passed (standard native/link, modes, four kill boundaries, conflicts, confirmed before rejected, sameboot origin, crossboot no replay/rebuild, auto preserved)'

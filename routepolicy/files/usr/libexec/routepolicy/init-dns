@@ -9,13 +9,13 @@ init_resolver_layout() {
 	local parent
 	for parent in "$RP_ROOT/etc" "$RP_ROOT/tmp" "$RP_ROOT/tmp/resolv.conf.d"; do
 		[ -d "$parent" ] && [ ! -L "$parent" ] || return 1
-		case "$(stat -c %a "$parent")" in 755|1777) ;; *) return 1 ;; esac
+		case "$(rp_path_mode "$parent")" in 755|1777) ;; *) return 1 ;; esac
 	done
 	[ -L "$RP_ROOT/etc/resolv.conf" ] && [ "$(readlink "$RP_ROOT/etc/resolv.conf")" = /tmp/resolv.conf ]
 }
 init_resolver_body() { printf 'nameserver 127.0.0.1\n'; }
 init_resolver_file_ok() {
-	[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(stat -c %a "$RP_RESOLVER_FILE")" = 644 ] && init_resolver_body | cmp -s - "$RP_RESOLVER_FILE"
+	[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(rp_path_mode "$RP_RESOLVER_FILE")" = 644 ] && init_resolver_body | cmp -s - "$RP_RESOLVER_FILE"
 }
 init_resolver_link_ok() { [ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/routepolicy.conf ]; }
 init_resolver_record() {
@@ -37,7 +37,7 @@ init_resolver_get() { awk -F '\t' -v key="$2" '$1==key{print $2}' "$1"; }
 init_resolver_native_file() {
 	local root localuse domain noresolv resolvfile inherited=1 newline='
 '
-	[ -f "$RP_RESOLVER_ENTRY" ] && [ ! -L "$RP_RESOLVER_ENTRY" ] && [ "$(stat -c %a "$RP_RESOLVER_ENTRY")" = 644 ] && [ "$(wc -c <"$RP_RESOLVER_ENTRY")" -le 1024 ] || return 1
+	[ -f "$RP_RESOLVER_ENTRY" ] && [ ! -L "$RP_RESOLVER_ENTRY" ] && [ "$(rp_path_mode "$RP_RESOLVER_ENTRY")" = 644 ] && [ "$(wc -c <"$RP_RESOLVER_ENTRY")" -le 1024 ] || return 1
 	[ "$(tail -c 1 "$RP_RESOLVER_ENTRY"; printf .)" = "$newline." ] || return 1
 	[ "$(init_dns_service_state dnsmasq)" = 1 ] || return 1
 	root=$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')
@@ -62,7 +62,7 @@ init_resolver_before_matches() {
 	case "$kind" in
 		absent) [ ! -e "$target" ] && [ ! -L "$target" ] ;;
 		link) [ -L "$target" ] && [ "$(readlink "$target")" = "$(init_resolver_get "$record" "$object-link")" ] ;;
-		regular) [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c %a "$target")" = "$(init_resolver_get "$record" "$object-mode")" ] && init_resolver_get "$record" "$object-line" | cmp -s - "$target" ;;
+		regular) [ -f "$target" ] && [ ! -L "$target" ] && [ "$(rp_path_mode "$target")" = "$(init_resolver_get "$record" "$object-mode")" ] && init_resolver_get "$record" "$object-line" | cmp -s - "$target" ;;
 		*) return 1 ;;
 	esac
 }
@@ -71,6 +71,7 @@ init_resolver_prepare() {
 	local mode=${1:-apply} record="$WAL/dns-resolver" boot active temporary kind
 	init_resolver_required || return 0
 	init_resolver_layout && boot=$(init_resolver_boot) || return 1
+	init_resolver_forward_admit || return 1
 	if [ -e "$record" ] || [ -L "$record" ]; then init_resolver_record "$record" || return 1; fi
 	if init_resolver_record "$record" && [ "$(init_resolver_get "$record" boot)" = "$boot" ]; then return 0; fi
 	if [ "$mode" = boot ]; then
@@ -97,6 +98,7 @@ init_resolver_attempt() {
 init_resolver_install() {
 	local record="$WAL/dns-resolver" boot temporary
 	init_resolver_required || return 0
+	init_resolver_forward_admit || return 1
 	init_resolver_layout && init_resolver_record "$record" && boot=$(init_resolver_boot) && [ "$(init_resolver_get "$record" boot)" = "$boot" ] || return 1
 	if init_resolver_file_ok && ! init_resolver_before_matches "$record" file; then [ "$(cat "$WAL/dns-resolver-file-attempted" 2>/dev/null)" = "$boot" ] || return 1; fi
 	if init_resolver_link_ok && ! init_resolver_before_matches "$record" entry; then [ "$(cat "$WAL/dns-resolver-link-attempted" 2>/dev/null)" = "$boot" ] || return 1; fi
@@ -111,6 +113,16 @@ init_resolver_install() {
 		rm "$temporary" && ln -s /tmp/resolv.conf.d/routepolicy.conf "$temporary" && mv -f "$temporary" "$RP_RESOLVER_ENTRY" && sync || return 1
 	fi
 	init_resolver_file_ok && init_resolver_link_ok
+}
+init_resolver_forward_admit() {
+	local boot
+	init_resolver_required || return 0
+	boot=$(init_resolver_boot) || return 1
+	# Before is resumable only until this boot has successfully confirmed DNS.
+	if [ "$(cat "$WAL/phase" 2>/dev/null)" = confirmed ] &&
+		{ [ "$(cat "$WAL/boot-id" 2>/dev/null)" = "$boot" ] || [ "$(cat "$WAL/dns-boot-ready" 2>/dev/null)" = "$boot" ]; }; then
+		init_resolver_record "$WAL/dns-resolver" && [ "$(init_resolver_get "$WAL/dns-resolver" boot)" = "$boot" ] && init_resolver_layout && init_resolver_file_ok && init_resolver_link_ok
+	fi
 }
 init_resolver_origin() {
 	local directory=$1 boot temporary
@@ -749,11 +761,18 @@ init_dns_coordinate() {
 			[ ! -L "$path" ] && { [ ! -e "$path" ] || [ -f "$path" ]; } || return 1
 			if [ -e "$path" ]; then cp -p "$path" "$WAL/dns-file-old" || return 1; else : >"$WAL/dns-file-absent"; fi
 			{ [ ! -f "$WAL/dns-file-old" ] || cat "$WAL/dns-file-old"; } >"$WAL/dns-file-new" || return 1
-			if ! grep -Fqx '# routepolicy initialization probes' "$WAL/dns-file-new"; then
-				{ printf '\n'; rp_smartdns_init_probes; } >>"$WAL/dns-file-new" || return 1
-			fi
-			for probe in default policy; do
-				[ "$(grep -Fxc "domain-rules /routepolicy-init-$probe.test/ -nameserver rp_init_$probe -speed-check-mode none" "$WAL/dns-file-new")" = 1 ] || return 1
+			[ "$(grep -Fxc '# routepolicy initialization probes' "$WAL/dns-file-new")" -le 1 ] || return 1
+			if ! grep -Fqx '# routepolicy initialization probes' "$WAL/dns-file-new"; then printf '\n# routepolicy initialization probes\n' >>"$WAL/dns-file-new" || return 1; fi
+			for probe in default policy resolver; do
+				local expected_probe probe_references probe_exact
+				expected_probe=$(rp_smartdns_init_probes | grep -F "/routepolicy-init-$probe.test/") || return 1
+				probe_references=$(awk -v domain="/routepolicy-init-$probe.test/" '$0!~/^[ \t]*#/&&index($0,domain){n++}END{print n+0}' "$WAL/dns-file-new") || return 1
+				probe_exact=$(grep -Fxc "$expected_probe" "$WAL/dns-file-new") || true
+				case "$probe_references:$probe_exact" in
+					0:0) printf '\n%s\n' "$expected_probe" >>"$WAL/dns-file-new" || return 1 ;;
+					1:1) ;;
+					*) return 1 ;;
+				esac
 			done
 			[ ! -L "$RP_SMARTDNS_FILE" ] && { [ ! -e "$RP_SMARTDNS_FILE" ] || [ -f "$RP_SMARTDNS_FILE" ]; } || return 1
 			if [ -e "$RP_SMARTDNS_FILE" ]; then cp -p "$RP_SMARTDNS_FILE" "$WAL/dns90-old" || return 1; else : >"$WAL/dns90-absent"; fi

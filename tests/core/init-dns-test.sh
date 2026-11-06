@@ -221,6 +221,7 @@ for service in smartdns dnsmasq; do
 done
 [ "$found" = 1 ] || exit 9
 case "$*" in *routepolicy-init-resolver.test*)
+	grep -Fxq 'address /routepolicy-init-resolver.test/127.0.0.1' "$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf" || exit 12
 	case "$*" in *@127.0.0.1*) ;; *) [ "$(readlink "$ROUTEPOLICY_ROOT/tmp/resolv.conf")" = /tmp/resolv.conf.d/routepolicy.conf ] || exit 10 ;; esac
 	[ "$(cat "$TEST_DNS_TMP/svc/smartdns.running")$(cat "$TEST_DNS_TMP/svc/smartdns.port")" = 153 ] || exit 11
 	printf '127.0.0.1\n'; exit 0 ;;
@@ -461,6 +462,52 @@ test_boot() {
 	rm -f "$RP_RESOLVER_ENTRY" "$RP_RESOLVER_FILE"
 	ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
 }
+if [ "${1:-}" = --resolver-repair ]; then
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	active=$(rp_init_active_record)
+	rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
+	if "$TX" repair >"$tmp/repair-auto-result" 2>&1; then printf 'confirmed repair overwrote external auto link\n' >&2; exit 1; fi
+	[ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/resolv.conf.auto ]
+	[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/smartdns.enabled")" = 11 ]
+	"$TX" status >"$tmp/repair-status"; [ "$(jsonfilter -i "$tmp/repair-status" -e '@.active.dns_boot_state')" = resolver_conflict ]
+	rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/routepolicy.conf "$RP_RESOLVER_ENTRY"
+	"$TX" repair >/dev/null
+	test_boot; printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
+	"$TX" recover-early >/dev/null; "$TX" boot-dns >/dev/null
+	[ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/routepolicy.conf ]
+	rm "$RP_RESOLVER_ENTRY"; ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
+	if "$TX" repair >/dev/null 2>&1; then printf 'post-reboot confirmed repair overwrote external auto link\n' >&2; exit 1; fi
+	[ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/resolv.conf.auto ]
+	printf '%s\n' 'confirmed resolver repair: passed (external before preserved, manual restoration retries, genuine new boot rebuilds, ready-boot external rollback rejected)'
+	exit 0
+fi
+if [ "${1:-}" = --resolver-probes ]; then
+	for probe_case in legacy no-header complete duplicate-role conflict-role duplicate-address conflict-address; do
+		baseline 0 0 1 1
+		path="$RP_SMARTDNS_EXTRA_FILE"
+		printf '# USER_KEEP unknown fragment\nprefetch-domain yes\n' >"$path"
+		case "$probe_case" in no-header) rp_smartdns_init_probes | tail -n +2 >>"$path" ;; complete) rp_smartdns_init_probes >>"$path" ;; *) rp_smartdns_init_probes | head -n 3 >>"$path" ;; esac
+		case "$probe_case" in
+			duplicate-role) printf 'domain-rules /routepolicy-init-default.test/ -nameserver rp_init_default -speed-check-mode none\n' >>"$path" ;;
+			conflict-role) printf 'domain-rules /routepolicy-init-policy.test/ -nameserver wrong\n' >>"$path" ;;
+			duplicate-address) printf 'address /routepolicy-init-resolver.test/127.0.0.1\naddress /routepolicy-init-resolver.test/127.0.0.1\n' >>"$path" ;;
+			conflict-address) printf 'address /routepolicy-init-resolver.test/192.0.2.99\n' >>"$path" ;;
+		esac
+		cp "$path" "$tmp/probe.before"
+		case "$probe_case" in
+			legacy|no-header|complete)
+				prepare_dns 192.0.2.53
+				new="$RP_STATE_DIR/init-transaction/current/dns-file-new"
+				head -c "$(wc -c <"$tmp/probe.before")" "$new" >"$tmp/probe.prefix"; cmp "$tmp/probe.before" "$tmp/probe.prefix"
+				for probe in default policy resolver; do expected=$(rp_smartdns_init_probes | grep -F "/routepolicy-init-$probe.test/"); [ "$(grep -Fxc "$expected" "$new")" = 1 ]; done
+				confirm_dns ;;
+			*) if "$TX" prepare lan wan wan2 - - - - - - - - 192.0.2.53 198.51.100.53 >/dev/null 2>&1; then printf 'duplicate/conflicting probe accepted: %s\n' "$probe_case" >&2; exit 1; fi
+				cmp "$tmp/probe.before" "$path" ;;
+		esac
+	done
+	printf '%s\n' 'resolver probe upgrade: passed (legacy/headerless/complete, unique role/address rules, unknown byte prefix preserved, duplicates/conflicts rejected before public write)'
+	exit 0
+fi
 if [ "${1:-}" = --legacy-resolver ]; then
 	[ -n "${TEST_LEGACY_INIT_LIBEXEC:-}" ] || { printf 'legacy resolver: skipped (provide frozen old libexec)\n'; exit 0; }
 	baseline 0 0 1 1

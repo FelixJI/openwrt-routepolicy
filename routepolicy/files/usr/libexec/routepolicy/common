@@ -676,11 +676,20 @@ rp_dns_boot_pending() {
 	active_pending=$(rp_init_active_record) || return 1
 	[ -f "$active_pending/dns-boot-pending" ]
 }
+# Only these exact standard permission strings are supported; other modes are conflicts.
+# shellcheck disable=SC3043
+rp_path_mode() {
+	local detail
+	detail=$(LC_ALL=C ls -ld "$1") || return 1
+	case "${detail%% *}" in
+		-rw-r--r--) printf 644 ;; drwxr-xr-x) printf 755 ;; drwxrwxrwt) printf 1777 ;; *) return 1 ;;
+	esac
+}
 rp_system_resolver_ready() {
 	[ -L "$RP_ROOT/etc/resolv.conf" ] && [ "$(readlink "$RP_ROOT/etc/resolv.conf")" = /tmp/resolv.conf ] &&
 		[ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/routepolicy.conf ] &&
 		[ -d "$RP_ROOT/tmp/resolv.conf.d" ] && [ ! -L "$RP_ROOT/tmp/resolv.conf.d" ] &&
-		[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(stat -c %a "$RP_RESOLVER_FILE")" = 644 ] &&
+		[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(rp_path_mode "$RP_RESOLVER_FILE")" = 644 ] &&
 		printf 'nameserver 127.0.0.1\n' | cmp -s - "$RP_RESOLVER_FILE"
 }
 

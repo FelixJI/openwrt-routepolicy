@@ -976,7 +976,7 @@ case "$operation" in
 		if repair_record=$(rp_init_active_record); then
 			(
 				WAL=$repair_record
-				load_args && uci_layout && no_pending && init_dns_managed_admit || exit 1
+				load_args && uci_layout && no_pending && init_dns_managed_admit && init_resolver_forward_admit || exit 1
 				cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/dns-boot-pending" && sync && init_dns_coordinate quarantine-boot
 			) && boot_dns_locked || fail '声明或 DNS/策略运行态不能安全重建'
 		else
