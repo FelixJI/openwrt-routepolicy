@@ -23,6 +23,8 @@ RP_SMARTDNS_BASELINE_VERSION="$RP_STATE_DIR/smartdns-baseline.version"
 RP_SMARTDNS_APPLIED="$RP_STATE_DIR/smartdns-applied.uci"
 RP_LOCAL_HOSTS="$RP_USER_DIR/local-hosts.list"
 RP_LOCAL_HOSTS_CANDIDATE="$RP_RUN_DIR/local-hosts-candidate.list"
+RP_RESOLVER_ENTRY="$RP_ROOT/tmp/resolv.conf"
+RP_RESOLVER_FILE="$RP_ROOT/tmp/resolv.conf.d/routepolicy.conf"
 RP_TABLE_FAMILY=inet
 RP_TABLE_NAME=routepolicy
 RP_SCHEMA_VERSION=1
@@ -408,7 +410,9 @@ rp_managed_publish() {
 		printf '%s\n' "${swap##*/}" >"$wal/managed-swap-name" && rp_managed_phase "$wal" publishing || return 1
 	rp_managed_equal "$RP_MANAGED_CURRENT" "$wal/managed-before-current" && rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" && rp_init_window_open "$wal" || return 1
 	mv "$RP_MANAGED_CURRENT" "$swap" && mv "$candidate" "$RP_MANAGED_CURRENT" || return 1
-	rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" && rm -rf "$RP_MANAGED_PREVIOUS" && mv "$swap" "$RP_MANAGED_PREVIOUS" || return 1
+	[ ! -e "$wal/managed-retired-previous" ] && [ ! -L "$wal/managed-retired-previous" ] &&
+		rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" &&
+		mv "$RP_MANAGED_PREVIOUS" "$wal/managed-retired-previous" && sync && mv "$swap" "$RP_MANAGED_PREVIOUS" || return 1
 	rp_managed_phase "$wal" published
 }
 
@@ -422,6 +426,10 @@ rp_managed_restore() {
 	swap_name=$(cat "$wal/managed-swap-name" 2>/dev/null) || swap_name=
 	case "$swap_name" in previous.next.[0-9]*) case "${swap_name#previous.next.}" in *[!0-9]*) return 1 ;; esac ;; '') ;; *) return 1 ;; esac
 	swap="$RP_ETC/managed.d/${swap_name:-unused}"
+	if [ -e "$wal/managed-retired-previous" ] || [ -L "$wal/managed-retired-previous" ]; then
+		rp_managed_equal "$wal/managed-retired-previous" "$wal/managed-before-previous" || return 1
+	fi
+	if [ -e "$swap" ] || [ -L "$swap" ]; then rp_managed_equal "$swap" "$wal/managed-before-current" || return 1; fi
 	# Validate both public directories before the first recovery rename.
 	for name in current previous; do
 		target="$RP_ETC/managed.d/$name"; before="$wal/managed-before-$name"
@@ -452,8 +460,9 @@ rp_managed_restore() {
 		fi
 		mv "$replacement" "$target" && sync || return 1
 	done
-	if [ -n "$swap_name" ] && [ -e "$swap" ]; then rp_managed_equal "$swap" "$wal/managed-before-current" && rm -rf "$swap" || return 1; fi
-	rp_managed_phase "$wal" restored
+	# Public snapshots have converged before any fallible cleanup of retired bytes.
+	rp_managed_phase "$wal" restored || return 1
+	if [ -n "$swap_name" ] && [ -e "$swap" ]; then rm -rf "$swap" || true; fi
 }
 
 rp_validate_sources() {
@@ -605,7 +614,8 @@ rp_output_error() {
 rp_smartdns_init_probes() {
 	printf '%s\n' '# routepolicy initialization probes' \
 		'domain-rules /routepolicy-init-default.test/ -nameserver rp_init_default -speed-check-mode none' \
-		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none'
+		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none' \
+		'address /routepolicy-init-resolver.test/127.0.0.1'
 }
 
 # A confirmed DNS contract survives replacement of the reviewable candidate WAL.
@@ -665,6 +675,13 @@ rp_dns_boot_pending() {
 	[ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ] && return 0
 	active_pending=$(rp_init_active_record) || return 1
 	[ -f "$active_pending/dns-boot-pending" ]
+}
+rp_system_resolver_ready() {
+	[ -L "$RP_ROOT/etc/resolv.conf" ] && [ "$(readlink "$RP_ROOT/etc/resolv.conf")" = /tmp/resolv.conf ] &&
+		[ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/routepolicy.conf ] &&
+		[ -d "$RP_ROOT/tmp/resolv.conf.d" ] && [ ! -L "$RP_ROOT/tmp/resolv.conf.d" ] &&
+		[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(stat -c %a "$RP_RESOLVER_FILE")" = 644 ] &&
+		printf 'nameserver 127.0.0.1\n' | cmp -s - "$RP_RESOLVER_FILE"
 }
 
 # One kernel gate covers initialization, candidate publication and runtime writers.

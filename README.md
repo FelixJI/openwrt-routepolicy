@@ -141,6 +141,22 @@ sysupgrade -b /tmp/before-firmware.tar.gz
 
 升级完成后从控制台重新安装受支持的两个 APK 及依赖，再执行 `routepolicyctl init-repair --json`、`routepolicyctl diagnose --json` 和 `ubus call routepolicy status '{}'`。恢复根据声明重新检查当前接口、受管字段、依赖和内核对象，先建立策略规则再启动 DNS；旧启动的 applied 不能认领新内核的同名资源。缺失依赖、静态清单或所有权冲突会保留现场并报错，不能把空规则或陈旧回执当作 strict 成功。实际固件升级只在隔离环境验收，本命令不会代替管理员执行 sysupgrade。
 
+系统解析接管保留标准 `/etc/resolv.conf` 链接，只把 `/tmp/resolv.conf` 指向受管的 IPv4 lo53 文件。接口 DNS 和 netifd 的 `resolv.conf.auto` 保持原样，供 SmartDNS 的 hostname 上游启动解析使用；自定义 resolver 布局或外部修改会阻止接管。普通停用继续保留 DNS，显式退出才恢复本次启动的原入口；固件恢复和冷启动不会重放旧 `/tmp` 内容。
+
+旧确认记录若没有系统 resolver 合同，`init-repair` 会明确拒绝虚报 DNS 就绪。可在维护窗口复用已验证记录的参数，先重新预览和准备，再按新 token 执行原有 apply、真实 LAN SSH confirm 流程，无需逐项重填：
+
+```sh
+token=$(cat /etc/routepolicy/state/init-transaction/active) || exit 1
+case "$token" in ''|*[!0-9a-f]*) exit 1 ;; esac
+[ "${#token}" = 32 ] || exit 1
+parameters=$(cat "/etc/routepolicy/state/init-transaction/confirmed/$token/parameters") || exit 1
+set -f
+IFS="$(printf '\t')"
+set -- $parameters
+routepolicyctl init-preview "$@" --json
+routepolicyctl init-prepare "$@" --json
+```
+
 ### 在另一台设备导入
 
 portable 使用 `routepolicy-config` schema 1 的 UTF-8 文本记录，最多 2 MiB、每份人工清单最多 256 KiB。它保存应用设置、来源、人工规则和初始化绑定提示；不接受 archive、任意文件路径、journal、applied 或动态集合。来源 URL、本地主机、接口与 DNS 地址可能敏感，备份必须私下保存。

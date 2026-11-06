@@ -3,6 +3,174 @@
 # Variables belong to the two sourcing entry points.
 # shellcheck disable=SC3043,SC2154
 
+init_resolver_required() { grep -Eq '^set[[:space:]]dhcp\.[^.]+\.localuse[[:space:]]0$' "$WAL/candidate"; }
+init_resolver_boot() { cat "$RP_ROOT/proc/sys/kernel/random/boot_id"; }
+init_resolver_layout() {
+	local parent
+	for parent in "$RP_ROOT/etc" "$RP_ROOT/tmp" "$RP_ROOT/tmp/resolv.conf.d"; do
+		[ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+		case "$(stat -c %a "$parent")" in 755|1777) ;; *) return 1 ;; esac
+	done
+	[ -L "$RP_ROOT/etc/resolv.conf" ] && [ "$(readlink "$RP_ROOT/etc/resolv.conf")" = /tmp/resolv.conf ]
+}
+init_resolver_body() { printf 'nameserver 127.0.0.1\n'; }
+init_resolver_file_ok() {
+	[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(stat -c %a "$RP_RESOLVER_FILE")" = 644 ] && init_resolver_body | cmp -s - "$RP_RESOLVER_FILE"
+}
+init_resolver_link_ok() { [ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/routepolicy.conf ]; }
+init_resolver_record() {
+	[ -f "$1" ] && [ ! -L "$1" ] && [ "$(wc -c <"$1")" -le 4096 ] || return 1
+	awk -F '\t' '
+		NF!=2||$2~/[[:cntrl:]]/{bad=1}
+		$1!~/^(schema|boot|expected-link|expected-file|entry-kind|entry-mode|entry-link|entry-line|file-kind|file-mode|file-line)$/{bad=1}
+		$1!~/^(entry-line|file-line)$/&&seen[$1]++{bad=1}
+		{value[$1]=$2;if($1=="entry-line")el++;if($1=="file-line")fl++}
+		END{exit bad||value["schema"]!="1"||value["expected-link"]!="/tmp/resolv.conf.d/routepolicy.conf"||value["expected-file"]!="nameserver 127.0.0.1"||length(value["boot"])!=36||value["boot"]~/[^0-9a-f-]/||
+			(value["entry-kind"]!="link"&&value["entry-kind"]!="regular")||
+			(value["entry-kind"]=="link"&&(el||value["entry-link"]!~/^\/tmp\/resolv.conf.d\/(resolv.conf.auto|routepolicy.conf)$/))||
+			(value["entry-kind"]=="regular"&&(!el||el>8||value["entry-mode"]!="644"))||
+			(value["file-kind"]!="absent"&&value["file-kind"]!="regular")||
+			(value["file-kind"]=="absent"&&fl)||(value["file-kind"]=="regular"&&(fl!=1||value["file-mode"]!="644"||value["file-line"]!="nameserver 127.0.0.1"))}
+	' "$1"
+}
+init_resolver_get() { awk -F '\t' -v key="$2" '$1==key{print $2}' "$1"; }
+init_resolver_native_file() {
+	local root localuse domain noresolv resolvfile inherited=1 newline='
+'
+	[ -f "$RP_RESOLVER_ENTRY" ] && [ ! -L "$RP_RESOLVER_ENTRY" ] && [ "$(stat -c %a "$RP_RESOLVER_ENTRY")" = 644 ] && [ "$(wc -c <"$RP_RESOLVER_ENTRY")" -le 1024 ] || return 1
+	[ "$(tail -c 1 "$RP_RESOLVER_ENTRY"; printf .)" = "$newline." ] || return 1
+	[ "$(init_dns_service_state dnsmasq)" = 1 ] || return 1
+	root=$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')
+	[ -n "$root" ] && [ "$(printf '%s\n' "$root" | wc -l)" = 1 ] || return 1
+	noresolv=$(uci -q get "dhcp.$root.noresolv") || noresolv=0
+	case "$noresolv" in 1|on|true|yes|enabled) ;; 0|off|false|no|disabled|'')
+		resolvfile=$(uci -q get "dhcp.$root.resolvfile") || resolvfile=/tmp/resolv.conf.d/resolv.conf.auto
+		[ "$resolvfile" = /tmp/resolv.conf.d/resolv.conf.auto ] || inherited=0 ;; *) return 1 ;; esac
+	localuse=$(uci -q get "dhcp.$root.localuse") || localuse=$inherited
+	localuse=${localuse:-$inherited}
+	case "$localuse" in 1|on|true|yes|enabled) ;; *) return 1 ;; esac
+	domain=$(uci -q get "dhcp.$root.domain") || domain=
+	awk -v domain="$domain" '
+		$0=="nameserver 127.0.0.1"{v4++;next}$0=="nameserver ::1"{v6++;next}
+		$0=="search " domain&&domain!=""{search++;next}{bad=1}
+		END{exit bad||v4!=1||v6>1||search>1}' "$RP_RESOLVER_ENTRY"
+}
+init_resolver_before_matches() {
+	local record=$1 object=$2 target kind
+	case "$object" in entry) target=$RP_RESOLVER_ENTRY ;; file) target=$RP_RESOLVER_FILE ;; *) return 1 ;; esac
+	kind=$(init_resolver_get "$record" "$object-kind")
+	case "$kind" in
+		absent) [ ! -e "$target" ] && [ ! -L "$target" ] ;;
+		link) [ -L "$target" ] && [ "$(readlink "$target")" = "$(init_resolver_get "$record" "$object-link")" ] ;;
+		regular) [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c %a "$target")" = "$(init_resolver_get "$record" "$object-mode")" ] && init_resolver_get "$record" "$object-line" | cmp -s - "$target" ;;
+		*) return 1 ;;
+	esac
+}
+# shellcheck disable=SC2120
+init_resolver_prepare() {
+	local mode=${1:-apply} record="$WAL/dns-resolver" boot active temporary kind
+	init_resolver_required || return 0
+	init_resolver_layout && boot=$(init_resolver_boot) || return 1
+	if [ -e "$record" ] || [ -L "$record" ]; then init_resolver_record "$record" || return 1; fi
+	if init_resolver_record "$record" && [ "$(init_resolver_get "$record" boot)" = "$boot" ]; then return 0; fi
+	if [ "$mode" = boot ]; then
+		[ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/resolv.conf.auto ] && [ ! -e "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] || return 1
+	fi
+	if [ -e "$RP_RESOLVER_FILE" ] || [ -L "$RP_RESOLVER_FILE" ]; then
+		active=$(rp_init_active_record) && init_resolver_record "$active/dns-resolver" && [ "$(init_resolver_get "$active/dns-resolver" boot)" = "$boot" ] && init_resolver_link_ok && init_resolver_file_ok || return 1
+	fi
+	if [ -L "$RP_RESOLVER_ENTRY" ]; then
+		case "$(readlink "$RP_RESOLVER_ENTRY")" in /tmp/resolv.conf.d/resolv.conf.auto) ;; /tmp/resolv.conf.d/routepolicy.conf) init_resolver_file_ok || return 1 ;; *) return 1 ;; esac
+	else init_resolver_native_file || return 1; fi
+	temporary=$(mktemp "$WAL/resolver-record.XXXXXX") || return 1
+	{
+		printf 'schema\t1\nboot\t%s\nexpected-link\t/tmp/resolv.conf.d/routepolicy.conf\nexpected-file\tnameserver 127.0.0.1\n' "$boot"
+		if [ -L "$RP_RESOLVER_ENTRY" ]; then printf 'entry-kind\tlink\nentry-link\t%s\n' "$(readlink "$RP_RESOLVER_ENTRY")"
+		else printf 'entry-kind\tregular\nentry-mode\t644\n'; sed 's/^/entry-line\t/' "$RP_RESOLVER_ENTRY"; fi
+		if [ -f "$RP_RESOLVER_FILE" ]; then printf 'file-kind\tregular\nfile-mode\t644\nfile-line\tnameserver 127.0.0.1\n'; else printf 'file-kind\tabsent\n'; fi
+	} >"$temporary" && init_resolver_record "$temporary" && chmod 600 "$temporary" && sync && mv "$temporary" "$record" && sync
+}
+init_resolver_attempt() {
+	local target="$WAL/dns-resolver-$1-attempted" boot
+	boot=$(init_resolver_boot) && printf '%s\n' "$boot" >"$target.new" && sync && mv "$target.new" "$target" && sync
+}
+init_resolver_install() {
+	local record="$WAL/dns-resolver" boot temporary
+	init_resolver_required || return 0
+	init_resolver_layout && init_resolver_record "$record" && boot=$(init_resolver_boot) && [ "$(init_resolver_get "$record" boot)" = "$boot" ] || return 1
+	if init_resolver_file_ok && ! init_resolver_before_matches "$record" file; then [ "$(cat "$WAL/dns-resolver-file-attempted" 2>/dev/null)" = "$boot" ] || return 1; fi
+	if init_resolver_link_ok && ! init_resolver_before_matches "$record" entry; then [ "$(cat "$WAL/dns-resolver-link-attempted" 2>/dev/null)" = "$boot" ] || return 1; fi
+	if ! init_resolver_file_ok; then
+		init_resolver_before_matches "$record" file && init_resolver_attempt file || return 1
+		temporary=$(mktemp "$RP_ROOT/tmp/resolv.conf.d/routepolicy.XXXXXX") || return 1
+		init_resolver_body >"$temporary" && chmod 644 "$temporary" && mv -f "$temporary" "$RP_RESOLVER_FILE" && sync || return 1
+	fi
+	if ! init_resolver_link_ok; then
+		init_resolver_before_matches "$record" entry && init_resolver_attempt link || return 1
+		temporary=$(mktemp "$RP_ROOT/tmp/resolv.conf.d/routepolicy-link.XXXXXX") || return 1
+		rm "$temporary" && ln -s /tmp/resolv.conf.d/routepolicy.conf "$temporary" && mv -f "$temporary" "$RP_RESOLVER_ENTRY" && sync || return 1
+	fi
+	init_resolver_file_ok && init_resolver_link_ok
+}
+init_resolver_origin() {
+	local directory=$1 boot temporary
+	[ -f "$WAL/dns-resolver" ] || return 0
+	init_resolver_record "$WAL/dns-resolver" && boot=$(init_resolver_boot) || return 1
+	[ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+	if [ -e "$directory/dns-resolver" ] || [ -L "$directory/dns-resolver" ]; then
+		init_resolver_record "$directory/dns-resolver" || return 1
+		[ "$(init_resolver_get "$directory/dns-resolver" boot)" != "$boot" ] || return 0
+	fi
+	temporary=$(mktemp "$directory/resolver-origin.XXXXXX") || return 1
+	cp "$WAL/dns-resolver" "$temporary" && chmod 600 "$temporary" && sync && mv "$temporary" "$directory/dns-resolver" && sync
+}
+init_resolver_exit_check() {
+	local record="$1/origin/dns-resolver" boot
+	[ -e "$record" ] || { [ ! -L "$record" ]; return; }
+	init_resolver_record "$record" && init_resolver_layout && boot=$(init_resolver_boot) && [ "$(init_resolver_get "$record" boot)" = "$boot" ] || return 1
+	{ init_resolver_link_ok || init_resolver_before_matches "$record" entry; } && { init_resolver_file_ok || init_resolver_before_matches "$record" file; }
+}
+init_resolver_verify() {
+	local answer protocol boot record="$WAL/dns-resolver"
+	init_resolver_required || return 0
+	init_resolver_record "$record" && boot=$(init_resolver_boot) && [ "$(init_resolver_get "$record" boot)" = "$boot" ] && init_resolver_layout && init_resolver_file_ok && init_resolver_link_ok || return 1
+	init_resolver_before_matches "$record" file || [ "$(cat "$WAL/dns-resolver-file-attempted" 2>/dev/null)" = "$boot" ] || return 1
+	init_resolver_before_matches "$record" entry || [ "$(cat "$WAL/dns-resolver-link-attempted" 2>/dev/null)" = "$boot" ] || return 1
+	for protocol in +notcp +tcp; do
+		# A deterministic local address rule isolates resolver correctness from upstream reachability.
+		answer=$(timeout 4 dig "$protocol" +time=1 +tries=1 +short routepolicy-init-resolver.test A) && [ "$answer" = 127.0.0.1 ] || return 1
+	done
+}
+init_resolver_restore_admit() {
+	local record=$1 object=$2 boot=$3 marker
+	init_resolver_before_matches "$record" "$object" && return 0
+	case "$object" in entry) marker='link' ;; file) marker='file' ;; *) return 1 ;; esac
+	[ "$(cat "$WAL/dns-resolver-$marker-attempted" 2>/dev/null)" = "$boot" ] || return 1
+	if [ "$object" = entry ]; then
+		init_resolver_link_ok || { [ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/resolv.conf.auto ]; } || init_resolver_native_file
+	else init_resolver_file_ok; fi
+}
+init_resolver_restore() {
+	local record="$WAL/dns-resolver" boot object target kind temporary
+	[ -e "$record" ] || { [ ! -L "$record" ]; return; }
+	init_resolver_record "$record" && boot=$(init_resolver_boot) || return 1
+	# /tmp belongs to this boot; old snapshots never authorize a replay into a new boot.
+	[ "$(init_resolver_get "$record" boot)" = "$boot" ] || return 0
+	init_resolver_layout || return 1
+	for object in entry file; do init_resolver_restore_admit "$record" "$object" "$boot" || return 1; done
+	for object in entry file; do
+		case "$object" in entry) target=$RP_RESOLVER_ENTRY ;; file) target=$RP_RESOLVER_FILE ;; esac
+		init_resolver_before_matches "$record" "$object" && continue
+		init_resolver_restore_admit "$record" "$object" "$boot" || return 1
+		kind=$(init_resolver_get "$record" "$object-kind")
+		if [ "$kind" = absent ]; then rm "$target" && sync || return 1; continue; fi
+		temporary=$(mktemp "$RP_ROOT/tmp/resolv.conf.d/routepolicy-restore.XXXXXX") || return 1
+		if [ "$kind" = link ]; then rm "$temporary" && ln -s "$(init_resolver_get "$record" "$object-link")" "$temporary" || return 1
+		else init_resolver_get "$record" "$object-line" >"$temporary" && chmod "$(init_resolver_get "$record" "$object-mode")" "$temporary" || return 1; fi
+		mv -f "$temporary" "$target" && sync || return 1
+	done
+}
+
 init_dns_values() {
 	local input=$1 logical=$2 raw item address port count=0 seen=''
 	if [ "$input" = - ]; then
@@ -168,6 +336,7 @@ init_dns_plan() {
 	set_value "smartdns.$root.server_flags" '-group rp_init_default'
 	set_value "dhcp.$dnsmasq.port" 0
 	set_value "dhcp.$dnsmasq.disabled" 1
+	set_value "dhcp.$dnsmasq.localuse" 0
 	data=$(uci -q export smartdns | rp_uci_field_data "$root" conf_files) || {
 		[ -z "$(get "smartdns.$root.conf_files")" ] || fail 'SmartDNS conf_files 包含不能无损处理的值'
 		data=''
@@ -262,6 +431,7 @@ init_dns_managed_admit() {
 	done
 	port_key=$(awk -F '\t' '$1=="set"&&$2~/^dhcp\.[^.]+\.port$/&&$3==0{n++;key=$2}END{if(n!=1)exit 1;print key}' "$WAL/candidate") || return 1
 	init_dns_applied_value "$port_key" 0 && init_dns_applied_value "${port_key%.*}.disabled" 1 || return 1
+	if init_resolver_required; then init_dns_applied_value "${port_key%.*}.localuse" 0 || return 1; fi
 	[ -z "$(uci_committed get "smartdns.$root.redirect")" ] || return 1
 	for item in dns_redirect old_dns_redirect; do
 		[ "$(uci_committed get "${port_key%.*}.$item")" != 1 ] || return 1
@@ -570,6 +740,7 @@ init_dns_coordinate() {
 	init_dns_owned || return 0
 	case "$action" in
 		prepare)
+			init_resolver_prepare || return 1
 			[ ! -L "$cache" ] && { [ ! -e "$cache" ] || [ -f "$cache" ]; } || return 1
 			if [ -e "$cache" ]; then
 				section=$(rp_smartdns_single_root) || return 1
@@ -642,13 +813,19 @@ init_dns_coordinate() {
 			else printf '%s' '' >"$WAL/dns-cache-absent" && sync || return 1; fi
 			;;
 		start)
-			init_dns_managed_admit && init_dns_call smartdns reload && init_dns_call smartdns enable
+			init_dns_managed_admit && init_dns_call smartdns reload && init_dns_call smartdns enable || return 1
+			if init_resolver_required; then
+				remaining=10
+				until [ "$(timeout 3 dig @127.0.0.1 +time=1 +tries=1 +short routepolicy-init-resolver.test A)" = 127.0.0.1 ]; do [ "$remaining" -gt 0 ] || return 1; sleep 1; remaining=$((remaining-1)); done
+				init_resolver_install && init_resolver_verify
+			fi
 			;;
 		policy-prepare)
 			rp_render_smartdns90 "$WAL/dns90-new" || return 1
 			printf '%s' '' >"$WAL/dns90-attempted" && sync
 			;;
 		verify)
+			init_resolver_verify || return 1
 			init_dns_audit_uci_structure || return 1
 			init_dns_audit_uci_servers || return 1
 			section=$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')
@@ -728,7 +905,7 @@ init_dns_coordinate() {
 					else mkdir -p "$RP_RUN_DIR" && cp -pR "$WAL/dns-active-old" "$RP_ACTIVE_DIR" || return 1; fi
 				fi
 			fi
-			[ "$action" != restore-files ] || return 0
+			[ "$action" != restore-files ] || { init_resolver_restore; return; }
 			[ -f "$WAL/dns-service-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
 			temp="$cache.init-$(cat "$WAL/token")"
 			[ ! -L "$temp" ] && [ ! -L "$cache" ] || return 1
@@ -737,7 +914,7 @@ init_dns_coordinate() {
 			# An existing confirmed contract owns cold boot DNS admission after rollback.
 			if rp_dns_boot_pending; then
 				if ! init_dns_restore_admit smartdns; then init_dns_restore_blocked smartdns || return 1; return 1; fi
-				init_dns_restore_bookkeeping; return
+				init_dns_restore_bookkeeping && init_resolver_restore; return
 			fi
 			# Complete native SmartDNS callbacks before the final dnsmasq runtime convergence.
 			for service in smartdns dnsmasq; do
@@ -770,7 +947,7 @@ init_dns_coordinate() {
 			fi
 			case "$(cat "$WAL/routepolicy-enabled")" in 1) enabled=enable ;; 0) enabled=disable ;; *) return 1 ;; esac
 			init_dns_call routepolicy "$enabled" || return 1
-			[ "$restore_failed" = 0 ]
+			init_resolver_restore && [ "$restore_failed" = 0 ]
 			;;
 		quarantine-boot)
 			printf '%s' '' >"$WAL/dns-boot-quarantined" && sync || return 1
@@ -780,6 +957,7 @@ init_dns_coordinate() {
 			[ "$(init_dns_enabled smartdns)$(init_dns_enabled dnsmasq)" = 00 ]
 			;;
 		confirm)
+			init_resolver_verify || return 1
 			temp="$cache.init-$(cat "$WAL/token")"
 			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } && rm -f "$temp" || return 1
 			uci_layout || return 1

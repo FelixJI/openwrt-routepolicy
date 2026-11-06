@@ -85,7 +85,7 @@ prepared_finish_locked() {
 	[ -n "$prepared_reason" ] || return 0
 	[ ! -L "$WAL/fields" ] && { [ ! -e "$WAL/fields" ] || [ -d "$WAL/fields" ]; } || return 1
 	if [ -d "$WAL/fields" ]; then [ -z "$(find "$WAL/fields" -name attempted)" ] || return 1; fi
-	for prepared_marker in link-attempted dns-service-attempted dns-attempted policy-attempted dns90-attempted dns-cache-move dns-boot-quarantined stage; do
+	for prepared_marker in link-attempted dns-service-attempted dns-attempted policy-attempted dns90-attempted dns-cache-move dns-boot-quarantined dns-resolver-file-attempted dns-resolver-link-attempted stage; do
 		[ ! -e "$WAL/$prepared_marker" ] && [ ! -L "$WAL/$prepared_marker" ] || return 1
 	done
 	# No resource was touched: invalidate the candidate, never run rollback/service writers.
@@ -152,11 +152,13 @@ origin_publish() {
 	for item in dns-file-new dns90-new; do
 		[ ! -f "$WAL/$item" ] || cp -p "$WAL/$item" "$stage/origin/$item" || return 1
 	done
+	init_resolver_origin "$stage/origin" || return 1
 	origin_validate "$stage/origin"
 }
 exit_check() {
 	local record=$1 n i entry key present type value expected old missing=0 owned_keys='' child service state desired managed
 	origin_validate "$record/origin" || { printf 'invalid-origin\n'; return 1; }
+	init_resolver_exit_check "$record" || { printf 'resolver-origin-or-runtime\n'; return 1; }
 	[ ! -f "$record/origin/incomplete" ] || { cat "$record/origin/incomplete"; return 1; }
 	no_pending || { printf 'pending-uci\n'; return 1; }
 	n=$(cat "$record/origin/count"); i=0
@@ -233,7 +235,7 @@ exit_apply() {
 			for path do
 				relative=${path#"$base"/}
 				case "$relative" in
-					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted) [ -f "$path" ] || printf "unknown\n" ;;
+					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted) [ -f "$path" ] || printf "unknown\n" ;;
 					delta) [ -d "$path" ] || printf "unknown\n" ;;
 					*) if [ -d "$path" ]; then [ -d "$origin/$relative" ] || printf "unknown\n"; else [ -f "$path" ] && [ -f "$origin/$relative" ] || printf "unknown\n"; fi ;;
 				esac
@@ -251,6 +253,9 @@ exit_apply() {
 	cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$stage/boot-id" || return 1
 	printf 'rolling_back\n' >"$stage/phase"
 	for item in dns-attempted dns-service-attempted dns90-attempted policy-attempted; do : >"$stage/$item" || return 1; done
+	if [ -f "$stage/dns-resolver" ]; then
+		for item in file link; do cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$stage/dns-resolver-$item-attempted" || return 1; done
+	fi
 	safe_dir "$stage/delta"
 	original=$WAL
 	[ ! -L "$TX/previous" ] && [ ! -e "$TX/previous" ] || return 1
@@ -271,7 +276,7 @@ active_publish() {
 		[ ! -e "$stage" ] || { [ -d "$stage" ] && [ -z "$(find "$stage" -type l)" ] && rm -rf "$stage"; } || return 1
 		mkdir "$stage" || return 1
 		# Keep the existing field/file provenance, without private UCI deltas or DNS caches.
-		for item in candidate parameters token boot-id count baseline fields policy-active policy-attempted smartdns-enabled smartdns-running dnsmasq-enabled dnsmasq-running routepolicy-enabled smartdns-listeners dnsmasq-listeners dns-file-old dns-file-absent dns90-old dns90-absent dns-active-old dns-boot-pending dns-boot-ready failed-stage; do
+		for item in candidate parameters token boot-id count baseline fields policy-active policy-attempted smartdns-enabled smartdns-running dnsmasq-enabled dnsmasq-running routepolicy-enabled smartdns-listeners dnsmasq-listeners dns-file-old dns-file-absent dns90-old dns90-absent dns-active-old dns-boot-pending dns-boot-ready failed-stage dns-resolver dns-resolver-file-attempted dns-resolver-link-attempted; do
 			[ ! -L "$WAL/$item" ] || return 1
 			[ ! -e "$WAL/$item" ] || cp -pR "$WAL/$item" "$stage/$item" || return 1
 		done
@@ -369,6 +374,7 @@ plan_valid() {
 			key=$2
 			if(key ~ /^routepolicy\.main\.(lan_interface|default_interface|policy_interface|smartdns_policy_group|smartdns_enabled|enabled)$/) next
 			if(key ~ /^dhcp\.([A-Za-z0-9_]+|@dnsmasq\[[0-9]+\])\.(port|disabled)$/) next
+			if(key ~ /^dhcp\.([A-Za-z0-9_]+|@dnsmasq\[[0-9]+\])\.localuse$/ && $1=="set" && $3=="0") next
 			if(key ~ /^smartdns\.([A-Za-z0-9_]+|@smartdns\[[0-9]+\])\.(enabled|port|tcp_server|ipv6_server|bind_device|bind_device_name|auto_set_dnsmasq|old_enabled|old_port|old_auto_set_dnsmasq|cache_persist|cache_file|force_aaaa_soa|tls_server|doh_server|seconddns_enabled|server_flags|conf_files)$/) next
 			if(key ~ /^smartdns\.rp_init(_(client_rule|domain_rule|ip_rule))?$/) next
 			if(key ~ /^smartdns\.rp_init_(default|policy)_[1-4](\.(routepolicy_init|enabled|type|ip|port|server_group|exclude_default_group|addition_arg))?$/) next
@@ -903,6 +909,8 @@ status_json() {
 		if [ -f "$status_active/dns-boot-pending" ]; then status_dns=pending; fi
 		status_failure=$(cat "$status_active/failed-stage" 2>/dev/null) || status_failure=
 		case "$status_failure:$status_dns" in boot-*:pending) status_dns=retrying ;; esac
+		if ! grep -Eq '^set[[:space:]]dhcp\.[^.]+\.localuse[[:space:]]0$' "$status_active/candidate"; then status_dns=requires_explicit_initialization
+		elif [ "$status_dns" = ready ] && ! rp_system_resolver_ready; then status_dns=resolver_conflict; fi
 		printf ',"active":{"token":"%s","dns_boot_state":"%s","failed_stage":"%s"}' \
 			"$(rp_json_escape "$(cat "$status_active/token")")" "$status_dns" "$(rp_json_escape "$status_failure")"
 	fi
@@ -920,6 +928,8 @@ boot_dns_locked() (
 		printf '%s\n' '受管 DNS/DHCP 字段归属或已提交的 port=0、disabled=1 不匹配；未启动原生 SmartDNS，未修复用户配置' >&2
 		return 1
 	fi
+	if ! init_resolver_required; then printf '%s\n' boot-resolver-contract-missing >"$WAL/failed-stage"; return 1; fi
+	init_resolver_prepare boot && init_resolver_origin "$WAL/origin" || { printf '%s\n' boot-resolver-admission >"$WAL/failed-stage"; return 1; }
 	# S19 may have been queued before S18 quarantined its link; converge explicitly.
 	init_dns_stop &&
 		init_dns_call dnsmasq stop && init_dns_call dnsmasq disable || return 1
@@ -935,7 +945,7 @@ boot_dns_locked() (
 	adapter=0; if init_dns_policy_adapter; then adapter=1; fi
 	rp_smartdns_set_registration "$RP_SMARTDNS_FILE" "$adapter" || return 1
 	# The application's /tmp cache starts cold on every boot, after its nft sets exist.
-	init_dns_call smartdns start && init_dns_coordinate verify && init_dns_call smartdns enable || {
+	init_dns_call smartdns start && init_resolver_install && init_dns_coordinate verify && init_dns_call smartdns enable || {
 		init_dns_stop || true
 		printf '%s\n' boot-dns-start >"$WAL/failed-stage"; return 1
 	}
@@ -1019,7 +1029,10 @@ case "$operation" in
 	prepare)
 		args_valid "$@" || fail '初始化参数非法'
 		lock
-		! rp_dns_boot_pending || fail '已确认接管的启动恢复尚未完成，请稍后重试初始化'
+		if rp_dns_boot_pending; then
+			# Explicit new initialization may replace an unsupported legacy DNS contract.
+			( WAL=$(rp_init_active_record) && ! init_resolver_required && [ "$(cat "$WAL/failed-stage" 2>/dev/null)" = boot-resolver-contract-missing ] && load_args && uci_layout && no_pending && init_dns_managed_admit ) || fail '已确认接管的启动恢复尚未完成，请稍后重试初始化'
+		fi
 		case "$(read_phase)" in absent|prepared|expired|confirmed|rolled_back|exited) ;; *) fail '存在未完成事务；请先恢复' ;; esac
 		no_pending || fail '存在外部 UCI pending changes'
 		candidate=$(make_plan "$@") || fail '拓扑预检失败'

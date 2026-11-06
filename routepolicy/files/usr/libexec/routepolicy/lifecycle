@@ -208,8 +208,10 @@ declaration_recover() {
 	phase=$(cat "$DECL/phase" 2>/dev/null) || phase=preparing
 	case "$phase" in committed|rolled_back) rp_output_ok restore-recover '声明事务已终结'; return ;; preparing) declaration_phase rolled_back && rp_output_ok restore-recover '准备阶段未修改公共声明，已取消候选'; return ;; prepared|installing|installed|recovering) ;; *) fail '声明阶段非法';; esac
 	no_pending || fail '未提交修改阻止声明恢复'
-	if [ "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null)" = confirmed ]; then
+	if [ "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null)" = confirmed ] && { [ -e "$DECL/init-token" ] || [ -L "$DECL/init-token" ]; }; then
 		# The network confirmation is the shared commit point, never undo its declarations.
+		safe_file "$DECL/init-token" && [ "$(wc -c <"$DECL/init-token")" = 33 ] &&
+			[ "$(cat "$DECL/init-token")" = "$(cat "$RP_STATE_DIR/init-transaction/current/token" 2>/dev/null)" ] || fail '已确认网络与本次声明绑定不匹配；未回滚声明'
 		"$LIBEXEC/init-transaction" archive-migrate >/dev/null || fail '已确认网络的声明提交点未能收敛；未回滚声明'
 		[ "$(cat "$DECL/phase")" = committed ] || fail '已确认网络与声明 token 不匹配；未回滚声明'
 		rp_output_ok restore-recover '网络已确认，应用声明提交已收敛'
@@ -283,7 +285,7 @@ case "$operation" in config-export|config-import|restore-status|restore-prepare|
 schema_admit
 if [ "$operation" = restore-status ]; then status_config; exit 0; fi
 writer_role=lifecycle
-case "$operation" in restore-prepare|restore-recover) writer_role=init ;; esac
+case "$operation" in restore-prepare|restore-recover|migrate) writer_role=init ;; esac
 rp_writer_enter "$writer_role" || fail '写锁忙或初始化恢复尚未完成'
 rp_ensure_dirs
 case "$operation" in
@@ -293,6 +295,7 @@ case "$operation" in
 	restore-prepare) restore_prepare ;;
 	restore-recover) declaration_recover ;;
 	migrate)
+		case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in applying|pending|rolling_back|confirming|conflict) fail '初始化事务尚未完成；拒绝迁移声明' ;; esac
 		no_pending || fail '迁移前请处理未提交的配置'
 		"$LIBEXEC/validate" >/dev/null || fail '旧配置校验失败；原配置未改变'
 		"$LIBEXEC/init-transaction" archive-migrate >/dev/null || fail '确认归档未能迁移；旧声明与记录保留'

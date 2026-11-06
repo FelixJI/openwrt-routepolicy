@@ -8,6 +8,7 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 sh "$HERE/lifecycle-test.sh"
 sh "$HERE/ownership-boot-test.sh"
 sh "$HERE/managed-recovery-test.sh"
+sh "$HERE/resolver-test.sh"
 "$HERE/init-lifecycle-test.sh"
 "$HERE/init-topology-test.sh"
 "$HERE/init-transaction-test.sh"

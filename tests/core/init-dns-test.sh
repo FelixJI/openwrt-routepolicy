@@ -114,6 +114,9 @@ if [ -f "$TEST_DNS_TMP/kill-exit-identity" ]; then
 		fi
 	done
 fi
+if [ -f "$TEST_DNS_TMP/kill-installed" ] && [ "$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/declarations/phase" 2>/dev/null)" = installed ]; then
+	rm "$TEST_DNS_TMP/kill-installed"; kill -KILL "$PPID"
+fi
 exit 0
 EOF
 # Keep the real planner ownership decision at the transaction/service fixture seam.
@@ -217,6 +220,11 @@ for service in smartdns dnsmasq; do
 	[ "$(cat "$TEST_DNS_TMP/svc/$service.running")" != 1 ] || [ "$(cat "$TEST_DNS_TMP/svc/$service.port")" != "$port" ] || found=1
 done
 [ "$found" = 1 ] || exit 9
+case "$*" in *routepolicy-init-resolver.test*)
+	case "$*" in *@127.0.0.1*) ;; *) [ "$(readlink "$ROUTEPOLICY_ROOT/tmp/resolv.conf")" = /tmp/resolv.conf.d/routepolicy.conf ] || exit 10 ;; esac
+	[ "$(cat "$TEST_DNS_TMP/svc/smartdns.running")$(cat "$TEST_DNS_TMP/svc/smartdns.port")" = 153 ] || exit 11
+	printf '127.0.0.1\n'; exit 0 ;;
+esac
 if [ -f "$TEST_DNS_TMP/query-fail" ] && [ "$*" != "${*%routepolicy-init-restore.test*}" ]; then printf ';; ->>HEADER<<- status: NOERROR, id: 1\n'
 elif [ -f "$TEST_DNS_TMP/query-fail" ]; then printf ';; ->>HEADER<<- status: SERVFAIL, id: 1\n'
 else printf ';; ->>HEADER<<- status: NOERROR, id: 1\n'; fi
@@ -406,6 +414,11 @@ baseline() {
 	rm -rf "$tmp/root/etc/routepolicy" "$tmp/root/tmp/routepolicy" "$tmp/root/etc/smartdns" "$tmp/root/var" "$tmp/svc" "$tmp/external"
 	rm -f "$tmp/policy-running" "$tmp/query-fail" "$tmp/policy-fail" "$tmp/kill-stage" "$tmp/queries" "$tmp/service-log" "$tmp/list-fail" "$tmp/delete-fail" "$tmp/delete-race" "$tmp/quiesce-fault" "$tmp/native-start-called" "$tmp/stale-dnsmasq" "$tmp/kill-confirm" "$tmp/kill-policy" "$tmp/watch-fail" "$tmp/watch-registration"
 	mkdir -p "$tmp/svc" "$tmp/external" "$tmp/root/etc/smartdns/conf.d" "$tmp/root/proc/sys/kernel/random"
+	mkdir -p "$tmp/root/tmp/resolv.conf.d"
+	rm -f "$tmp/root/etc/resolv.conf" "$tmp/root/tmp/resolv.conf" "$tmp/root/tmp/resolv.conf.d/routepolicy.conf"
+	ln -s /tmp/resolv.conf "$tmp/root/etc/resolv.conf"
+	ln -s /tmp/resolv.conf.d/resolv.conf.auto "$tmp/root/tmp/resolv.conf"
+	printf 'nameserver 192.0.2.53\n' >"$tmp/root/tmp/resolv.conf.d/resolv.conf.auto"
 	printf '100.00 0.00\n' >"$tmp/root/proc/uptime"
 	printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
 	printf "config interface 'lan'\n\toption proto 'static'\n\toption ipaddr '192.0.2.1'\n\tlist ip6addr '2001:db8::1/64'\nconfig interface 'wan'\n\toption proto 'dhcp'\nconfig interface 'wan2'\n\toption proto 'dhcp'\n" >"$tmp/root/etc/config/network"
@@ -442,8 +455,87 @@ confirm_dns() {
 	"$TX" apply "$token" >/dev/null
 	if ! SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >"$tmp/confirm-result"; then cat "$tmp/confirm-result" >&2; return 1; fi
 }
+test_boot() {
+	test_boot_sequence=$(( ${test_boot_sequence:-10} + 1 ))
+	printf '00000000-0000-4000-8000-%012d\n' "$test_boot_sequence" >"$tmp/root/proc/sys/kernel/random/boot_id"
+	rm -f "$RP_RESOLVER_ENTRY" "$RP_RESOLVER_FILE"
+	ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
+}
+if [ "${1:-}" = --legacy-resolver ]; then
+	[ -n "${TEST_LEGACY_INIT_LIBEXEC:-}" ] || { printf 'legacy resolver: skipped (provide frozen old libexec)\n'; exit 0; }
+	baseline 0 0 1 1
+	cp -R "$tmp/lib" "$tmp/legacy-lib"
+	cp "$TEST_LEGACY_INIT_LIBEXEC/common" "$TEST_LEGACY_INIT_LIBEXEC/init-dns" "$TEST_LEGACY_INIT_LIBEXEC/init-transaction" "$tmp/legacy-lib/"
+	chmod +x "$tmp/legacy-lib/init-transaction"
+	output=$(ROUTEPOLICY_LIBEXEC="$tmp/legacy-lib" "$tmp/legacy-lib/init-transaction" prepare lan wan wan2 - - - - - - - - 192.0.2.53 198.51.100.53)
+	token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+	ROUTEPOLICY_LIBEXEC="$tmp/legacy-lib" "$tmp/legacy-lib/init-transaction" apply "$token" >/dev/null
+	SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' ROUTEPOLICY_LIBEXEC="$tmp/legacy-lib" "$tmp/legacy-lib/init-transaction" confirm "$token" >/dev/null
+	test_boot; "$TX" recover-early >/dev/null
+	active=$(rp_init_active_record)
+	if "$TX" boot-dns >/dev/null 2>&1; then printf 'legacy resolver boot adopted without authority\n' >&2; exit 1; fi
+	[ "$(cat "$active/failed-stage")" = boot-resolver-contract-missing ] && [ -f "$active/dns-boot-pending" ]
+	for failure in boot-dns-start boot-dns-admission; do
+		printf '%s\n' "$failure" >"$active/failed-stage"
+		if "$TX" prepare lan wan wan2 - - - - - - - - 192.0.2.53 198.51.100.53 >/dev/null 2>&1; then printf 'unrelated boot failure bypassed prepare gate\n' >&2; exit 1; fi
+	done
+	printf 'boot-resolver-contract-missing\n' >"$active/failed-stage"
+	uci set 'dhcp.@dnsmasq[0].port=53'; uci commit dhcp
+	if "$TX" prepare lan wan wan2 - - - - - - - - 192.0.2.53 198.51.100.53 >/dev/null 2>&1; then printf 'legacy external conflict bypassed prepare gate\n' >&2; exit 1; fi
+	uci set 'dhcp.@dnsmasq[0].port=0'; uci commit dhcp
+	prepare_dns 192.0.2.53; : >"$tmp/query-fail"
+	if "$TX" apply "$token" >/dev/null; then printf 'new initialization failure accepted\n' >&2; exit 1; fi
+	[ -f "$active/dns-boot-pending" ] && [ ! -f "$active/dns-boot-ready" ]
+	[ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/resolv.conf.auto ] && [ ! -e "$RP_RESOLVER_FILE" ]
+	rm "$tmp/query-fail"; prepare_dns 192.0.2.53; confirm_dns
+	[ "$(rp_init_active_record)" != "$active" ]; (WAL=$(rp_init_active_record); export WAL; init_resolver_verify)
+	printf '%s\n' 'legacy resolver reinitialization: passed (precise missing-contract gate; other failures/conflicts denied; failed apply retains old pending; new confirmed contract ready)'
+	exit 0
+fi
+if [ "${1:-}" = --restore-prior-confirmed ] || [ "${1:-}" = --migrate ]; then
+	cp "$REAL_LIB/lifecycle" "$REAL_LIB/validate" "$REAL_LIB/converter-lib" "$tmp/lib/"
+	chmod +x "$tmp/lib/lifecycle" "$tmp/lib/validate" "$tmp/lib/converter-lib"
+	baseline 0 0 1 1
+	cp "$ROOT/routepolicy/files/etc/config/routepolicy" "$RP_UCI_CONFIG"
+	uci set routepolicy.main.policy_interface=wan2; uci commit routepolicy
+	if [ "${1:-}" = --migrate ]; then
+		uci -q delete routepolicy.main.config_schema || true; uci commit routepolicy
+		"$tmp/lib/lifecycle" migrate >/dev/null
+		[ "$(uci get routepolicy.main.config_schema)" = 1 ]
+	fi
+	prepare_dns 192.0.2.53; confirm_dns
+	if [ "${1:-}" = --migrate ]; then
+		"$tmp/lib/lifecycle" migrate >/dev/null
+		printf 'pending\n' >"$RP_STATE_DIR/init-transaction/current/phase"
+		cp "$RP_UCI_CONFIG" "$tmp/migrate-pending.before"
+		if "$tmp/lib/lifecycle" migrate >/dev/null 2>&1; then printf 'pending init migrated\n' >&2; exit 1; fi
+		cmp "$tmp/migrate-pending.before" "$RP_UCI_CONFIG"; printf 'confirmed\n' >"$RP_STATE_DIR/init-transaction/current/phase"
+		uci set routepolicy.main.config_schema=2; uci commit routepolicy
+		if "$tmp/lib/lifecycle" migrate >/dev/null 2>&1; then printf 'future schema migrated\n' >&2; exit 1; fi
+		uci set routepolicy.main.config_schema=1; uci commit routepolicy
+		uci set network.lan.user_pending=keep
+		if "$tmp/lib/lifecycle" migrate >/dev/null 2>&1; then printf 'pending configuration migrated\n' >&2; exit 1; fi
+		[ "$(uci changes network)" != '' ]
+		printf '%s\n' 'native migrate: passed (real nested archive, no/archive legacy paths, schema and pending rejection)'; exit 0
+	fi
+	mkdir -p "$RP_USER_DIR"; cp "$ROOT/routepolicy/files/etc/routepolicy/user.d/"*.list "$RP_USER_DIR/"
+	ROUTEPOLICY_OUTPUT=text "$tmp/lib/lifecycle" config-export >"$tmp/prior-export"
+	"$tmp/lib/lifecycle" config-import <"$tmp/prior-export" >/dev/null
+	cp "$RP_UCI_CONFIG" "$tmp/prior-app.before"
+	: >"$tmp/kill-installed"
+	mapping=$(printf 'lan\twan\twan2\t-\t-\t-\t-\t-\t-\t-\t-\t192.0.2.53\t198.51.100.53\t1\t1\n')
+	if printf '%s\n' "$mapping" | "$tmp/lib/lifecycle" restore-prepare >/dev/null 2>&1; then printf 'installed kill missing\n' >&2; exit 1; fi
+	decl="$RP_STATE_DIR/init-transaction/declarations"
+	[ ! -e "$decl/init-token" ] && [ "$(cat "$decl/phase")" = installed ]
+	"$tmp/lib/lifecycle" restore-recover >/dev/null
+	cmp "$tmp/prior-app.before" "$RP_UCI_CONFIG"; [ "$(cat "$decl/phase")" = rolled_back ]
+	(WAL=$(rp_init_active_record); export WAL; init_resolver_verify)
+	printf '%s\n' 'prior confirmed declaration recovery: passed (real installed sync kill, no new token, original declarations and resolver preserved)'
+	exit 0
+fi
 if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
 	cp "$REAL_LIB/lifecycle" "$REAL_LIB/validate" "$REAL_LIB/converter-lib" "$tmp/lib/"
+	chmod +x "$tmp/lib/lifecycle" "$tmp/lib/validate" "$tmp/lib/converter-lib"
 	for restore_case in success failure; do
 		baseline 0 0 1 1
 		cp "$ROOT/routepolicy/files/etc/config/routepolicy" "$tmp/root/etc/config/routepolicy"
@@ -822,7 +914,7 @@ uci set routepolicy.main.auto_update=1; uci set routepolicy.main.update_hour=0; 
 watch_result=0
 (unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND; exec 9>&-; ROUTEPOLICY_LIBEXEC="$tmp/watch-lib" timeout -k 1 2 "$REAL_LIB/watch") || watch_result=$?
 [ "$watch_result" = 124 ] && [ "$(cat "$tmp/watch-updated")" = updated ]
-printf 'watch-new-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 printf 0 >"$tmp/svc/routepolicy.running"
 "$TX" confirm "$token" >/dev/null
 [ "$(cat "$tmp/svc/routepolicy.running")" = 0 ]
@@ -877,7 +969,7 @@ prepare; "$TX" recover >/dev/null
 [ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/active")" = "$ownership_active" ]
 prepare; "$TX" apply "$token" >/dev/null
 SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
-printf 'ownership-new-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 "$TX" recover-early >/dev/null; "$TX" boot-dns >/dev/null
 prepare; "$TX" apply "$token" >/dev/null
 SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >/dev/null
@@ -1108,7 +1200,7 @@ if "$TX" apply "$preview_token" >/dev/null 2>&1; then exit 1; fi
 baseline 0 0 1 1; prepare; preview_token=$token
 "$REAL_LIB/apply" event >/dev/null
 cp "$tmp/service-log" "$tmp/prepared-services"
-printf 'unapplied-new-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 "$TX" recover-early >/dev/null
 [ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = expired ]
 cmp "$tmp/prepared-services" "$tmp/service-log"; restored
@@ -1118,7 +1210,7 @@ cmp "$tmp/prepared-services" "$tmp/service-log"; restored
 if "$TX" apply "$preview_token" >/dev/null 2>&1; then exit 1; fi
 baseline 0 0 1 1; prepare
 : >"$tmp/root/etc/routepolicy/state/init-transaction/current/dns-service-attempted"
-printf 'cannot-prove-unwritten\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 if "$TX" recover-early >/dev/null 2>&1; then exit 1; fi
 [ "$(cat "$tmp/root/etc/routepolicy/state/init-transaction/current/phase")" = prepared ]
 printf '%s\n' 'init DNS unapplied candidate lifecycle: passed (same-boot preview, explicit cancel, cross-boot and zero-write evidence)'
@@ -1131,7 +1223,7 @@ for se in 0 1; do for sr in 0 1; do for de in 0 1; do for dr in 0 1; do
 	queries_before=0; [ ! -f "$tmp/queries" ] || queries_before=$(wc -l <"$tmp/queries")
 	"$TX" apply "$token" >/dev/null
 	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = 1100 ]
-	[ "$(( $(wc -l <"$tmp/queries") - queries_before ))" = 4 ]
+	[ "$(( $(wc -l <"$tmp/queries") - queries_before ))" = 9 ]
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 1 ]
 	"$TX" recover >/dev/null; restored
 	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = "$se$sr$de$dr" ]
@@ -1194,7 +1286,7 @@ canonical smartdns >"$tmp/smartdns.after"; cmp "$tmp/smartdns.before" "$tmp/smar
 printf '%s\n' 'init DNS restore functionality and reserved-root protection: passed'
 if [ "${1:-}" = --restore-smoke ]; then exit 0; fi
 baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
-printf 'different-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
 rm -f "$tmp/policy-running"
 "$TX" recover-early >/dev/null
@@ -1214,14 +1306,14 @@ prepare; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null; restored
 baseline 1 0 1 1; prepare
 printf 'commit:smartdns.@smartdns[0].port' >"$tmp/kill-stage"
 if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
-printf 'reboot-after-kill\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 "$TX" recover-early >/dev/null
 [ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
 "$TX" recover-startup >/dev/null; restored
 # A true conflict also quarantines both native DNS startup entries.
 baseline 1 0 1 1; prepare; "$TX" apply "$token" >/dev/null
 uci set 'smartdns.@smartdns[0].port=9999'; uci commit smartdns
-printf 'reboot-conflict\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 if "$TX" recover-early >/dev/null; then exit 1; fi
 [ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
 [ "$(uci -q get 'smartdns.@smartdns[0].port')" = 9999 ]
@@ -1235,7 +1327,7 @@ canonical dhcp >"$tmp/shutdown-dhcp.before"
 canonical dhcp >"$tmp/shutdown-dhcp.after"; cmp "$tmp/shutdown-dhcp.before" "$tmp/shutdown-dhcp.after"
 rm -rf "$tmp/root/tmp/routepolicy"; rm -f "$tmp/policy-running"
 printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
-printf 'confirmed-reboot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+test_boot
 "$TX" recover-early >/dev/null
 [ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
 # Admission precedes policy writes and native start; it never repairs DHCP drift.
@@ -1296,7 +1388,7 @@ wait_guard() {
 reboot_services() {
 	rm -rf "$tmp/root/tmp/routepolicy"; rm -f "$tmp/policy-running"
 	printf 0 >"$tmp/svc/smartdns.running"; printf 0 >"$tmp/svc/dnsmasq.running"
-	printf '%s\n' "$1" >"$tmp/root/proc/sys/kernel/random/boot_id"
+	test_boot
 	"$TX" recover-early >/dev/null
 }
 # Policy off keeps DNS, even when the policy NIC is down and apply cannot run.
@@ -1307,7 +1399,7 @@ for adapter in 1 0; do
 	"$TX" boot-dns >/dev/null
 	[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.running")" = 10 ]
 	[ ! -f "$tmp/policy-running" ] && [ ! -e "$tmp/root/tmp/routepolicy/active" ] && [ ! -e "$tmp/watch-registration" ]
-	[ "$(wc -l <"$tmp/queries")" = 2 ]
+	[ "$(wc -l <"$tmp/queries")" = 4 ]
 	if grep -Fq routepolicy-init-policy.test "$tmp/queries" || grep -Fq "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'" "$tmp/root/var/etc/smartdns/smartdns.conf"; then exit 1; fi
 	[ "$(uci -q get routepolicy.main.enabled):$(uci -q get routepolicy.main.smartdns_enabled)" = "0:$adapter" ]
 done
