@@ -175,7 +175,7 @@ init_dns_plan() {
 	files=$(printf '%s\n' "$files" | tr '|' '\n' | awk '$0!="/etc/smartdns/conf.d/90-routepolicy.conf"&&NF' | tr '\n' '|'); files=${files%|}
 	case "|$files|" in *'|/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf|'*) ;; *) files="${files:+$files|}/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf" ;; esac
 	files="$files|/etc/smartdns/conf.d/90-routepolicy.conf"
-	init_dns_audit_user_files "$files" "$access_device" || fail '用户 SmartDNS include 占用保留上游组或含无法安全审计的语法；文件已保留，请先手工处理'
+	init_dns_audit_user_files "$files" "$access_device" || fail 'SmartDNS 用户字段/include 审计失败：请检查换行、控制字符、保留组或不支持的语法；原值已保留'
 	printf 'list\tsmartdns.%s.conf_files\t%s\n' "$root" "$files"
 	set_value routepolicy.main.smartdns_enabled 1
 	set_value routepolicy.main.smartdns_policy_group rp_init_policy
@@ -369,6 +369,35 @@ init_dns_server_owned() {
 	done
 	return 1
 }
+init_dns_audit_uci_line() {
+	local key=$1 optional=${2:-0} value clean newline='
+'
+	# Keep a sentinel so command substitution cannot discard a trailing user newline.
+	if value=$(uci -q get "$key" && printf '.'); then
+		value=${value%.}; value=${value%"$newline"}
+	else
+		[ "$optional" = 1 ] && return 0
+		rp_err "不能读取 SmartDNS 原生配置字段: $key"; return 1
+	fi
+	clean=$(printf '%s' "$value" | LC_ALL=C tr -d '[:cntrl:]') || return 1
+	[ "$value" = "$clean" ] || { rp_err "SmartDNS 原生配置字段包含换行、回车或控制字符: $key；原值已保留"; return 1; }
+}
+init_dns_audit_uci_structure() {
+	local shown keys key
+	shown=$(uci -q show smartdns) || return 1
+	# Cover root, server, rule and list options, including preserved unknown options.
+	# Native init writes multiple classes of values directly through conf_append.
+	keys=$(printf '%s\n' "$shown" | sed -n 's/^\(smartdns\.[^.]*\.[^=]*\)=.*/\1/p')
+	while IFS= read -r key; do
+		[ -z "$key" ] || init_dns_audit_uci_line "$key" || return 1
+	done <<EOF
+$keys
+EOF
+	# load_service also uses these optional external fields in generated directives.
+	for key in 'dhcp.@dnsmasq[0].leasefile' 'dhcp.@dnsmasq[0].resolvfile' network.lan.device; do
+		init_dns_audit_uci_line "$key" 1 || return 1
+	done
+}
 init_dns_audit_uci_servers() {
 	local section enabled type address option value owned
 	for section in $(rp_smartdns_server_sections); do
@@ -395,6 +424,7 @@ init_dns_audit_uci_servers() {
 
 init_dns_audit_user_files() {
 	local files=$1 device=$2 include exported sections section enabled data
+	init_dns_audit_uci_structure || return 1
 	init_dns_audit_uci_servers || return 1
 	# Native init also loads enabled client-rule includes and these three fixed files.
 	exported=$(uci -q export smartdns) || return 1
@@ -503,6 +533,7 @@ init_dns_coordinate() {
 			printf '%s' '' >"$WAL/dns90-attempted" && sync
 			;;
 		verify)
+			init_dns_audit_uci_structure || return 1
 			init_dns_audit_uci_servers || return 1
 			section=$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')
 			[ "$(uci -q get "dhcp.$section.disabled")" = 1 ] && [ "$(uci -q get "dhcp.$section.port")" = 0 ] || return 1

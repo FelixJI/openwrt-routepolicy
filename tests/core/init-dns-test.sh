@@ -355,6 +355,72 @@ restored() {
 	[ "$(cat "$tmp/root/etc/smartdns/user.cache")" = USER-CACHE ]
 	[ "$(cat "$tmp/svc/routepolicy.enabled")" = 0 ]
 }
+# Harmless names must remain single configuration-line values across native init.
+for structure_case in newline crlf tab control del trailing-newline; do
+	baseline 0 0 1 1
+	case "$structure_case" in
+		newline) name=$(printf 'Kitchen Router\nLiving Router.') ;;
+		crlf) name=$(printf 'Kitchen Router\r\nLiving Router.') ;;
+		tab) name=$(printf 'Kitchen\tRouter.') ;;
+		control) name=$(printf 'Kitchen\001Router.') ;;
+		del) name=$(printf 'Kitchen\177Router.') ;;
+		trailing-newline) name=$(printf 'Kitchen Router\n.') ;;
+	esac
+	name=${name%.}
+	if ! uci set "smartdns.@smartdns[0].server_name=$name" >"$tmp/structure-set-error" 2>&1; then
+		# libuci itself rejects some C0/DEL bytes before they become valid UCI data.
+		case "$structure_case" in control|del) restored; continue ;; *) exit 1 ;; esac
+	fi
+	uci commit smartdns
+	canonical smartdns >"$tmp/smartdns.before"
+	if prepare >"$tmp/structure-error" 2>&1; then printf 'unsafe multiline/control name accepted: %s\n' "$structure_case" >&2; exit 1; fi
+	restored
+	[ "$(cat "$tmp/svc/smartdns.running")$(cat "$tmp/svc/dnsmasq.running")" = 01 ]
+	baseline 0 0 1 1; prepare
+	uci set "smartdns.@smartdns[0].server_name=$name"; uci commit smartdns
+	canonical smartdns >"$tmp/smartdns.before"
+	if "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+	[ "$(find "$tmp/root/etc/routepolicy/state/init-transaction/current/fields" -name attempted | wc -l)" = 0 ]
+	restored
+done
+# Check the shared value boundary too, without claiming libuci accepts these bytes.
+if (uci() { printf 'Kitchen\001Router\n'; }; init_dns_audit_uci_line smartdns.main.server_name) >"$tmp/structure-error" 2>&1; then exit 1; fi
+if (uci() { printf 'Kitchen\177Router\n'; }; init_dns_audit_uci_line smartdns.main.server_name) >"$tmp/structure-error" 2>&1; then exit 1; fi
+# Lists and other native rule classes share the same structure check.
+for structure_kind in client-list rule-value; do
+	baseline 0 0 1 1
+	name=$(printf 'Living Room\nKitchen Room')
+	if [ "$structure_kind" = client-list ]; then
+		uci set smartdns.room=client-rule; uci set smartdns.room.enabled=1
+		uci add_list "smartdns.room.client_addr=$name"
+	else
+		uci set smartdns.room=domain-rule; uci set smartdns.room.enabled=1
+		uci set "smartdns.room.speed_check_mode=$name"
+	fi
+	uci commit smartdns; canonical smartdns >"$tmp/smartdns.before"
+	if prepare >"$tmp/structure-error" 2>&1; then exit 1; fi
+	restored
+done
+for external_option in leasefile resolvfile; do
+	baseline 0 0 1 1
+	name=$(printf '/tmp/Kitchen\nRouter')
+	uci set "dhcp.@dnsmasq[0].$external_option=$name"; uci commit dhcp
+	canonical dhcp >"$tmp/dhcp.before"
+	if prepare >"$tmp/structure-error" 2>&1; then exit 1; fi
+	restored
+done
+baseline 0 0 1 1
+uci set 'smartdns.@smartdns[0].server_name=Kitchen Router'
+uci add_list 'smartdns.@smartdns[0].display_labels=Kitchen Router'
+uci add_list 'smartdns.@smartdns[0].display_labels=Living Router'
+uci set smartdns.room=client-rule; uci set 'smartdns.room.client_ip=192.0.2.10'
+uci set 'smartdns.room.description=Living Room Router'; uci commit smartdns
+uci set 'dhcp.@dnsmasq[0].leasefile=/tmp/Kitchen Router.leases'; uci commit dhcp
+canonical dhcp >"$tmp/dhcp.before"
+canonical smartdns >"$tmp/smartdns.before"; prepare; restored
+"$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null; restored
+printf '%s\n' 'init DNS UCI line structure: passed (harmless names, CRLF/control/trailing newline, spaces/lists, pre-write zero changes)'
+if [ "${1:-}" = --line-structure ]; then exit 0; fi
 # Exercise every enabled/running combination for both pre-existing services.
 # Native reload_service starts an rc-disabled daemon; per-instance disabled prevents it.
 baseline 0 0 1 1
