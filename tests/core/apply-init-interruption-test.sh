@@ -166,6 +166,22 @@ run_apply() {
  return "$result"
 }
 scenario=$(cat "$TEST_INTERRUPTION_DIR/scenario")
+case "$scenario" in stopped-*)
+ export ROUTEPOLICY_INIT_RESTORE=1 ROUTEPOLICY_DNS_DEFER=1
+ run_apply apply; result=$?
+ case "$scenario" in stopped-kill|stopped-boot)
+  [ "$result" = 137 ] || { cat "$TEST_INTERRUPTION_DIR/result"; exit 97; }
+  wal="$RP_STATE_DIR/init-transaction/current"
+  cp "$wal/policy-runtime-intent" "$TEST_INTERRUPTION_DIR/exit-intent"
+  if [ "$scenario" = stopped-boot ]; then
+   rm -rf "$RP_RUN_DIR"; rm -f "$TEST_INTERRUPTION_DIR/rule" "$TEST_INTERRUPTION_DIR/nft"
+   : >"$TEST_INTERRUPTION_DIR/routes"
+   printf '22222222-2222-2222-2222-222222222222\n' >"$RP_ROOT/proc/sys/kernel/random/boot_id"
+  fi
+  run_apply apply; result=$?
+ esac
+ exit "$result" ;;
+esac
 run_apply; result=$?
 printf '%s\n' "$result" >"$TEST_INTERRUPTION_DIR/initial-rc"
 if [ "$scenario" = prewrite ] || [ "$scenario" = missing-generation ]; then [ "$result" != 0 ] || exit 92; exit 0; fi
@@ -285,6 +301,66 @@ run_owner() {
 recovery_wrote_nothing() {
  if grep -Eq '^ip -4 (rule (add|del)|route (add|del|replace|flush))|^nft (-f|delete)' "$tmp/commands"; then cat "$tmp/commands" >&2; exit 1; fi
 }
+exit_stopped_policy() (
+ . "$ROUTEPOLICY_LIBEXEC/common"
+ for scenario in stopped-present stopped-absent stopped-kill stopped-boot stopped-foreign-rule stopped-foreign-boot-rule stopped-foreign-90 stopped-foreign-receipt stopped-bad-marker stopped-missing-marker; do
+  reset 0 never
+  printf '1\n' >"$wal/policy-active"; printf 'rolling_back\n' >"$wal/phase"
+  printf 'exit\n' >"$wal/kind"; printf '1\n' >"$wal/dns90-new-absent"
+  printf 'wanold\n' >"$tmp/current-if"; printf '%s\n' "$scenario" >"$tmp/scenario"
+  TEST_SMARTDNS_ENABLED=1
+  if [ "$scenario" = stopped-absent ]; then
+   TEST_SMARTDNS_ENABLED=0; : >"$wal/dns90-absent"
+  else rp_smartdns90_content policy >"$wal/dns90-old"; fi
+  export TEST_SMARTDNS_ENABLED
+  case "$scenario" in
+   stopped-kill) printf 'default\n' >"$tmp/kill-at" ;;
+   stopped-boot) printf 'published\n' >"$tmp/kill-at" ;;
+   stopped-foreign*rule)
+    printf '11000: from all lookup 201\n' >"$tmp/rule"
+    if [ "$scenario" = stopped-foreign-boot-rule ]; then
+     printf '22222222-2222-2222-2222-222222222222\n' >"$RP_ROOT/proc/sys/kernel/random/boot_id"
+    fi ;;
+   stopped-foreign-90)
+    mkdir -p "$(dirname "$RP_SMARTDNS_FILE")"
+    printf 'external DNS content\n' >"$RP_SMARTDNS_FILE" ;;
+   stopped-foreign-receipt) printf 'schema=1\ninit_generation=external\n' >"$state/applied" ;;
+   stopped-bad-marker) printf 'exit\n' >"$wal/dns90-new-absent" ;;
+   stopped-missing-marker) rm "$wal/dns90-new-absent" ;;
+  esac
+  case "$scenario" in stopped-foreign-*|stopped-*-marker)
+   if run_owner >"$tmp/stopped-owner.log" 2>&1; then printf 'stopped exit adopted %s\n' "$scenario" >&2; exit 1; fi
+   recovery_wrote_nothing
+   [ ! -e "$wal/policy-runtime-intent" ]
+   case "$scenario" in
+    stopped-foreign*rule) grep -Fxq '11000: from all lookup 201' "$tmp/rule" ;;
+    stopped-foreign-90) grep -Fxq 'external DNS content' "$RP_SMARTDNS_FILE" ;;
+    stopped-foreign-receipt) grep -Fxq 'init_generation=external' "$state/applied" ;;
+   esac
+   continue ;;
+  esac
+  if ! run_owner >"$tmp/stopped-owner.log" 2>&1; then
+   printf 'stopped exit restore failed: %s\n' "$scenario" >&2
+   cat "$tmp/stopped-owner.log" "$tmp/result" >&2; exit 1
+  fi
+  [ ! -e "$wal/policy-runtime-intent" ] && [ -f "$tmp/nft" ] && [ -f "$tmp/rule" ] || exit 1
+  grep -Fq 'default via 10.17.1.2 dev eth0' "$tmp/routes"
+  [ "$(rp_state_get init_generation)" = "$(cat "$wal/token")" ]
+  if [ "$scenario" = stopped-absent ]; then
+   [ ! -e "$RP_SMARTDNS_FILE" ] && [ "$(rp_state_get smartdns90_present)" = 0 ] || exit 1
+  else
+   cmp "$RP_SMARTDNS_FILE" "$wal/dns90-old"
+   rp_smartdns_receipt_content "$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id")" >"$tmp/restored90"
+   cmp "$RP_SMARTDNS_FILE" "$tmp/restored90"
+  fi
+  case "$scenario" in stopped-kill|stopped-boot)
+   grep -Fxq "$(printf 'before-rule\t0')" "$tmp/exit-intent"
+   grep -Fxq "$(printf 'before-nft\t0')" "$tmp/exit-intent" ;;
+  esac
+ done
+ printf '%s\n' 'stopped exit policy: passed (original active1, exact 90/absence, foreign resources and bad marker refused, same/new-boot intent retry)'
+)
+if [ "${1:-}" = --exit-stopped ]; then exit_stopped_policy; exit 0; fi
 if [ "${1:-}" = --bootstrap ]; then
 	. "$ROUTEPOLICY_LIBEXEC/common"
 	cat >"$tmp/owner" <<'SH'
@@ -491,3 +567,4 @@ printf 'init intent boundaries: passed (foreign/invalid evidence, read and publi
 printf 'init intent retirement: passed (single error JSON on failed intent/applied/catalog removal, retry; numeric mark normalization)\n'
 printf 'init intent admission: passed (unfinished no-token writer rejected, terminal/prepared ordinary path retained, bad token/path rejected)\n'
 printf 'init routing IDs: passed (0200/012000 rejected before writes, intent load and cross-boot retirement; canonical IDs and padded hex mark retained)\n'
+exit_stopped_policy

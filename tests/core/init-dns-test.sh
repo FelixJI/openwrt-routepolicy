@@ -221,7 +221,20 @@ for service in smartdns dnsmasq; do
 	[ "$(cat "$TEST_DNS_TMP/svc/$service.running")" = 1 ] || continue
 	port=$(cat "$TEST_DNS_TMP/svc/$service.port")
 	[ "$port" != 0 ] || continue
-	printf 'tcp 0 0 0.0.0.0:%s 0.0.0.0:* LISTEN 101/%s\nudp 0 0 0.0.0.0:%s 0.0.0.0:* 101/%s\n' "$port" "$service" "$port" "$service"
+	owner="101/$service"
+	if [ "$service" = smartdns ]; then
+		owner="$(cat "$TEST_DNS_TMP/svc/smartdns.pid")/smartdns"
+		case "$(cat "$TEST_DNS_TMP/svc/listener-fault" 2>/dev/null)" in
+			reload-pending) continue ;;
+			reload-foreign) owner=999/foreign ;;
+		esac
+	fi
+	printf 'tcp 0 0 0.0.0.0:%s 0.0.0.0:* LISTEN %s\nudp 0 0 0.0.0.0:%s 0.0.0.0:* %s\n' "$port" "$owner" "$port" "$owner"
+	if [ "$service" = smartdns ] && [ "$(cat "$TEST_DNS_TMP/svc/compensation-fault" 2>/dev/null)" = reload-partial ] &&
+		[ ! -f "$TEST_DNS_TMP/svc/listener-fault" ]; then
+		# Distinct device-bound sockets can display the same tuple in netstat.
+		printf 'tcp 0 0 0.0.0.0:%s 0.0.0.0:* LISTEN %s\n' "$port" "$owner"
+	fi
 	if [ "$service" = dnsmasq ] && [ "${TEST_DNS_IPV6:-0}" = 1 ]; then
 		printf 'tcp6 0 0 :::%s :::* LISTEN 101/dnsmasq\nudp6 0 0 :::%s :::* 101/dnsmasq\n' "$port" "$port"
 	fi
@@ -281,8 +294,10 @@ fi
 mkdir -p "$RP_ACTIVE_DIR"
 : >"$RP_ACTIVE_DIR/domain-default.list"; : >"$RP_ACTIVE_DIR/domain-policy.list"
 printf '%s\n' "${ROUTEPOLICY_INIT_GENERATION:-boot}" >"$RP_ACTIVE_DIR/generation"
-rp_render_smartdns90 "$RP_SMARTDNS_FILE"
-[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 1
+adapter=$(rp_uci_get main smartdns_enabled 1)
+if [ "$adapter" = 1 ]; then rp_render_smartdns90 "$RP_SMARTDNS_FILE"
+else rm -f "$RP_SMARTDNS_FILE"; fi
+[ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_smartdns_set_registration "$RP_SMARTDNS_FILE" "$adapter"
 printf 'policy_interface=%s\npolicy_device=eth2\nroute_table=200\n' "$(uci -q get routepolicy.main.policy_interface)" >"$RP_STATE_DIR/applied"
 : >"$TEST_DNS_TMP/policy-running"
 [ "${ROUTEPOLICY_DNS_DEFER:-0}" = 1 ] || rp_native_service smartdns reload
@@ -331,6 +346,10 @@ if [ "$1" = reload ] && [ -f "$svc/publication-attempted" ]; then
 	case "$(cat "$svc/compensation-fault")" in
 		reload-error) exit 1 ;;
 		reload-stale) exit 0 ;;
+		reload-pending|reload-foreign|reload-partial)
+			cat "$svc/compensation-fault" >"$svc/listener-fault"
+			printf '%s' "$(($(cat "$svc/smartdns.pid") + 1))" >"$svc/smartdns.pid"
+			exit 0 ;;
 	esac
 fi
 if [ "$1" = restart ]; then
@@ -540,7 +559,7 @@ if [ "$target" = "$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/90-routepolicy.conf" ] &
 fi
 SH
 	chmod +x "$tmp/bin/mv"
-	for managed_case in immediate legacy-shape publish-fail reload-error reload-stale publish-stopped publish-sync rollback-fail receipt-conflict file-conflict interrupted preboot preforeign premissing preoversize external77 oldboot duplicate badtuple bootstrap foreign90 real91 continuation proof-read-error; do
+	for managed_case in immediate legacy-shape publish-fail reload-error reload-stale reload-pending reload-foreign reload-partial publish-stopped publish-sync rollback-fail receipt-conflict file-conflict interrupted preboot preforeign premissing preoversize external77 oldboot duplicate badtuple bootstrap foreign90 real91 continuation proof-read-error; do
 		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
 		active=$(rp_init_active_record)
 		cp -R "$active/origin" "$tmp/managed-origin-$managed_case"
@@ -548,7 +567,7 @@ SH
 		cp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
 		cp "$RP_SMARTDNS_FILE" "$tmp/managed90.before"
 		case "$managed_case" in
-			publish-fail|reload-error|reload-stale|publish-stopped)
+			publish-fail|reload-*|publish-stopped)
 				printf '%s\n' "$managed_case" >"$tmp/svc/compensation-fault"
 				: >"$tmp/fail-managed-receipt"
 				cp "$RP_SMARTDNS_GENERATED" "$tmp/managed-main.before"
@@ -568,7 +587,7 @@ SH
 			premissing) rm "$RP_STATE_DIR/applied" ;;
 			preoversize) dd if=/dev/zero bs=2097153 count=1 >"$RP_STATE_DIR/applied" 2>/dev/null ;;
 		esac
-		case "$managed_case" in publish-fail|reload-error|reload-stale|publish-stopped)
+		case "$managed_case" in publish-fail|reload-*|publish-stopped)
 			if "$tmp/lib/smartdns-control" apply >"$tmp/managed-failed" 2>&1; then printf 'receipt failure succeeded\n' >&2; exit 1; fi
 			cmp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
 			cmp "$RP_SMARTDNS_FILE" "$tmp/managed90.before"
@@ -854,6 +873,158 @@ if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
 	printf '%s\n' 'source-free restore: passed (empty published snapshot; failure restores current/previous and unknown files)'
 	exit 0
 fi
+if [ "${1:-}" = --exit-disabled ]; then
+	cp "$REAL_LIB/init-policy-runtime" "$tmp/lib/"
+	cat >"$tmp/bin/nft" <<'SH'
+#!/bin/sh
+case "$1:$2" in
+	list:table) test -f "$TEST_DNS_TMP/policy-running" ;;
+	list:tables) if [ -f "$TEST_DNS_TMP/policy-running" ]; then printf 'table inet routepolicy\n'; fi ;;
+	delete:table) rm -f "$TEST_DNS_TMP/policy-running" ;;
+	*) exit 1 ;;
+esac
+SH
+	cat >"$tmp/bin/ip" <<'SH'
+#!/bin/sh
+case "$*" in
+	'-4 -N rule show'|'-4 rule show')
+		printf '0: from all lookup 255\n32766: from all lookup 254\n32767: from all lookup 253\n'
+		if [ -f "$TEST_DNS_TMP/foreign-rule" ]; then printf '11000: from all lookup 201\n'; fi ;;
+	'-4 route flush table 200') : >"$TEST_DNS_TMP/route-flushed" ;;
+	'-4 route show table 200')
+		if [ -f "$TEST_DNS_TMP/policy-running" ] && [ ! -f "$TEST_DNS_TMP/route-flushed" ]; then
+			printf 'default via 198.51.100.1 dev eth2 metric 10\n'
+		fi ;;
+	'-4 -N route show table all'|'-4 rule del '*) ;;
+	*) exit 1 ;;
+esac
+SH
+	TEST_EXIT_MV=$(command -v mv); export TEST_EXIT_MV
+	cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+"$TEST_EXIT_MV" "$@" || exit $?
+for target do :; done
+if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current" ] &&
+	[ -f "$target/dns90-new-absent" ] && [ -f "$TEST_DNS_TMP/kill-disabled-exit" ]; then
+	rm "$TEST_DNS_TMP/kill-disabled-exit"; kill -KILL "$PPID"
+fi
+SH
+	chmod +x "$tmp/bin/nft" "$tmp/bin/ip" "$tmp/bin/mv"
+	for disabled_case in inactive-absent inactive-present active-absent active-present active-changed manual partial unknown reordered field foreign-rule promoted promoted-boot promoted-foreign; do
+		baseline 0 0 1 1
+		rm -f "$tmp/route-flushed" "$tmp/foreign-rule"
+		original_active=0; original_file=0
+		case "$disabled_case" in active-*) original_active=1 ;; esac
+		case "$disabled_case" in *-present|active-changed|promoted*) original_file=1 ;; esac
+		uci set "routepolicy.main.enabled=$original_active"
+		uci set "routepolicy.main.smartdns_enabled=$original_file"
+		uci set routepolicy.main.smartdns_policy_group=policy
+		uci commit routepolicy
+		if [ "$original_active" = 1 ]; then
+			rp_ensure_dirs
+			printf 'policy_interface=wan2\n' >"$RP_STATE_DIR/applied"
+			: >"$tmp/policy-running"
+		fi
+		if [ "$original_file" = 1 ]; then
+			if [ "$original_active" = 1 ]; then rp_render_smartdns90 "$RP_SMARTDNS_FILE"
+			else printf '# Original user fragment\n' >"$RP_SMARTDNS_FILE"; fi
+			uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/90-routepolicy.conf'
+			uci commit smartdns
+			cp "$RP_SMARTDNS_FILE" "$tmp/original90"
+		fi
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.before"; done
+		prepare_dns 192.0.2.53; confirm_dns
+		active=$(rp_init_active_record); txroot="$RP_STATE_DIR/init-transaction"
+		cp -R "$active/origin" "$tmp/origin-disabled-$disabled_case"
+		managed_apply_dns
+		if [ "$disabled_case" = active-present ]; then rm "$RP_LOCAL_HOSTS_CANDIDATE"; fi
+		"$tmp/lib/smartdns-control" apply >/dev/null
+		"$TX" exit-preview >/dev/null
+		if [ "$disabled_case" = manual ]; then
+			rm "$RP_SMARTDNS_FILE"
+			if "$TX" exit-preview >"$tmp/disabled-conflict"; then printf 'exit adopted a manually removed 90\n' >&2; exit 1; fi
+			grep -Fq file:dns90 "$tmp/disabled-conflict"
+			continue
+		fi
+		uci set routepolicy.main.enabled=0; uci commit routepolicy
+		if [ "$disabled_case" = partial ]; then
+			rm "$RP_SMARTDNS_FILE"
+			rp_smartdns_set_registration "$RP_SMARTDNS_FILE" 0
+			if "$TX" exit-preview >"$tmp/disabled-conflict"; then printf 'exit adopted an incomplete teardown\n' >&2; exit 1; fi
+			grep -Fq policy-disable-incomplete "$tmp/disabled-conflict"
+			[ -f "$RP_STATE_DIR/applied" ] && [ -f "$tmp/policy-running" ] || exit 1
+			continue
+		fi
+		(
+			export ROUTEPOLICY_APPLY="$REAL_LIB/apply"
+			config_load() { :; }
+			config_get_bool() {
+				# shellcheck disable=SC2034
+				enabled=$(uci -q get routepolicy.main.enabled)
+			}
+			# shellcheck disable=SC1090
+			. "$TEST_DNS_REAL_INIT"
+			reload_service
+		) >"$tmp/ordinary-disabled"
+		[ ! -e "$RP_SMARTDNS_FILE" ] && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -e "$RP_ACTIVE_DIR" ] || exit 1
+		[ "$(cat "$tmp/svc/smartdns.running")" = 1 ]
+		rm -f "$tmp/route-flushed"
+		case "$disabled_case" in
+			unknown) uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/77-external.conf'; uci commit smartdns ;;
+			reordered)
+				uci del_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/custom-a.conf'
+				uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/custom-a.conf'; uci commit smartdns ;;
+			field) uci set 'smartdns.@smartdns[0].port=6054'; uci commit smartdns ;;
+			foreign-rule) : >"$tmp/foreign-rule" ;;
+		esac
+		case "$disabled_case" in active-changed|unknown|reordered|field|foreign-rule)
+			cp -R "$tmp/root/etc/config" "$tmp/before-disabled-$disabled_case"
+			if "$TX" exit-prepare >"$tmp/disabled-conflict"; then printf 'exit adopted %s\n' "$disabled_case" >&2; exit 1; fi
+			case "$disabled_case" in
+				active-changed) grep -Fq '原有分流与当前声明不一致，无法安全恢复' "$tmp/disabled-conflict" ;;
+				unknown|reordered) grep -Fq '.conf_files' "$tmp/disabled-conflict" ;;
+				field) grep -Fq '.port' "$tmp/disabled-conflict" ;;
+				foreign-rule) grep -Fq policy-disable-incomplete "$tmp/disabled-conflict" ;;
+			esac
+			diff -r "$tmp/root/etc/config" "$tmp/before-disabled-$disabled_case"
+			diff -r "$active/origin" "$tmp/origin-disabled-$disabled_case"
+			[ ! -e "$txroot/exit-token" ]
+			continue ;;
+		esac
+		"$TX" exit-preview >"$tmp/disabled-preview"
+		output=$("$TX" exit-prepare); exit_token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+		case "$disabled_case" in promoted*)
+			: >"$tmp/kill-disabled-exit"
+			if "$TX" exit-apply "$exit_token" >"$tmp/disabled-exit-killed" 2>&1; then printf 'exit promotion fault was missed\n' >&2; exit 1; fi
+			[ "$(cat "$txroot/current/dns90-new-absent")" = 1 ] && [ ! -e "$txroot/current/dns90-new" ] || exit 1
+			[ -f "$txroot/current/dns90-old" ] && [ ! -e "$txroot/current/dns90-absent" ] || exit 1
+			if [ "$disabled_case" = promoted-boot ]; then
+				test_boot; "$TX" recover-early >"$tmp/disabled-early"
+				cmp "$RP_SMARTDNS_FILE" "$tmp/original90"
+			elif [ "$disabled_case" = promoted-foreign ]; then
+				printf 'address /external.test/203.0.114.99\n' >"$RP_SMARTDNS_FILE"
+				cp -R "$tmp/root/etc/config" "$tmp/before-disabled-foreign"
+				if "$TX" recover >/dev/null 2>&1; then printf 'exit overwrote external 90 after promotion\n' >&2; exit 1; fi
+				grep -Fq external.test "$RP_SMARTDNS_FILE"
+				diff -r "$tmp/root/etc/config" "$tmp/before-disabled-foreign"
+				diff -r "$active/origin" "$tmp/origin-disabled-$disabled_case"
+				continue
+			fi
+			"$TX" recover >"$tmp/disabled-exited" ;;
+		*) "$TX" exit-apply "$exit_token" >"$tmp/disabled-exited" ;;
+		esac
+		[ "$(cat "$txroot/current/phase")" = exited ] && [ ! -e "$txroot/active" ] || exit 1
+		[ "$(uci -q get routepolicy.main.enabled)" = "$original_active" ]
+		if [ "$original_active" = 1 ]; then [ -f "$tmp/policy-running" ] && [ -f "$RP_STATE_DIR/applied" ] || exit 1
+		else [ ! -f "$tmp/policy-running" ] && [ ! -e "$RP_STATE_DIR/applied" ] || exit 1; fi
+		if [ "$original_file" = 1 ]; then cmp "$RP_SMARTDNS_FILE" "$tmp/original90"
+		else [ ! -e "$RP_SMARTDNS_FILE" ]; fi
+		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.after"; cmp "$tmp/$package.before" "$tmp/$package.after"; done
+		diff -r "$active/origin" "$tmp/origin-disabled-$disabled_case"
+	done
+	printf '%s\n' 'disabled exit: passed (native teardown, original policy/file, foreign edits/runtime, private-stage and cold recovery)'
+	exit 0
+fi
 if [ "${1:-}" = --exit-archive ]; then
 	for archive_case in sameboot reboot conflict; do
 		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
@@ -1110,6 +1281,7 @@ management_auto_defaults_test() {
 	control="$REAL_LIB/smartdns-control"
 	while read -r current requested dns_running accepted; do
 		baseline 1 1 1 "$dns_running"
+		"$tmp/root/etc/init.d/smartdns" start
 		case "$current" in missing) uci delete 'smartdns.@smartdns[0].auto_set_dnsmasq' ;; empty) uci set 'smartdns.@smartdns[0].auto_set_dnsmasq=' ;; *) uci set "smartdns.@smartdns[0].auto_set_dnsmasq=$current" ;; esac
 		uci commit smartdns
 		# A deliberate return to default-on may safely retain an existing forwarder.

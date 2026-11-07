@@ -470,8 +470,18 @@ smartdns_loaded_fragments() {
 	done
 }
 
+smartdns_listener_ports() {
+	# Native generated binds include the main, secondary and TLS/HTTPS ports.
+	# Other UDP sockets under the same PID can be upstream source sockets.
+	awk '$1~/^bind(-tcp|-tls|-https|-quic)?$/ {
+		port=$2; sub(/@.*/,"",port); sub(/^.*:/,"",port)
+		if(port!~/^[0-9]+$/||port<1||port>65535)bad=1
+		else ports[port+0]=1
+	} END {if(bad)exit 1; for(port in ports){printf "%s%s",space,port; space=" "}}' "$RP_SMARTDNS_GENERATED"
+}
+
 restore_smartdns_service() {
-	local current_pid restored_pid remaining=5
+	local current_pid restored_pid restored_listeners remaining=5
 	if [ "$service_pid_before" = 0 ]; then
 		rp_native_service smartdns stop && [ "$(smartdns_running_pid)" = 0 ]
 		return
@@ -482,7 +492,10 @@ restore_smartdns_service() {
 	rp_native_service smartdns reload || return 1
 	while :; do
 		restored_pid=$(smartdns_running_pid) || return 1
-		if [ "$restored_pid" != 0 ] && [ "$restored_pid" != "$current_pid" ] && [ "$restored_pid" != "$service_pid_before" ]; then break; fi
+		if [ "$restored_pid" != 0 ] && [ "$restored_pid" != "$current_pid" ] && [ "$restored_pid" != "$service_pid_before" ]; then
+			restored_listeners=$(rp_dns_listener_rows "^$restored_pid/" "$listener_ports") || return 1
+			[ "$restored_listeners" != "$listeners_before" ] || break
+		fi
 		[ "$remaining" -gt 0 ] || return 1
 		sleep 1; remaining=$((remaining - 1))
 	done
@@ -508,6 +521,9 @@ smartdns_apply() {
 		service_pid_before=$(smartdns_running_pid) || { rp_output_error smartdns-apply '无法核对应用前 SmartDNS 运行状态'; return 1; }
 		if [ "$service_pid_before" != 0 ]; then
 			fragments_before=$(smartdns_loaded_fragments) || { rp_output_error smartdns-apply '无法核对应用前 SmartDNS 生成配置'; return 1; }
+			listener_ports=$(smartdns_listener_ports) &&
+				listeners_before=$(rp_dns_listener_rows "^$service_pid_before/" "$listener_ports") &&
+				[ -n "$listeners_before" ] || { rp_output_error smartdns-apply '无法核对应用前 SmartDNS 监听端点'; return 1; }
 		fi
 	fi
 	roots=$(rp_smartdns_root_sections); root=$(printf '%s\n' "$roots" | sed -n '1p')

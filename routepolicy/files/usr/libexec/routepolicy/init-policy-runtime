@@ -8,7 +8,7 @@
 ipr_context() {
 	IPR_WAL="$RP_STATE_DIR/init-transaction/current"
 	IPR_INTENT="$IPR_WAL/policy-runtime-intent"
-	IPR_CONTEXT=0; IPR_ERROR=; IPR_TOKEN=; IPR_ENABLED=0; IPR_CROSSBOOT_EMPTY=0
+	IPR_CONTEXT=0; IPR_ERROR=; IPR_TOKEN=; IPR_ENABLED=0; IPR_CROSSBOOT_EMPTY=0; IPR_EXIT_STOPPED=0
 	IPR_CONTINUING=0
 	IPR_PLANNED_ROUTES=; IPR_BEFORE_ROUTES=
 	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] || return 0
@@ -47,6 +47,19 @@ ipr_context() {
 	case "$IPR_ACTIVE" in 0|1) ;; *) return 1 ;; esac
 	IPR_PHASE=$(cat "$IPR_WAL/phase") || return 1
 	case "$IPR_PHASE:${ROUTEPOLICY_INIT_RESTORE:-0}" in applying:0|rolling_back:1) ;; *) return 1 ;; esac
+	if [ -e "$IPR_WAL/dns90-new-absent" ] || [ -L "$IPR_WAL/dns90-new-absent" ]; then
+		[ "$IPR_PHASE" = rolling_back ] && rp_exit_dns90_restore_admit "$IPR_WAL" || return 1
+		case "$IPR_ACTIVE:$mode" in 0:teardown|1:apply) ;; *) return 1 ;; esac
+		# A retry may see this exit's restored state. Do not adopt a new writer.
+		if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ]; then
+			[ "$IPR_ACTIVE" = 1 ] && [ "$(rp_state_get init_generation)" = "$IPR_TOKEN" ] &&
+				rp_smartdns_receipt_content "$(rp_state_get boot_id)" "$RP_STATE_DIR/applied" 1 >/dev/null || return 1
+		fi
+		if [ -e "$RP_ACTIVE_DIR" ] || [ -L "$RP_ACTIVE_DIR" ]; then
+			[ "$IPR_ACTIVE" = 1 ] && ipr_catalog && [ "$IPR_GENERATION_NOW" = "$IPR_TOKEN" ] || return 1
+		fi
+		IPR_EXIT_STOPPED=1
+	fi
 	if ! rp_init_routing_id_between "$(rp_uci_get main route_table 200)" 1 252 || ! rp_init_routing_id_between "$(rp_uci_get main rule_priority 12000)" 1 32765; then
 		IPR_ERROR='初始化 route_table/rule_priority 必须为无前导零的十进制整数；未改变配置或实际表号'
 		return 1
@@ -304,6 +317,9 @@ ipr_prepare() {
 	if [ "$IPR_CONTINUING" = 1 ]; then
 		[ "$IPR_APPLIED_NOW" = 1 ] && [ "$before_nft" = 1 ] && [ "$IPR_RULE_NOW" = 1 ] && [ "$catalog" = 1 ] && [ "$generation" = "$IPR_TOKEN" ] && ipr_matches_plan || return 1
 	elif [ "$IPR_RECOVERED" = 1 ]; then ipr_matches_plan || return 1
+	elif [ "$IPR_EXIT_STOPPED:$applied_before:$catalog" = 1:0:0 ]; then
+		# The exit restores an originally active policy from a proven empty baseline.
+		[ "$IPR_RULE_NOW" = 0 ] && [ -z "$IPR_ROUTES_NOW" ] && [ "$before_nft" = 0 ] && ipr_legacy_empty || return 1
 	elif [ "${IPR_CROSSBOOT_EMPTY:-0}" = 1 ]; then [ "$IPR_RULE_NOW" = 0 ] && [ -z "$IPR_ROUTES_NOW" ] && [ "$before_nft" = 0 ] || return 1
 	elif [ "$IPR_ACTIVE" = 0 ]; then
 		[ "$IPR_RULE_NOW" = 0 ] && [ -z "$IPR_ROUTES_NOW" ] && [ "$before_nft" = 0 ] || return 1

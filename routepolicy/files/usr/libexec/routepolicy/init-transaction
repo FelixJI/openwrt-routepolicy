@@ -157,10 +157,17 @@ origin_publish() {
 	origin_validate "$stage/origin"
 }
 exit_file_snapshot() {
-	local record=$1 key=$2 snapshot=$3 path proof receipt_boot result=1
+	local record=$1 key=$2 snapshot=$3 stopped=${4:-0} path proof receipt_boot result=1
 	case "$key" in dns-file) path=$RP_SMARTDNS_EXTRA_FILE ;; dns90) path=$RP_SMARTDNS_FILE ;; *) return 1 ;; esac
 	[ ! -L "$path" ] || return 1
-	if [ ! -e "$path" ]; then [ -f "$record/origin/$key-absent" ]; return; fi
+	if [ ! -e "$path" ]; then
+		if [ "$key:$stopped" = dns90:1 ]; then
+			rm -f "$snapshot" && printf '1\n' >"$snapshot-absent"
+		elif [ "$key" = dns90 ] && [ -f "$record/origin/dns90-new" ]; then return 1
+		else [ -f "$record/origin/$key-absent" ]; fi
+		return
+	fi
+	[ "$key:$stopped" != dns90:1 ] || return 1
 	[ -f "$path" ] && [ "$(wc -c <"$path")" -le 1048576 ] && cp "$path" "$snapshot" || return 1
 	if cmp -s "$snapshot" "$record/origin/$key-new" || cmp -s "$snapshot" "$record/origin/$key-old"; then return 0; fi
 	proof=$(mktemp "$RP_RUN_DIR/exit-proof.XXXXXX") || return 1
@@ -179,12 +186,48 @@ exit_file_snapshot() {
 	rm -f "$proof"
 	return "$result"
 }
+exit_policy_stopped() {
+	local path
+	for path in "$RP_SMARTDNS_FILE" "$RP_STATE_DIR/applied" "$RP_ACTIVE_DIR" "$TX/current/policy-runtime-intent"; do
+		[ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+	done
+	! rp_dns_boot_pending && [ -f "$RP_SMARTDNS_GENERATED" ] && [ ! -L "$RP_SMARTDNS_GENERATED" ] &&
+		[ -r "$RP_SMARTDNS_GENERATED" ] && ! rp_smartdns_fragment_loaded "$RP_SMARTDNS_FILE" || return 1
+	timeout 8 sh -c '. "$1"; ipr_legacy_empty' routepolicy-exit "$LIBEXEC/init-policy-runtime"
+}
+exit_stopped_conf_files() {
+	printf '%s\n' "$1" | awk -F '[|]' '
+		{for(i=1;i<=NF;i++) {
+			if($i=="/etc/smartdns/conf.d/90-routepolicy.conf") {removed++; continue}
+			if($i=="") bad=1
+			rest=rest sep $i; sep="|"
+		}} END {if(bad||removed!=1)exit 1; print rest}'
+}
+exit_original_policy_matches() {
+	local origin=$1 adapter=$2 group=$3 proof result=1
+	case "$(cat "$origin/policy-active"):$adapter" in
+		0:*) return 0 ;;
+		1:0) [ -f "$origin/dns90-absent" ] && [ ! -e "$origin/dns90-old" ]; return ;;
+		1:1) [ -f "$origin/dns90-old" ] && [ ! -e "$origin/dns90-absent" ] && rp_is_group "$group" || return 1 ;;
+		*) return 1 ;;
+	esac
+	proof=$(mktemp "$RP_RUN_DIR/exit-policy-proof.XXXXXX") || return 1
+	if rp_smartdns90_content "$group" >"$proof" && cmp -s "$proof" "$origin/dns90-old"; then result=0; fi
+	rm -f "$proof"
+	return "$result"
+}
 exit_check() {
-	local record=$1 n i entry key present type value expected old missing=0 owned_keys='' child service state desired managed file_work
+	local record=$1 stage=${2:-} n i entry key present type value expected old existed old_type expected_type
+	local missing=0 owned_keys='' child service state desired managed file_work stopped=0 stopped_enabled=0 stopped_list=0 stripped
+	local old_adapter=invalid old_group=invalid adopted stopped_field
 	origin_validate "$record/origin" || { printf 'invalid-origin\n'; return 1; }
 	init_resolver_exit_check "$record" || { printf 'resolver-origin-or-runtime\n'; return 1; }
 	[ ! -f "$record/origin/incomplete" ] || { cat "$record/origin/incomplete"; return 1; }
 	no_pending || { printf 'pending-uci\n'; return 1; }
+	if [ -f "$record/origin/dns90-new" ] && read_current routepolicy.main.enabled && [ "$FIELD_TYPE:$FIELD_VALUE" = scalar:0 ]; then
+		if exit_policy_stopped; then stopped=1
+		else printf 'policy-disable-incomplete\n'; missing=1; fi
+	fi
 	n=$(cat "$record/origin/count"); i=0
 	while [ "$i" -lt "$n" ]; do i=$((i+1)); owned_keys="$owned_keys|$(cat "$record/origin/fields/$i/key")|"; done
 	i=0
@@ -193,8 +236,15 @@ exit_check() {
 		present=0; value=; type=0
 		if read_current "$key"; then present=1; value=$FIELD_VALUE; type=$FIELD_TYPE
 		elif [ "$?" != 1 ]; then printf 'unreadable:%s\n' "$key"; missing=1; continue; fi
-		expected=$(cat "$entry/expected"); old=$(cat "$entry/old")
-		case "$key:$(cat "$entry/existed")" in
+		expected=$(cat "$entry/expected") && expected_type=$(cat "$entry/expected-type") &&
+			old=$(cat "$entry/old") && existed=$(cat "$entry/existed") && old_type=$(cat "$entry/type") || return 1
+		case "$key:$existed:$old_type" in
+			routepolicy.main.smartdns_enabled:0:scalar) old_adapter=1 ;;
+			routepolicy.main.smartdns_enabled:1:scalar) old_adapter=$old ;;
+			routepolicy.main.smartdns_policy_group:0:scalar) old_group=policy ;;
+			routepolicy.main.smartdns_policy_group:1:scalar) old_group=$old ;;
+		esac
+		case "$key:$existed" in
 			*.*.*:*) ;;
 			*:0)
 				for child in $(uci_committed show "$key" 2>/dev/null | sed 's/=.*//'); do
@@ -202,11 +252,34 @@ exit_check() {
 					case "$owned_keys" in *"|$child|"*) ;; *) printf 'unknown-child:%s\n' "$child"; missing=1 ;; esac
 				done ;;
 		esac
-		if { [ "$present" = "$(cat "$entry/existed")" ] && { [ "$present" = 0 ] || { [ "$value" = "$old" ] && [ "$type" = "$(cat "$entry/type")" ]; }; }; } ||
-			{ [ "$present" = 0 ] && [ "$(cat "$entry/expected-type")" = 0 ]; } ||
-			{ [ "$type" = "$(cat "$entry/expected-type")" ] && [ "$value" = "$expected" ]; }; then :
+		adopted=0; stopped_field=0
+		case "$stopped:$key" in
+			1:routepolicy.main.enabled)
+				stopped_field=1
+				if [ "$expected_type:$expected:$type:$value" = scalar:1:scalar:0 ]; then adopted=1; stopped_enabled=1; fi ;;
+			1:smartdns.*.conf_files)
+				stopped_field=1
+				if [ "$stopped_list" = 0 ] && [ "$expected_type" = list ] && stripped=$(exit_stopped_conf_files "$expected"); then
+					if [ "$type:$value" = "list:$stripped" ] || { [ -z "$stripped" ] && [ "$present" = 0 ]; }; then adopted=1; stopped_list=1; fi
+				fi ;;
+		esac
+		if [ "$adopted" = 1 ]; then
+			if [ -n "$stage" ]; then
+				[ "$present" != 0 ] || value=-
+				printf '%s' "$value" >"$stage/fields/$i/expected" && printf '%s\n' "$type" >"$stage/fields/$i/expected-type" || return 1
+			fi
+		elif [ "$stopped_field" = 1 ]; then
+			printf 'field:%s\n' "$key"; missing=1
+		elif { [ "$present" = "$existed" ] && { [ "$present" = 0 ] || { [ "$value" = "$old" ] && [ "$type" = "$old_type" ]; }; }; } ||
+			{ [ "$present" = 0 ] && [ "$expected_type" = 0 ]; } ||
+			{ [ "$type" = "$expected_type" ] && [ "$value" = "$expected" ]; }; then :
 		else printf 'field:%s\n' "$key"; missing=1; fi
 	done
+	if [ "$stopped" = 1 ]; then
+		[ "$stopped_enabled:$stopped_list" = 1:1 ] || { printf 'policy-disable-origin\n'; missing=1; }
+		exit_original_policy_matches "$record/origin" "$old_adapter" "$old_group" ||
+			{ printf '原有分流与当前声明不一致，无法安全恢复\n'; missing=1; }
+	fi
 	for service in smartdns dnsmasq; do
 		for key in enabled running; do
 			desired=$(cat "$record/origin/$service-$key") || return 1
@@ -216,11 +289,12 @@ exit_check() {
 			if [ "$state" != "$managed" ] && [ "$state" != "$desired" ]; then printf 'service:%s:%s\n' "$service" "$key"; missing=1; fi
 		done
 	done
-	file_work=$(mktemp -d "$RP_RUN_DIR/exit-files.XXXXXX") || return 1
+	file_work=$stage
+	if [ -z "$file_work" ]; then file_work=$(mktemp -d "$RP_RUN_DIR/exit-files.XXXXXX") || return 1; fi
 	for key in dns-file dns90; do
-		if ! exit_file_snapshot "$record" "$key" "$file_work/$key"; then printf 'file:%s\n' "$key"; missing=1; fi
+		if ! exit_file_snapshot "$record" "$key" "$file_work/$key-new" "$stopped"; then printf 'file:%s\n' "$key"; missing=1; fi
 	done
-	rm -rf "$file_work"
+	[ -n "$stage" ] || rm -rf "$file_work"
 	[ "$missing" = 0 ]
 }
 exit_finish() {
@@ -257,7 +331,7 @@ exit_apply() {
 			for path do
 				relative=${path#"$base"/}
 				case "$relative" in
-					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted|dns-file-new|dns90-new) [ -f "$path" ] || printf "unknown\n" ;;
+					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted|dns-file-new|dns90-new|dns90-new-absent) [ -f "$path" ] || printf "unknown\n" ;;
 					delta) [ -d "$path" ] || printf "unknown\n" ;;
 					*) if [ -d "$path" ]; then [ -d "$origin/$relative" ] || printf "unknown\n"; else [ -f "$path" ] && [ -f "$origin/$relative" ] || printf "unknown\n"; fi ;;
 				esac
@@ -270,7 +344,7 @@ exit_apply() {
 	staging=$(mktemp -d "$TX/exit-preparing.XXXXXX") || return 1
 	printf '%s\n' "$supplied" >"$staging/token" && printf 'exit\n' >"$staging/kind" && sync && mv "$staging" "$stage" && sync || return 1
 	cp -pR "$record/origin/." "$stage/" || return 1
-	for item in dns-file dns90; do exit_file_snapshot "$record" "$item" "$stage/$item-new" || return 1; done
+	exit_check "$record" "$stage" || return 1
 	for item in candidate parameters; do cp "$record/$item" "$stage/$item" || return 1; done
 	printf '%s\n' "$supplied" >"$stage/token"; printf 'exit\n' >"$stage/kind"
 	cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$stage/boot-id" || return 1
@@ -805,6 +879,9 @@ rollback_fields() {
 	phase rolling_back || return 1
 	uci_layout || { phase conflict; return 1; }
 	printf '%s' '' >"$WAL/conflicts" || return 1
+	if [ -e "$WAL/dns90-new-absent" ] || [ -L "$WAL/dns90-new-absent" ]; then
+		if ! rp_exit_dns90_restore_admit "$WAL"; then printf 'file:dns90\n' >"$WAL/conflicts"; phase conflict; return 1; fi
+	fi
 	# A failed commit may leave unapplied private changes; never commit those during restore.
 	[ -d "$WAL/delta" ] && [ ! -L "$WAL/delta" ] || { phase conflict; return 1; }
 	find "$WAL/delta" -type f -exec rm -f '{}' ';' || { phase conflict; return 1; }

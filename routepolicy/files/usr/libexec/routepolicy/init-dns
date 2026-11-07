@@ -576,11 +576,10 @@ init_dns_original_probe() {
 		esac
 		rp_uint_between "$configured" 0 65535 || return 1
 		if [ "$configured" = 0 ]; then : >"$endpoints"; return; fi
-		output=$(timeout 3 netstat -lnptu) || return 1
-		printf '%s\n' "$output" | awk -v service="$service" -v configured="$configured" '
-			$1~/^(tcp|udp)(6)?$/ && $NF~("/" service "$") && $4~/:+[0-9]+$/ {
-				address=$4;sub(/:[0-9]+$/,"",address);port=$4;sub(/^.*:/,"",port)
-				if(port!=configured)next
+		output=$(rp_dns_listener_rows "/$service\$" "$configured") || return 1
+		printf '%s\n' "$output" | awk '
+			NF==2 {
+				address=$2;sub(/:[0-9]+$/,"",address);port=$2;sub(/^.*:/,"",port)
 				if(address=="0.0.0.0")address="127.0.0.1"
 				if(address=="::")address="::1"
 				print $1 " " address " " port " 0"}' | sort -u >"$endpoints" || return 1
@@ -935,7 +934,15 @@ init_dns_coordinate() {
 			[ -f "$WAL/dns-attempted" ] || [ -f "$WAL/dns-service-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
 			if [ -f "$WAL/dns90-attempted" ]; then
 				[ ! -L "$RP_SMARTDNS_FILE" ] || return 1
-				if cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-new" || { [ -f "$WAL/dns90-restore" ] && cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-restore"; }; then
+				if [ -e "$WAL/dns90-new-absent" ] || [ -L "$WAL/dns90-new-absent" ]; then
+					rp_exit_dns90_restore_admit "$WAL" || return 1
+					if [ ! -e "$RP_SMARTDNS_FILE" ] && [ -f "$WAL/dns90-old" ]; then
+						temp="$RP_SMARTDNS_FILE.init-$(cat "$WAL/token")"
+						[ ! -L "$temp" ] && { [ ! -e "$temp" ] || { [ -f "$temp" ] && rm -f "$temp"; }; } || return 1
+						mkdir -p "$(dirname "$RP_SMARTDNS_FILE")" &&
+							cp -p "$WAL/dns90-old" "$temp" && mv "$temp" "$RP_SMARTDNS_FILE" || return 1
+					fi
+				elif cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-new" || { [ -f "$WAL/dns90-restore" ] && cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-restore"; }; then
 					if [ -f "$WAL/dns90-absent" ]; then rm -f "$RP_SMARTDNS_FILE"; else cp -p "$WAL/dns90-old" "$RP_SMARTDNS_FILE"; fi
 				elif [ -f "$WAL/dns90-absent" ]; then [ ! -e "$RP_SMARTDNS_FILE" ] || return 1
 				else cmp -s "$RP_SMARTDNS_FILE" "$WAL/dns90-old" || return 1; fi

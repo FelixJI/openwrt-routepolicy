@@ -117,6 +117,8 @@ retire_crossboot_metadata() {
 			cmp -s "$RP_ACTIVE_DIR/$restore_file" "$restore_wal/dns-active-old/$restore_file" || return 2
 		done
 	fi
+	# A stopped exit can rebuild only after ruling out other custom policy state.
+	[ "$IPR_EXIT_STOPPED" != 1 ] || ipr_legacy_empty || return 2
 	restore_rules=$(ip -4 -N rule show) || return 2
 	printf '%s\n' "$restore_rules" | awk -v p="$priority:" -v t="$table" 'NF&&$1!~/^[0-9]+:$/{bad=1}$1==p{bad=1}{for(i=1;i<NF;i++)if(($i=="lookup"||$i=="table")&&$(i+1)==t)bad=1}END{exit bad}' || return 2
 	read_policy_routes "$table" && [ -z "$policy_routes" ] || return 2
@@ -374,6 +376,11 @@ managed_devices=$(rp_managed_device_signature)
 active_new="$work/active.new"
 mkdir "$active_new" || { rp_output_error apply '无法创建 active catalog 候选目录'; exit 1; }
 smartdns_enabled=$(rp_uci_get main smartdns_enabled 1)
+if [ "$IPR_EXIT_STOPPED" = 1 ]; then
+	if { [ "$smartdns_enabled" = 1 ] && [ -f "$IPR_WAL/dns90-old" ] && cmp -s "$RP_RUN_DIR/90-routepolicy.conf" "$IPR_WAL/dns90-old"; } ||
+		{ [ "$smartdns_enabled" = 0 ] && [ -f "$IPR_WAL/dns90-absent" ]; }; then :
+	else rp_output_error apply '原有分流与当前声明不一致，无法安全恢复'; exit 1; fi
+fi
 if [ "$smartdns_enabled" = 1 ]; then
 	cp "$RP_RUN_DIR/lists/domain-policy.list" "$active_new/domain-policy.list" && \
 		cp "$RP_RUN_DIR/lists/domain-default.list" "$active_new/domain-default.list" || { rp_output_error apply '无法准备 active catalog 域名候选'; exit 1; }
