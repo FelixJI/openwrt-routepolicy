@@ -21,6 +21,7 @@ case "$1:$2" in
 	changes:smartdns|changes:dhcp) printf '%s' "${TEST_BACKUP_PENDING:-}" ;;
 	get:smartdns.@smartdns\[0\].conf_files) printf '%s\n' '77-user.conf /etc/smartdns/conf.d/90-routepolicy.conf' ;;
 	get:smartdns.@smartdns\[0\].hosts_files) printf '%s\n' 'selected.hosts' ;;
+	get:smartdns.@smartdns\[0\].cache_file) printf '%s\n' '/etc/dns-view/./out.cache' ;;
 	*) exit 1 ;;
 esac
 SH
@@ -29,6 +30,7 @@ cat >"$tmp/shown" <<'UCI'
 smartdns.@smartdns[0]=smartdns
 smartdns.@smartdns[0].conf_files='77-user.conf' '/etc/smartdns/conf.d/90-routepolicy.conf'
 smartdns.@smartdns[0].hosts_files='selected.hosts'
+smartdns.@smartdns[0].cache_file='/etc/dns-view/./out.cache'
 UCI
 cat >"$tmp/uci" <<'UCI'
 package smartdns
@@ -36,19 +38,36 @@ config smartdns
 	list conf_files '77-user.conf'
 	list conf_files '/etc/smartdns/conf.d/90-routepolicy.conf'
 	list hosts_files 'selected.hosts'
+	option cache_file '/etc/dns-view/./out.cache'
 UCI
 cat >"$tmp/platform" <<'PATHS'
 /etc/config/smartdns
 /etc/init.d/smartdns
+/etc/ordinary-dangling
+/etc/ordinary-link-to-receipt
 /etc/routepolicy/state/init-transaction/active
 /etc/routepolicy/state/init-transaction/source
 /etc/routepolicy/state/init-transaction/confirmed/token/origin/fields/1/old
+/etc/state-view
+/etc/state-view/init-transaction/confirmed/token/origin/fields/1/old
 /usr/bin/native-platform-item
 PATHS
 dns="$ROUTEPOLICY_ROOT/etc/smartdns"
+state="$ROUTEPOLICY_ROOT/etc/routepolicy/state"
+mkdir -p "$state/init-transaction/confirmed/token/origin/fields/1"
+printf 'confirmed origin\n' >"$state/init-transaction/confirmed/token/origin/fields/1/old"
+printf 'runtime receipt\n' >"$state/applied"
+printf 'runtime cache\n' >"$dns/out.cache"
+printf 'runtime log\n' >"$dns/log.out"
+ln -s log.out "$dns/log.link"
+ln -s routepolicy/state "$ROUTEPOLICY_ROOT/etc/state-view"
+ln -s smartdns "$ROUTEPOLICY_ROOT/etc/dns-view"
+ln -s routepolicy/state/applied "$ROUTEPOLICY_ROOT/etc/ordinary-link-to-receipt"
+ln -s missing "$ROUTEPOLICY_ROOT/etc/ordinary-dangling"
 printf '# fixed\n' >"$dns/custom.conf"
 printf '# retained user declaration\n' >"$dns/conf.d/91-routepolicy-smartdns-extra.conf"
 printf 'conf-file "child.conf" -group user\n' >"$dns/conf.d/77-user.conf"
+printf 'log-file /etc/dns-view/./log.link\n' >>"$dns/conf.d/77-user.conf"
 # SmartDNS supports a quoted value as a whole token, with a separate -file.
 printf 'domain-set -name user -file "domains with spaces.list"\n' >"$dns/conf.d/child.conf"
 printf 'ip-set -n clients --file=client.list\n' >>"$dns/conf.d/child.conf"
@@ -96,11 +115,13 @@ printf '/etc/user-dns/outside.hosts\n' >>"$tmp/platform"
 grep -Fxq /etc/user-dns/outside.hosts "$tmp/list"
 
 cp "$tmp/platform" "$tmp/clean-platform"
-printf '/etc/routepolicy/state/init-transaction/current/token\n' >>"$tmp/platform"
-reject '备份清单包含受管运行态'
-cp "$tmp/clean-platform" "$tmp/platform"
-printf '/etc/smartdns/smartdns.cache\n' >>"$tmp/platform"
-reject 'SmartDNS 输出'
+for path in /etc/routepolicy/state/init-transaction/current/token /etc/routepolicy/state/./applied \
+	/etc/state-view/applied /etc/state-view/init-transaction/../applied /etc/smartdns/smartdns.cache \
+	/etc/smartdns/./out.cache /etc/dns-view/out.cache /etc/smartdns/log.link /etc/smartdns/log.out; do
+	cp "$tmp/clean-platform" "$tmp/platform"
+	printf '%s\n' "$path" >>"$tmp/platform"
+	reject "备份清单包含受管运行态或 SmartDNS 输出 $path"
+done
 cp "$tmp/clean-platform" "$tmp/platform"
 TEST_BACKUP_PENDING=1 reject 'UCI 暂存变更'
 
