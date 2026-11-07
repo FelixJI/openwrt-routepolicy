@@ -608,7 +608,7 @@ init_dns_original_probe() {
 	[ "$mode" != save ] || mv "$endpoints.new" "$endpoints"
 }
 init_dns_audit_lines() {
-	awk -v port="$1" -v device="$2" -v user="$3" '
+	awk -v port="$1" -v device="$2" -v user="$3" -v dependencies="${4:-0}" '
 		function tokens(line, i,c,q,word,n,started,closed,k) {
 			for(k in arg)delete arg[k]
 			for(i=1;i<=length(line);i++) {
@@ -628,6 +628,31 @@ init_dns_audit_lines() {
 			line=$0;sub(/\r$/,"",line);clean=line;gsub(/\t/,"",clean)
 			if(length(line)>4095||index(line,"\\")||clean~/[[:cntrl:]]/){bad=1;next}
 			key=$1
+			if(dependencies) {
+				if(key!~/^(conf-file|hosts-file|domain-set|ip-set|bind-cert-file|bind-cert-key-file|ca-file|ca-path|resolv-file|cache-file|log-file|audit-file|dnsmasq-lease-file|plugin)$/)next
+				sub(/^[ \t]*[^ \t]+[ \t]+/,key " ",line)
+				n=tokens(line)
+				if(!n||line~/\t/||key=="plugin"||key=="ca-path"){bad=1;next}
+				if(key=="domain-set"||key=="ip-set") {
+					files=0
+					for(i=2;i<=n;i++) {
+						argval=arg[i]
+						if(argval=="-f"||argval~/^--?file$/){if(i==n||arg[i+1]==""){bad=1;break};print "data\t" arg[++i];files++;continue}
+						if(argval~/^--?file=/){sub(/^--?file=/,"",argval);print "data\t" argval;files++;continue}
+						if(argval~/^-[nt]$/||argval~/^--?(name|type)$/){if(i==n)bad=1;else i++;continue}
+						if(argval~/^--?(name|type)=/)continue
+						bad=1
+					}
+					if(files!=1)bad=1;next
+				}
+				if(arg[2]==""||(n!=2&&!(key=="conf-file"&&n==4&&arg[3]~/^(-g|--?group)$/&&arg[4]!=""))){bad=1;next}
+				kind="data"
+				if(key=="conf-file")kind="conf"
+				if(key=="ca-file"||key=="resolv-file")if(substr(arg[2],1,1)!="/"){bad=1;next}
+				if(key=="resolv-file"&&arg[2]=="/tmp/resolv.conf.d/resolv.conf.auto")next
+				if(key=="cache-file"||key=="log-file"||key=="audit-file"||key=="dnsmasq-lease-file")kind="output"
+				print kind "\t" arg[2];next
+			}
 			if(key!~/^server/&&key!~/^bind/&&key!~/^group-/&&key!="conf-file"&&key!="conf_file")next
 			n=tokens(line);if(!n){bad=1;next}
 			if(user&& (key~/^server/||key=="group-begin"||key=="conf-file"||key=="conf_file")) {

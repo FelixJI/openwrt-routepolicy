@@ -258,10 +258,11 @@ exit_apply() {
 		for item in file link; do cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$stage/dns-resolver-$item-attempted" || return 1; done
 	fi
 	safe_dir "$stage/delta"
-	original=$WAL
+	original="$TX/current"
 	[ ! -L "$TX/previous" ] && [ ! -e "$TX/previous" ] || return 1
 	[ ! -e "$original" ] || mv "$original" "$TX/previous" || return 1
 	mv "$stage" "$original" && sync || return 1
+	WAL=$original
 	rollback_fields && exit_finish
 }
 active_publish() {
@@ -1014,6 +1015,14 @@ case "$operation" in
 		lock
 		case "$(read_phase)" in confirmed|prepared|expired|rolled_back|exited|absent) ;; *) fail '先完成或恢复当前事务，再退出' ;; esac
 		exit_record=$(rp_init_active_record) || fail '没有可验证的已确认旁路由接管'
+		if [ ! -e "$WAL" ]; then
+			# Confirmed identity supplies a private read namespace, never a synthetic current WAL.
+			exit_read_context=$(mktemp -d "$RP_RUN_DIR/exit-read.XXXXXX") || fail '不能创建退出只读命名空间'
+			trap 'rm -rf "$exit_read_context"' EXIT
+			trap 'exit 1' HUP INT TERM
+			cp "$exit_record/token" "$exit_read_context/token" || fail '不能读取已验证确认身份'
+			WAL=$exit_read_context
+		fi
 		uci_layout || fail '不能读取已提交的逐字段状态'
 		if [ "$operation" = exit-preview ]; then
 			exit_problems=$(exit_check "$exit_record"); exit_ok=$?

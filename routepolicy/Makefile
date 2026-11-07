@@ -45,6 +45,7 @@ define Package/routepolicy/install
 	$(INSTALL_BIN) ./files/etc/init.d/routepolicy-initguard $(1)/etc/init.d/routepolicy-initguard
 	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/95-routepolicy $(1)/etc/hotplug.d/iface/95-routepolicy
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/routepolicy $(1)/lib/upgrade/keep.d/routepolicy
+	$(INSTALL_DATA) ./files/lib/upgrade/routepolicy.sh $(1)/lib/upgrade/routepolicy.sh
 	$(INSTALL_BIN) ./files/usr/sbin/routepolicyctl $(1)/usr/sbin/routepolicyctl
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/apply $(1)/usr/libexec/routepolicy/apply
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/common $(1)/usr/libexec/routepolicy/common
@@ -56,6 +57,7 @@ define Package/routepolicy/install
 	$(INSTALL_DATA) ./files/usr/libexec/routepolicy/init-policy-runtime $(1)/usr/libexec/routepolicy/init-policy-runtime
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/init-topology $(1)/usr/libexec/routepolicy/init-topology
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/lifecycle $(1)/usr/libexec/routepolicy/lifecycle
+	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/firmware-backup $(1)/usr/libexec/routepolicy/firmware-backup
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/observe $(1)/usr/libexec/routepolicy/observe
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/render $(1)/usr/libexec/routepolicy/render
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/rollback $(1)/usr/libexec/routepolicy/rollback

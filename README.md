@@ -137,6 +137,8 @@ sysupgrade -b /tmp/before-firmware.tar.gz
 
 核对备份包含 `/etc/config/routepolicy`、人工清单、静态 `managed.d/current` 清单，以及 `state/init-transaction/active`、`source` 和 `confirmed/` 中完整的确认记录／累计退出原值。SmartDNS、network、dhcp、firewall 的原有未知字段由系统自己的配置备份保存。临时锁、未提交 WAL、applied 回执、warm 动态集合和官方 init／二进制不属于应用保留清单。恢复入口会重新建立 0700 目录和 0600 记录。
 
+备份会补入 SmartDNS 46.1 声明引用的静态文件，包括用户 `conf_files`、递归 `conf-file`、`hosts-file` 及域名／IP 集合文件。目录外的文件和符号链接目标须已在系统原清单中；缺项时按报错把具体路径加入 `/etc/sysupgrade.conf`，再重跑上面两条命令。只归档明确引用的文件，备份不会打包整个下载目录。通配符、续行、转义、缩写参数、`plugin` 和 `ca-path` 会阻止备份，须先把配置改为可核对的静态文件声明。缺少静态输入或清单纳入本应用运行态时，系统备份会报错退出。预检与归档期间暂停其他配置写入。
+
 把系统备份、portable 声明、上一个可用版本和待安装版本的两个 APK、依赖说明及已有发布校验材料复制到路由器之外，再按 OpenWrt 官方流程升级。普通 sysupgrade 和公共 ASU 不会自动保留本项目的自定义 APK。应用缺失期间没有分流规则与 strict 保护；SmartDNS 缺失时也可能没有 DNS，接入 DHCP 仍保持关闭。先保留带外管理与离线安装材料，避免依赖待恢复的 DNS 下载应用。
 
 升级完成后从控制台重新安装受支持的两个 APK 及依赖，再执行 `routepolicyctl init-repair --json`、`routepolicyctl diagnose --json` 和 `ubus call routepolicy status '{}'`。恢复根据声明重新检查当前接口、受管字段、依赖和内核对象，先建立策略规则再启动 DNS；旧启动的 applied 不能认领新内核的同名资源。缺失依赖、静态清单或所有权冲突会保留现场并报错，不能把空规则或陈旧回执当作 strict 成功。实际固件升级只在隔离环境验收，本命令不会代替管理员执行 sysupgrade。
@@ -153,8 +155,8 @@ parameters=$(cat "/etc/routepolicy/state/init-transaction/confirmed/$token/param
 set -f
 IFS="$(printf '\t')"
 set -- $parameters
-routepolicyctl init-preview "$@" --json
-routepolicyctl init-prepare "$@" --json
+routepolicyctl init-preview "$@"
+routepolicyctl init-prepare "$@"
 ```
 
 ### 在另一台设备导入
@@ -235,6 +237,8 @@ routepolicyctl exit-apply TOKEN
 ```
 
 退出只恢复有累计来源且仍符合预期的字段。旧版本多次初始化后缺少中间原值、外部编辑或未知子字段会在预览中列出并阻止猜测恢复；不会整份覆盖配置。成功退出后原用户上游和未知字段仍保留。
+
+固件恢复后，可直接使用已恢复的确认记录预览、准备和执行退出。预览和准备不会重建上一次启动的事务日志。
 
 确认默认网络和 DNS 可用后，再运行 `routepolicyctl package-preview --json`，用 `printf 'CONFIRM-REMOVE-ROUTEPOLICY\n' | routepolicyctl uninstall` 明确删除两个包。也可以明确选择保留接管配置后删除程序，但此时分流保护和应用管理都不可用，应安排重装或外部维护。
 

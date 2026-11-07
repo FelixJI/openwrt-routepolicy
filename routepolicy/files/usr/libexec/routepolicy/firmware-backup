@@ -1,0 +1,197 @@
+#!/bin/sh
+# OpenWrt 25.12 SmartDNS 46.1 declarations. stdout contains only the archive file list.
+# shellcheck disable=SC3043
+set -eu
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+. "$LIBEXEC/init-dns"
+[ "$#" = 0 ] || exit 2
+umask 077
+export LC_ALL=C
+
+fail() { rp_err "固件备份拒绝: $*"; exit 1; }
+needs_keep() { fail "$*；请在 /etc/sysupgrade.conf 明确列入缺失路径，再重试 sysupgrade -l/-b"; }
+
+rp_writer_enter lifecycle || fail '存在未完成事务或写入；先完成确认/恢复'
+work=$(mktemp -d "$RP_RUN_DIR/firmware.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+
+dd bs=1024 count=1025 of="$work/original" 2>/dev/null
+[ "$(wc -c <"$work/original")" -le 1048576 ] || fail '官方备份清单过大'
+LC_ALL=C awk 'length($0)>4095||$0!~/^\//||$0~/[[:cntrl:]]/{bad=1}END{exit bad}' "$work/original" || fail '官方清单路径不可安全解析'
+cp "$work/original" "$work/result"
+: >"$work/seen"
+: >"$work/outputs"
+TAB=$(printf '\t')
+
+covered() { grep -Fxq "$1" "$work/original"; }
+automatic() { case "$1" in /etc/smartdns/*) return 0 ;; *) return 1 ;; esac; }
+runtime_path() {
+	case "$1" in
+		/etc/smartdns/conf.d/90-routepolicy.conf|/etc/smartdns/smartdns.cache|/tmp/routepolicy/*|/var/routepolicy/*|/etc/routepolicy/state/applied|/etc/routepolicy/state/warm-*|/etc/routepolicy/managed.d/previous/*) return 0 ;;
+		/etc/routepolicy/state/init-transaction/active|/etc/routepolicy/state/init-transaction/source|/etc/routepolicy/state/init-transaction/confirmed/*) return 1 ;;
+		/etc/routepolicy/state/init-transaction/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+static_path() {
+	runtime_path "$1" && return 1
+	case "$1" in /tmp/*|/var/*|/run/*|/proc/*|/sys/*|/dev/*|/bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/libexec/*|/etc/init.d/*|/etc/rc.d/*) return 1 ;; esac
+	return 0
+}
+valid_path() {
+	printf '%s\n' "$1" | LC_ALL=C awk 'NR!=1||length($0)>4095||$0!~/^\//||$0~/[[:cntrl:]]/{bad=1}END{exit bad}'
+}
+
+resolve() {
+	local path=$1 kind=$2 pending part target rounds=0
+	pending=${path#/}
+	RESOLVED=
+	LINKS=
+	# Resolve each component before ".." so relative link targets use the kernel's base.
+	while [ -n "$pending" ]; do
+		[ "$kind" = output ] || [ -d "$RP_ROOT${RESOLVED:-/}" ] || fail "依赖目录不存在 $path"
+		part=${pending%%/*}
+		case "$pending" in */*) pending=${pending#*/} ;; *) pending= ;; esac
+		case "$part" in
+			''|.) continue ;;
+			..) RESOLVED=${RESOLVED%/*}; continue ;;
+		esac
+		RESOLVED="$RESOLVED/$part"
+		[ ! -L "$RP_ROOT$RESOLVED" ] || {
+			rounds=$((rounds+1))
+			[ "$rounds" -le 16 ] || fail "链接循环或过深 $path"
+			LINKS="$LINKS$RESOLVED
+"
+			target=$(readlink -n "$RP_ROOT$RESOLVED" && printf .) || fail "不能读取链接 $RESOLVED"
+			target=${target%.}
+			case "$target" in
+				/*) RESOLVED=; target=${target#/} ;;
+				*) RESOLVED=${RESOLVED%/*} ;;
+			esac
+			valid_path "/$target" || fail "不能安全解析链接 $path"
+			case "$target" in */) target="$target." ;; esac
+			pending="$target${pending:+/$pending}"
+		}
+	done
+	RESOLVED=${RESOLVED:-/}
+}
+
+collect() {
+	local kind=$1 requested=$2 base=$3 depth=$4 path canonical links link record ref child
+	[ "$depth" -lt 16 ] || fail "依赖递归过深 $requested"
+	[ -n "$requested" ] || fail "空文件依赖 $base"
+	case "$requested" in /*) path=$requested ;; *) path="${base%/}/$requested" ;; esac
+	valid_path "$path" || fail "非法依赖 $requested"
+	[ "${#path}" -lt 1024 ] || fail "路径超过 SmartDNS 46.1 长度限制 $path"
+	case "$path" in *'*'*|*'?'*|*'['*|*']'*|*\\*) fail "不支持依赖通配符或转义 $path，请使用明确文件" ;; esac
+	# The generated 90 include is rebuilt from the backed-up RoutePolicy declarations.
+	if [ "$kind:$path" = conf:/etc/smartdns/conf.d/90-routepolicy.conf ]; then
+		[ ! -L "$RP_ROOT$path" ] || fail "RoutePolicy 生成片段不能是链接 $path"
+		return 0
+	fi
+	resolve "$path" "$kind"
+	canonical=$RESOLVED; links=$LINKS
+	if [ "$kind" = output ]; then
+		printf '%s\n%s\n' "$path" "$canonical" >>"$work/outputs"
+		return 0
+	fi
+	static_path "$canonical" || fail "依赖指向运行态或程序 $path -> $canonical"
+	case "$path" in */) fail "静态输入不是普通文件 $path" ;; esac
+	[ -f "$RP_ROOT$canonical" ] || fail "静态输入或链接目标缺失或不是普通文件 $path -> $canonical"
+	if [ -n "$links" ]; then
+		covered "$canonical" || needs_keep "链接目标未在原官方清单 $path -> $canonical"
+		while IFS= read -r link; do
+			[ -n "$link" ] || continue
+			static_path "$link" || fail "链接位于运行态或程序路径 $link"
+			covered "$link" || automatic "$link" || needs_keep "外部链接未在原官方清单 $link"
+			printf '%s\n' "$link" >>"$work/result"
+		done <<EOF
+$links
+EOF
+	fi
+	automatic "$canonical" || covered "$canonical" || needs_keep "外部依赖未在原官方清单 $canonical (来自 $path)"
+	printf '%s\n' "$canonical" >>"$work/result"
+	# Native relative includes use the referring filename, even through a symlink.
+	record=$(printf '%s\t%s\t%s' "$kind" "${path%/*}" "$canonical")
+	if grep -Fxq "$record" "$work/seen"; then return 0; fi
+	printf '%s\n' "$record" >>"$work/seen"
+	[ "$(wc -l <"$work/seen")" -le 512 ] || fail '静态依赖超过 512 项'
+	[ "$kind" = conf ] || return 0
+	[ "$(wc -c <"$RP_ROOT$canonical")" -le 1048576 ] || fail "配置片段过大 $path"
+	init_dns_audit_lines 53 lo 0 1 <"$RP_ROOT$canonical" >"$work/deps.$depth" ||
+		fail "文件依赖语法无法可靠盘点 $path；请使用明确文件和完整参数。暂不支持 plugin、ca-path、续行或转义"
+	while IFS="$TAB" read -r ref child; do
+		collect "$ref" "$child" "${path%/*}" "$((depth+1))"
+	done <"$work/deps.$depth"
+}
+
+for package in smartdns dhcp; do
+	changes=$(uci -q changes "$package") || fail "不能读取 $package 暂存状态"
+	[ -z "$changes" ] || fail "先处理 $package 的 UCI 暂存变更"
+done
+init_dns_audit_uci_structure || fail 'SmartDNS 原生声明包含无法安全解析的字段'
+
+# The native init includes these package files independently of UCI list entries.
+for path in address.conf blacklist-ip.conf custom.conf domain-block.list domain-forwarding.list; do
+	path="/etc/smartdns/$path"
+	[ -e "$RP_ROOT$path" ] || [ -L "$RP_ROOT$path" ] || continue
+	case "$path" in *.conf) kind=conf ;; *) kind=data ;; esac
+	collect "$kind" "$path" / 0
+done
+# 91 is also a fixed keep.d declaration and may be enabled after recovery.
+path=/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf
+if [ -e "$RP_ROOT$path" ] || [ -L "$RP_ROOT$path" ]; then collect conf "$path" / 0; fi
+
+uci -q export smartdns >"$work/uci" || fail '不能读取 SmartDNS 声明'
+uci -q show smartdns >"$work/shown" || fail '不能枚举 SmartDNS 段'
+sed -n 's/^smartdns\.\([^.=]*\)=\([^=]*\)$/\1 \2/p' "$work/shown" >"$work/sections"
+while read -r section type; do
+	case "$type" in
+		smartdns) options='conf_files hosts_files bind_cert bind_cert_key cache_file log_file audit_log_file' ;;
+		client-rule) options='conf_files client_addr_file block_domain_set_file' ;;
+		domain-rule) options='forwarding_domain_set_file block_domain_set_file' ;;
+		domain-rule-list) options=domain_list_file ;;
+		ip-rule|ip-rule-list) options=ip_set_file ;;
+		*) continue ;;
+	esac
+	for option in $options; do
+		if ! data=$(rp_uci_field_data "$section" "$option" <"$work/uci"); then
+			if uci -q get "smartdns.$section.$option" >/dev/null 2>&1; then fail "路径声明不可解析 smartdns.$section.$option"; fi
+			continue
+		fi
+		field_type=${data%%"$TAB"*}; data=${data#*"$TAB"}
+		[ -n "$data" ] || continue
+		case "$option:$field_type" in
+			conf_files:list) kind=conf; base=/etc/smartdns/conf.d ;;
+			hosts_files:list) kind=data; base=/etc/smartdns/download ;;
+			cache_file:scalar|log_file:scalar|audit_log_file:scalar) kind=output; base=/var/etc/smartdns ;;
+			conf_files:*|hosts_files:*|*:list) fail "不支持的路径字段类型 smartdns.$section.$option" ;;
+			*) kind=data; base=/var/etc/smartdns ;;
+		esac
+		printf '%s\n' "$data" | tr '|' '\n' >"$work/uci-paths"
+		while IFS= read -r path; do
+			case "$path" in *"'"*|*'"'*|*\\*) fail "路径包含引号或转义 smartdns.$section.$option" ;; esac
+			case "$option:$path" in bind_cert*:*' '*|cache_file:*' '*|log_file:*' '*|audit_log_file:*' '*) fail "路径包含未引用的空格 smartdns.$section.$option" ;; esac
+			collect "$kind" "$path" "$base" 0
+		done <"$work/uci-paths"
+	done
+done <"$work/sections"
+
+# The system regenerates standard resolver and lease files. Custom resolvers are inputs.
+resolver=$(uci -q get 'dhcp.@dnsmasq[0].resolvfile') || resolver=
+case "$resolver" in
+	''|/tmp/resolv.conf.d/resolv.conf.auto) ;;
+	/*) collect data "$resolver" / 0 ;;
+	*) fail 'dhcp.@dnsmasq[0].resolvfile 必须是明确的绝对路径' ;;
+esac
+lease=$(uci -q get 'dhcp.@dnsmasq[0].leasefile') || lease=
+collect output "${lease:-/tmp/dhcp.leases}" /var/etc/smartdns 0
+
+while IFS= read -r path; do
+	if runtime_path "$path" || grep -Fxq "$path" "$work/outputs"; then
+		fail "备份清单包含受管运行态或 SmartDNS 输出 $path，请调整备份范围"
+	fi
+done <"$work/result"
+LC_ALL=C sort -u "$work/result"

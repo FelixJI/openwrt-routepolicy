@@ -632,6 +632,35 @@ if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
 	printf '%s\n' 'source-free restore: passed (empty published snapshot; failure restores current/previous and unknown files)'
 	exit 0
 fi
+if [ "${1:-}" = --exit-archive ]; then
+	for archive_case in sameboot reboot conflict; do
+		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+		txroot="$RP_STATE_DIR/init-transaction"
+		rm -rf "$txroot/current"
+		if [ "$archive_case" = reboot ]; then test_boot; "$TX" recover-early >/dev/null; "$TX" boot-dns >/dev/null; fi
+		origin="$txroot/confirmed/$(cat "$txroot/active")/origin"
+		cp -R "$origin" "$tmp/origin-$archive_case"
+		"$TX" exit-preview >"$tmp/archive-preview"; [ ! -e "$txroot/current" ]
+		output=$("$TX" exit-prepare); [ ! -e "$txroot/current" ]
+		exit_token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+		if [ "$archive_case" = conflict ]; then
+			uci set smartdns.rp_init_default_1.user_note=KEEP; uci commit smartdns
+			cp "$RP_SMARTDNS_UCI" "$tmp/archive-conflict.before"
+			if "$TX" exit-apply "$exit_token" >"$tmp/archive-conflict" 2>&1; then printf 'archive exit overwrote unknown child\n' >&2; exit 1; fi
+			cmp "$RP_SMARTDNS_UCI" "$tmp/archive-conflict.before"
+			[ ! -e "$txroot/current" ] && [ -f "$txroot/active" ]
+			diff -r "$origin" "$tmp/origin-$archive_case"
+			continue
+		fi
+		"$TX" exit-apply "$exit_token" >"$tmp/archive-exit"
+		[ "$(cat "$txroot/current/phase")" = exited ] && [ "$(cat "$txroot/current/kind")" = exit ]
+		[ ! -e "$txroot/active" ]; [ ! -f "$tmp/policy-running" ]
+		[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 11 ]
+		diff -r "$origin" "$tmp/origin-$archive_case"
+	done
+	printf '%s\n' 'confirmed-only exit: passed (no current, same/new boot, preview/prepare create no current, real exit, unknown child preserved)'
+	exit 0
+fi
 if [ "${1:-}" = --exit-stage ]; then
 	TEST_EXIT_CP=$(command -v cp); export TEST_EXIT_CP
 	cat >"$tmp/bin/cp" <<'SH'
