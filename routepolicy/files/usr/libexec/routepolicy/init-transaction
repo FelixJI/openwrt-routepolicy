@@ -533,8 +533,8 @@ snapshot() {
 	done <"$1"
 }
 preview_json() {
-	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":120,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
-		"$operation" "$(rp_json_escape "$1")"
+	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":%s,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
+		"$operation" "$(rp_json_escape "$1")" "$RP_INIT_WINDOW_SECONDS"
 	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
 	printf ',"maintenance_notice":"初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙、SmartDNS 或 RoutePolicy 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。"'
 	printf ',"link_preparation":"%s"' "$(rp_json_escape "${link_preview:-required\t0}")"
@@ -621,11 +621,9 @@ wait_new_dhcp() {
 		[ "$(uci_committed get "network.$dhcp_interface.device")" = "$a5" ] || return 1
 	printf '%s\n' dhcp-readiness >"$WAL/stage" && sync || return 1
 	while :; do
-		pending_recovery_due && break
-		dhcp_wait_now=$(monotonic_now) || break
-		dhcp_started=$(cat "$WAL/uptime-start-cs") || break
+		transaction_same_boot && dhcp_remaining=$(rp_init_remaining_cs "$WAL") || break
 		# Spend the existing window, leaving 20 seconds for management confirmation.
-		[ "$dhcp_wait_now" -lt "$((dhcp_started + 10000))" ] || break
+		[ "$dhcp_remaining" -gt "$((RP_INIT_CONFIRM_RESERVE_SECONDS * 100))" ] || break
 		link_identity_matches || break
 		if new_dhcp_probe; then return 0; else dhcp_result=$?; fi
 		if [ "$dhcp_result" != 75 ]; then
@@ -669,16 +667,14 @@ policy_sync() {
 	policy_timeout=30
 	if [ "$policy_mode" != restore ]; then
 		[ "$policy_required" = 0 ] || policy_runtime_present || return 1
-		! pending_recovery_due || return 1
-		policy_now=$(monotonic_now) || return 1
-		policy_started=$(cat "$WAL/uptime-start-cs") || return 1
-		policy_remaining=$(( (policy_started + 12000 - policy_now) / 100 ))
-		case "$a4:$a6" in default:dhcp|policy:dhcp) policy_remaining=$((policy_remaining - 20)) ;; esac
+		transaction_same_boot && policy_remaining=$(rp_init_remaining_cs "$WAL") || return 1
+		policy_remaining=$((policy_remaining / 100))
+		case "$a4:$a6" in default:dhcp|policy:dhcp) policy_remaining=$((policy_remaining - RP_INIT_CONFIRM_RESERVE_SECONDS)) ;; esac
 		[ "$policy_remaining" -gt 0 ] || return 1
 		[ "$policy_remaining" -ge "$policy_timeout" ] || policy_timeout=$policy_remaining
 	fi
-	policy_wait_started=$(monotonic_now) || return 1
-	policy_wait_now=$(monotonic_now) || return 1
+	policy_wait_started=$(rp_init_now_cs) || return 1
+	policy_wait_now=$(rp_init_now_cs) || return 1
 	policy_timeout=$((policy_timeout - (policy_wait_now - policy_wait_started + 99) / 100))
 	[ "$policy_timeout" -gt 0 ] || return 1
 	printf '%s\n' policy-runtime >"$WAL/stage" && sync || return 1
@@ -876,32 +872,18 @@ recover_locked() {
 	esac
 }
 transaction_same_boot() {
+	[ -f "$WAL/boot-id" ] && [ ! -L "$WAL/boot-id" ] || return 1
 	transaction_boot=$(cat "$WAL/boot-id" 2>/dev/null) || return 1
 	running_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
 	[ -n "$transaction_boot" ] && [ -n "$running_boot" ] && [ "$transaction_boot" = "$running_boot" ]
 }
-monotonic_now() {
-	# /proc/uptime supplies boot-scoped centiseconds, unaffected by wall-clock correction.
-	LC_ALL=C awk '
-		NR!=1 || NF!=2 || $1 !~ /^[0-9]+\.[0-9][0-9]$/ || $1>=10000000000 {exit 1}
-		{printf "%.0f\n", $1*100}
-		END {if(NR!=1) exit 1}
-	' "$RP_ROOT/proc/uptime"
-}
 pending_recovery_due() {
-	transaction_same_boot || return 0
-	# Legacy or invalid timing evidence is due immediately; never fall back to epoch time.
-	pending_started=$(cat "$WAL/uptime-start-cs" 2>/dev/null) || return 0
-	case "$pending_started" in 0[0-9]*) return 0 ;; esac
-	rp_uint_between "$pending_started" 0 999999999999 || return 0
-	pending_now=$(monotonic_now) || return 0
-	[ "$pending_now" -ge "$pending_started" ] || return 0
-	[ "$pending_now" -ge "$((pending_started + 12000))" ]
+	# Missing or invalid monotonic evidence is due immediately.
+	! { transaction_same_boot && rp_init_window_open "$WAL"; }
 }
 pending_confirmation_ready() {
-	! pending_recovery_due || return 1
-	confirmation_now=$(monotonic_now) && confirmation_started=$(cat "$WAL/uptime-start-cs") || return 1
-	[ "$confirmation_now" -le "$((confirmation_started + 10000))" ]
+	transaction_same_boot && confirmation_remaining=$(rp_init_remaining_cs "$WAL") &&
+		[ "$confirmation_remaining" -ge "$((RP_INIT_CONFIRM_RESERVE_SECONDS * 100))" ]
 }
 recover_auto_locked() {
 	# The guard's earlier observation is advisory; only this locked state permits rollback.
@@ -1139,9 +1121,14 @@ case "$operation" in
 			esac
 		done <"$WAL/candidate"
 		wall_started=$(date +%s) && rp_uint_between "$wall_started" 0 9999999999 || fail '不能读取确认期限的墙钟时间'
-		uptime_started=$(monotonic_now) || fail '不能读取启动单调时钟'
-		# Keep the public epoch deadline; enforce the 120-second window using uptime only.
-		printf '%s\n' "$count" >"$WAL/count" && printf '%s\n' "$((wall_started + 120))" >"$WAL/deadline" &&
+		uptime_started=$(rp_init_now_cs) || fail '不能读取启动单调时钟'
+		for timing in deadline uptime-start-cs boot-id; do
+			[ ! -L "$WAL/$timing" ] || fail '确认期限记录不能是符号链接'
+		done
+		rp_init_window_seconds "$WAL" >/dev/null || fail '确认窗口记录非法'
+		# Publish the duration with the existing clock evidence before phase applying.
+		printf '%s\n' "$RP_INIT_WINDOW_SECONDS" >"$WAL/window-seconds" &&
+			printf '%s\n' "$count" >"$WAL/count" && printf '%s\n' "$((wall_started + RP_INIT_WINDOW_SECONDS))" >"$WAL/deadline" &&
 			printf '%s\n' "$uptime_started" >"$WAL/uptime-start-cs" || fail '不能保存WAL计数和确认期限'
 		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$WAL/boot-id" || fail '无法记录事务启动身份'
 		[ -s "$WAL/boot-id" ] || fail '事务启动身份缺失'
@@ -1189,10 +1176,9 @@ case "$operation" in
 				printf '%s\n' "$(cat "$WAL/token")" >"$WAL/source-bootstrap" && sync || failed_stage='source-bootstrap-intent'
 				[ -n "$failed_stage" ] || { policy_sync bootstrap && init_dns_coordinate start || failed_stage='source-bootstrap'; }
 				# Bootstrap and DNS startup consume the same original monotonic window.
-				source_now=0; source_started=0; source_remaining=0
 				if [ -z "$failed_stage" ]; then
-					if rp_init_window_open "$WAL" && source_now=$(monotonic_now) && source_started=$(cat "$WAL/uptime-start-cs"); then
-						source_remaining=$(( (source_started + 12000 - source_now) / 100 - 10 ))
+					if transaction_same_boot && source_remaining=$(rp_init_remaining_cs "$WAL"); then
+						source_remaining=$((source_remaining / 100 - 10))
 						[ "$source_remaining" -gt 0 ] || failed_stage='source-timeout'
 					else failed_stage='source-timeout'; fi
 				fi

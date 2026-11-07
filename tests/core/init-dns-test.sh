@@ -792,11 +792,11 @@ EOF
 		case "$source_case" in download-failure) : >"$tmp/source-download-fail" ;; later-policy-failure) : >"$tmp/policy-fail-once" ;; esac
 		case "$source_case" in
 			budget-success|expired-dns|expired-download)
-				printf '120.00 0.00\n' >"$tmp/source-bootstrap-clock"; printf '130.00 0.00\n' >"$tmp/source-dns-clock" ;;
-			expired-bootstrap) printf '221.00 0.00\n' >"$tmp/source-bootstrap-clock" ;;
-			slow-download-timeout) printf '209.00 0.00\n' >"$tmp/source-bootstrap-clock"; : >"$tmp/source-download-slow" ;;
+				printf '170.00 0.00\n' >"$tmp/source-bootstrap-clock"; printf '230.00 0.00\n' >"$tmp/source-dns-clock" ;;
+			expired-bootstrap) printf '281.00 0.00\n' >"$tmp/source-bootstrap-clock" ;;
+			slow-download-timeout) printf '269.00 0.00\n' >"$tmp/source-bootstrap-clock"; : >"$tmp/source-download-slow" ;;
 		esac
-		case "$source_case" in expired-dns) printf '221.00 0.00\n' >"$tmp/source-dns-clock" ;; expired-download) printf '221.00 0.00\n' >"$tmp/source-download-clock" ;; esac
+		case "$source_case" in expired-dns) printf '281.00 0.00\n' >"$tmp/source-dns-clock" ;; expired-download) printf '281.00 0.00\n' >"$tmp/source-download-clock" ;; esac
 		if [ "$source_case" = success ] || [ "$source_case" = budget-success ]; then
 			confirm_dns
 			grep -Fxq new.example "$tmp/root/etc/routepolicy/managed.d/current/feed.domain-policy.list"
@@ -820,7 +820,7 @@ EOF
 			*) grep -Fq -- '--interface if!eth2' "$tmp/source-curl" ;;
 		esac
 		case "$source_case" in
-			budget-success|expired-download) grep -Fq -- '-s KILL 80 ' "$tmp/source-budget" || { cat "$tmp/source-budget"; printf 'bootstrap/DNS time was not deducted\n' >&2; exit 1; } ;;
+			budget-success|expired-download) grep -Fq -- '-s KILL 40 ' "$tmp/source-budget" || { cat "$tmp/source-budget"; printf 'bootstrap/DNS time was not deducted\n' >&2; exit 1; } ;;
 			slow-download-timeout) grep -Fq -- '-s KILL 1 ' "$tmp/source-budget" || { cat "$tmp/source-budget"; printf 'slow download exceeded remaining budget\n' >&2; exit 1; } ;;
 		esac
 	done

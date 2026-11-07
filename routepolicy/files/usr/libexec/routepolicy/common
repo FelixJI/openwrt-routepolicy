@@ -29,6 +29,8 @@ RP_TABLE_FAMILY=inet
 RP_TABLE_NAME=routepolicy
 RP_SCHEMA_VERSION=1
 RP_CONFIG_SCHEMA=1
+RP_INIT_WINDOW_SECONDS=180
+RP_INIT_CONFIRM_RESERVE_SECONDS=20
 
 rp_err() { printf '%s\n' "routepolicy: $*" >&2; }
 rp_die() { rp_err "$*"; exit 1; }
@@ -566,13 +568,38 @@ rp_config_admit() {
 	case "$rp_config_version" in 0|1) return 0 ;; *) rp_err '不支持配置 schema；拒绝执行或降级解释'; return 1 ;; esac
 }
 
+rp_init_now_cs() {
+	# /proc/uptime supplies boot-scoped centiseconds, independent of wall time.
+	LC_ALL=C awk '
+		NR!=1 || NF!=2 || $1 !~ /^[0-9]+\.[0-9][0-9]$/ || $1>=10000000000 {exit 1}
+		{printf "%.0f\n", $1*100}
+		END {if(NR!=1) exit 1}
+	' "$RP_ROOT/proc/uptime"
+}
+rp_init_window_seconds() {
+	# Transactions written before the window marker retain their 120 seconds.
+	if [ ! -e "$1/window-seconds" ] && [ ! -L "$1/window-seconds" ]; then
+		printf '%s\n' 120
+		return 0
+	fi
+	[ -f "$1/window-seconds" ] && [ ! -L "$1/window-seconds" ] &&
+		printf '%s\n' "$RP_INIT_WINDOW_SECONDS" | cmp -s - "$1/window-seconds" || return 1
+	printf '%s\n' "$RP_INIT_WINDOW_SECONDS"
+}
+# shellcheck disable=SC3043
+rp_init_remaining_cs() {
+	local started extra now window
+	[ -f "$1/uptime-start-cs" ] && [ ! -L "$1/uptime-start-cs" ] || return 1
+	{ IFS= read -r started && ! IFS= read -r extra && [ -z "$extra" ]; } <"$1/uptime-start-cs" || return 1
+	case "$started" in 0[0-9]*) return 1 ;; esac
+	rp_uint_between "$started" 0 999999999999 || return 1
+	window=$(rp_init_window_seconds "$1") && now=$(rp_init_now_cs) && [ "$now" -ge "$started" ] || return 1
+	printf '%s\n' "$((started + window * 100 - now))"
+}
 # shellcheck disable=SC3043
 rp_init_window_open() {
-	local started now
-	[ -f "$1/uptime-start-cs" ] && [ ! -L "$1/uptime-start-cs" ] || return 1
-	started=$(cat "$1/uptime-start-cs") && rp_uint_between "$started" 0 999999999999 || return 1
-	now=$(LC_ALL=C awk 'NR==1&&NF==2&&$1~/^[0-9]+\.[0-9][0-9]$/{printf "%.0f",$1*100;ok=1}END{exit !ok}' "$RP_ROOT/proc/uptime") || return 1
-	[ "$now" -ge "$started" ] && [ "$now" -lt "$((started+12000))" ]
+	local remaining
+	remaining=$(rp_init_remaining_cs "$1") && [ "$remaining" -gt 0 ]
 }
 
 rp_utf8_text() {
