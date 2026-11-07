@@ -188,7 +188,9 @@ case "$2:${3:-}" in
 		[ ! -f "$TEST_DNS_TMP/list-fail" ] || exit 1
 		if [ "$service" = smartdns ] && [ -f "$TEST_DNS_TMP/svc/smartdns.absent" ]; then printf '{}\n'; exit 0; fi
 		running=false; [ "$(cat "$TEST_DNS_TMP/svc/$service.running")" != 1 ] || running=true
-		printf '{"%s":{"instances":{"main":{"running":%s}}}}\n' "$service" "$running" ;;
+		pid=
+		if [ "$service:$running" = smartdns:true ]; then pid=$(printf ',"pid":%s' "$(cat "$TEST_DNS_TMP/svc/smartdns.pid")"); fi
+		printf '{"%s":{"instances":{"main":{"running":%s%s}}}}\n' "$service" "$running" "$pid" ;;
 	service:delete)
 		case "${4:-}" in *routepolicy-initguard*) exit 0 ;; esac
 		[ ! -f "$TEST_DNS_TMP/delete-fail" ] || exit 1
@@ -315,6 +317,7 @@ cat >"$tmp/root/etc/init.d/smartdns" <<'EOF'
 #!/bin/sh
 set -eu
 service=smartdns
+svc="$TEST_DNS_TMP/svc"
 printf '%s %s\n' "$service" "$1" >>"$TEST_DNS_TMP/service-log"
 case "$1" in
 	enabled) [ "$(cat "$TEST_DNS_TMP/svc/$service.enabled")" = 1 ]; exit ;;
@@ -324,6 +327,12 @@ case "$1" in
 	start|reload|restart) ;;
 	*) exit 1 ;;
 esac
+if [ "$1" = reload ] && [ -f "$svc/publication-attempted" ]; then
+	case "$(cat "$svc/compensation-fault")" in
+		reload-error) exit 1 ;;
+		reload-stale) exit 0 ;;
+	esac
+fi
 if [ "$1" = restart ]; then
 	. "$TEST_DNS_TMP/native-forward"
 	config_get() { value=$(uci -q get "smartdns.$2.$3" || printf '%s' "${4:-}"); export "$1=$value"; }
@@ -366,6 +375,15 @@ mkdir -p "$ROUTEPOLICY_ROOT/var/etc/smartdns"
 	case " $(uci -q get 'smartdns.@smartdns[0].conf_files') " in *' /etc/smartdns/conf.d/90-routepolicy.conf '*) printf "conf-file '/etc/smartdns/conf.d/90-routepolicy.conf'\n" ;; esac
 	printf "conf-file '/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n"
 } >"$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
+# procd start/set retains the process if its tracked main config is unchanged.
+generated="$ROUTEPOLICY_ROOT/var/etc/smartdns/smartdns.conf"
+if [ "$1" != start ] || [ ! -f "$svc/compensation-fault" ] || ! cmp -s "$generated" "$svc/live-main"; then
+	printf '%s' "$(($(cat "$svc/smartdns.pid") + 1))" >"$svc/smartdns.pid"
+	if [ -f "$svc/compensation-fault" ]; then
+		cp "$generated" "$svc/live-main"
+		cp "$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/90-routepolicy.conf" "$svc/live90"
+	fi
+fi
 if [ -f "$TEST_DNS_TMP/source-dns-clock" ]; then
 	cat "$TEST_DNS_TMP/source-dns-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"; rm "$TEST_DNS_TMP/source-dns-clock"
 fi
@@ -447,6 +465,7 @@ baseline() {
 	for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.before"; done
 	printf 0 >"$tmp/svc/routepolicy.enabled"; printf 0 >"$tmp/svc/routepolicy.running"
 	printf '%s' "$1" >"$tmp/svc/smartdns.enabled"; printf '%s' "$2" >"$tmp/svc/smartdns.running"
+	printf 100 >"$tmp/svc/smartdns.pid"
 	printf '%s' "$3" >"$tmp/svc/dnsmasq.enabled"; printf '%s' "$4" >"$tmp/svc/dnsmasq.running"
 	printf 6053 >"$tmp/svc/smartdns.port"; printf 53 >"$tmp/svc/dnsmasq.port"
 }
@@ -505,6 +524,10 @@ SH
 #!/bin/sh
 for target do :; done
 if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied" ] && [ -f "$TEST_DNS_TMP/fail-managed-receipt" ]; then
+	if [ -f "$TEST_DNS_TMP/svc/compensation-fault" ]; then
+		cp "$TEST_DNS_TMP/svc/live90" "$TEST_DNS_TMP/svc/publication-attempted"
+		cp "$TEST_DNS_TMP/svc/live-main" "$TEST_DNS_TMP/svc/publication-main"
+	fi
 	rm "$TEST_DNS_TMP/fail-managed-receipt"; exit 1
 fi
 if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied" ] && [ -f "$TEST_DNS_TMP/fail-managed-restore" ] &&
@@ -517,7 +540,7 @@ if [ "$target" = "$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/90-routepolicy.conf" ] &
 fi
 SH
 	chmod +x "$tmp/bin/mv"
-	for managed_case in immediate legacy-shape publish-fail publish-sync rollback-fail receipt-conflict file-conflict interrupted preboot preforeign premissing preoversize external77 oldboot duplicate badtuple bootstrap foreign90 real91 continuation proof-read-error; do
+	for managed_case in immediate legacy-shape publish-fail reload-error reload-stale publish-stopped publish-sync rollback-fail receipt-conflict file-conflict interrupted preboot preforeign premissing preoversize external77 oldboot duplicate badtuple bootstrap foreign90 real91 continuation proof-read-error; do
 		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
 		active=$(rp_init_active_record)
 		cp -R "$active/origin" "$tmp/managed-origin-$managed_case"
@@ -525,7 +548,16 @@ SH
 		cp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
 		cp "$RP_SMARTDNS_FILE" "$tmp/managed90.before"
 		case "$managed_case" in
-			publish-fail) : >"$tmp/fail-managed-receipt" ;;
+			publish-fail|reload-error|reload-stale|publish-stopped)
+				printf '%s\n' "$managed_case" >"$tmp/svc/compensation-fault"
+				: >"$tmp/fail-managed-receipt"
+				cp "$RP_SMARTDNS_GENERATED" "$tmp/managed-main.before"
+				cp "$tmp/managed-main.before" "$tmp/svc/live-main"
+				cp "$tmp/managed90.before" "$tmp/svc/live90"
+				if [ "$managed_case" = publish-stopped ]; then
+					"$tmp/root/etc/init.d/smartdns" stop
+					rm -f "$tmp/svc/live-main"
+				fi ;;
 			publish-sync) : >"$tmp/fail-managed-sync" ;;
 			rollback-fail) : >"$tmp/fail-managed-sync"; : >"$tmp/fail-managed-restore" ;;
 			receipt-conflict) : >"$tmp/change-managed-receipt" ;;
@@ -535,6 +567,30 @@ SH
 			preforeign) printf 'address /foreign.test/203.0.114.99\n' >>"$RP_SMARTDNS_FILE" ;;
 			premissing) rm "$RP_STATE_DIR/applied" ;;
 			preoversize) dd if=/dev/zero bs=2097153 count=1 >"$RP_STATE_DIR/applied" 2>/dev/null ;;
+		esac
+		case "$managed_case" in publish-fail|reload-error|reload-stale|publish-stopped)
+			if "$tmp/lib/smartdns-control" apply >"$tmp/managed-failed" 2>&1; then printf 'receipt failure succeeded\n' >&2; exit 1; fi
+			cmp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
+			cmp "$RP_SMARTDNS_FILE" "$tmp/managed90.before"
+			cmp "$RP_SMARTDNS_GENERATED" "$tmp/managed-main.before"
+			cmp "$tmp/svc/publication-main" "$tmp/managed-main.before"
+			grep -Fxq 'address /firmware-local.lab19.test/203.0.114.30' "$tmp/svc/publication-attempted"
+			[ -f "$RP_SMARTDNS_CANDIDATE" ] && [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]
+			case "$managed_case" in
+				publish-fail)
+					cmp "$tmp/svc/live90" "$tmp/managed90.before" || { printf '运行中的 SmartDNS 仍使用候选片段\n' >&2; exit 1; }
+					grep -Fq '已恢复应用前配置' "$tmp/managed-failed"
+					"$TX" exit-preview >/dev/null ;;
+				publish-stopped)
+					[ "$(cat "$tmp/svc/smartdns.running")" = 0 ]
+					grep -Fq '已恢复应用前配置' "$tmp/managed-failed" ;;
+				*)
+					cmp "$tmp/svc/live90" "$tmp/svc/publication-attempted"
+					grep -Fq '补偿未完整完成' "$tmp/managed-failed"
+					! grep -Fq '已恢复应用前配置' "$tmp/managed-failed" ;;
+			esac
+			diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+			continue ;;
 		esac
 		case "$managed_case" in preboot|preforeign|premissing|preoversize)
 			cp "$RP_SMARTDNS_UCI" "$tmp/pre-managed.uci"
@@ -557,7 +613,7 @@ SH
 			diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
 			continue ;;
 		esac
-		if [ "$managed_case" = publish-fail ] || [ "$managed_case" = publish-sync ] || [ "$managed_case" = interrupted ]; then
+		if [ "$managed_case" = publish-sync ] || [ "$managed_case" = interrupted ]; then
 			if "$tmp/lib/smartdns-control" apply >"$tmp/managed-failed" 2>&1; then printf 'managed failure succeeded\n' >&2; exit 1; fi
 			cmp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
 			[ -f "$RP_SMARTDNS_CANDIDATE" ] && [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]

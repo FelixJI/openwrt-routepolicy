@@ -1,4 +1,6 @@
 #!/bin/sh
+# OpenWrt ash supports local variables.
+# shellcheck disable=SC3043
 
 set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
@@ -444,6 +446,49 @@ fragment_registration() {
 	[ "$wanted" = 0 ] || printf "add_list smartdns.%s.conf_files='%s'\n" "$root" "$fragment" >>"$work/uci.batch"
 }
 
+smartdns_running_pid() {
+	local services running pid
+	services=$(rp_native_run 3 ubus call service list '{"name":"smartdns"}' 2>/dev/null) || return 1
+	case "$services" in \{*\}) ;; *) return 1 ;; esac
+	printf '%s\n' "$services" | jsonfilter -e '@' >/dev/null || return 1
+	running=$(printf '%s\n' "$services" | jsonfilter -e '@.smartdns.instances.*.running') || running=
+	case "$running" in
+		''|false) printf 0 ;;
+		true)
+			pid=$(printf '%s\n' "$services" | jsonfilter -e '@.smartdns.instances[@.running=true].pid') || return 1
+			rp_is_uint "$pid" && [ "$pid" -gt 0 ] 2>/dev/null || return 1
+			printf '%s' "$pid" ;;
+		*) return 1 ;;
+	esac
+}
+
+smartdns_loaded_fragments() {
+	local path
+	[ -f "$RP_SMARTDNS_GENERATED" ] && [ ! -L "$RP_SMARTDNS_GENERATED" ] && [ -r "$RP_SMARTDNS_GENERATED" ] || return 1
+	for path in "$RP_SMARTDNS_FILE" "$RP_SMARTDNS_EXTRA_FILE"; do
+		if rp_smartdns_fragment_loaded "$path"; then printf 1; else printf 0; fi
+	done
+}
+
+restore_smartdns_service() {
+	local current_pid restored_pid remaining=5
+	if [ "$service_pid_before" = 0 ]; then
+		rp_native_service smartdns stop && [ "$(smartdns_running_pid)" = 0 ]
+		return
+	fi
+	[ "$restore_failed" = 0 ] || return 1
+	current_pid=$(smartdns_running_pid) || return 1
+	# Native reload replaces the instance even when the main config has not changed.
+	rp_native_service smartdns reload || return 1
+	while :; do
+		restored_pid=$(smartdns_running_pid) || return 1
+		if [ "$restored_pid" != 0 ] && [ "$restored_pid" != "$current_pid" ] && [ "$restored_pid" != "$service_pid_before" ]; then break; fi
+		[ "$remaining" -gt 0 ] || return 1
+		sleep 1; remaining=$((remaining - 1))
+	done
+	[ "$(smartdns_loaded_fragments)" = "$fragments_before" ]
+}
+
 smartdns_apply() {
 	validate_candidate "$RP_SMARTDNS_CANDIDATE" || { rp_output_error smartdns-apply 'SmartDNS 候选校验失败'; return 1; }
 	baseline_unchanged || { rp_output_error smartdns-apply 'SmartDNS 配置已被外部修改，请刷新'; return 1; }
@@ -458,9 +503,12 @@ smartdns_apply() {
 	snapshot_file "$RP_SMARTDNS_FILE" "$work/90.previous" || { rp_output_error smartdns-apply '90 片段不是安全普通文件'; return 1; }
 	snapshot_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous" || { rp_output_error smartdns-apply '91 片段不是安全普通文件'; return 1; }
 	snapshot_file "$RP_LOCAL_HOSTS" "$work/hosts.previous" || { rp_output_error smartdns-apply '本地主机文件不是安全普通文件'; return 1; }
-	service_was_running=0
-	if rp_have ubus; then
-		ubus call service list '{"name":"smartdns"}' 2>/dev/null | jsonfilter -e '@.smartdns.instances.*.running' 2>/dev/null | grep -Eq '^(true|1)$' && service_was_running=1
+	service_pid_before='' fragments_before=''
+	if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
+		service_pid_before=$(smartdns_running_pid) || { rp_output_error smartdns-apply '无法核对应用前 SmartDNS 运行状态'; return 1; }
+		if [ "$service_pid_before" != 0 ]; then
+			fragments_before=$(smartdns_loaded_fragments) || { rp_output_error smartdns-apply '无法核对应用前 SmartDNS 生成配置'; return 1; }
+		fi
 	fi
 	roots=$(rp_smartdns_root_sections); root=$(printf '%s\n' "$roots" | sed -n '1p')
 	if [ -z "$root" ]; then root=main; printf 'set smartdns.%s=smartdns\n' "$root" >"$work/uci.batch"; else : >"$work/uci.batch"; fi
@@ -522,9 +570,9 @@ smartdns_apply() {
 	fi
 	enabled=$(candidate_value enabled "$RP_SMARTDNS_CANDIDATE")
 	[ -n "$enabled" ] || enabled=$(rp_uci_config_get smartdns "$root" enabled 1)
-	if [ -z "$failed" ] && [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
+	if [ -z "$failed" ] && [ -n "$service_pid_before" ]; then
 		if [ "$enabled" = 0 ]; then rp_native_service smartdns stop >"$work/service.log" 2>&1 || failed='停止 SmartDNS 失败';
-		elif [ "$service_was_running" = 1 ]; then rp_native_service smartdns reload >"$work/service.log" 2>&1 || failed='重载 SmartDNS 失败';
+		elif [ "$service_pid_before" != 0 ]; then rp_native_service smartdns reload >"$work/service.log" 2>&1 || failed='重载 SmartDNS 失败';
 		else rp_native_service smartdns start >"$work/service.log" 2>&1 || failed='启动 SmartDNS 失败'; fi
 	fi
 	if [ -z "$failed" ] && [ "$enabled" != 0 ]; then
@@ -565,12 +613,11 @@ smartdns_apply() {
 		restore_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous" "$work/91.candidate" || restore_failed=1
 		hosts_expected="$work/hosts.previous"; [ ! -f "$work/hosts.candidate" ] || hosts_expected="$work/hosts.candidate"
 		restore_file "$RP_LOCAL_HOSTS" "$work/hosts.previous" "$hosts_expected" || restore_failed=1
+		if [ -n "$service_pid_before" ]; then
+			restore_smartdns_service >/dev/null 2>&1 || restore_failed=1
+		fi
 		if [ "$receipt_required" = 1 ]; then
 			restore_file "$RP_STATE_DIR/applied" "$work/applied.previous" "$work/applied.candidate" || restore_failed=1
-		fi
-		if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
-			if [ "$service_was_running" = 1 ]; then rp_native_service smartdns start >/dev/null 2>&1 || restore_failed=1
-			else rp_native_service smartdns stop >/dev/null 2>&1 || restore_failed=1; fi
 		fi
 		[ "$restore_failed" = 0 ] || { rp_output_error smartdns-apply "$failed；补偿未完整完成或存在外部修改，已保留候选和现场"; return 1; }
 		rp_output_error smartdns-apply "$failed；已恢复应用前配置与自有文件"
