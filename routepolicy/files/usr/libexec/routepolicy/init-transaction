@@ -997,7 +997,7 @@ status_json() {
 	p=$(read_phase)
 	printf '{"ok":true,"operation":"init-status","phase":"%s"' "$(rp_json_escape "$p")"
 	printf ',"confirmation_transport":"trusted-ssh","http_confirmation_ready":false'
-	if [ -e "$WAL/source-bootstrap" ] || [ -L "$WAL/source-bootstrap" ]; then printf ',"source_bootstrap":true,"sources_state":"pending"'; else printf ',"source_bootstrap":false'; fi
+	if rp_wal_source_bootstrap_pending "$WAL"; then printf ',"source_bootstrap":true,"sources_state":"pending"'; else printf ',"source_bootstrap":false'; fi
 	if [ -f "$WAL/token" ] && [ ! -L "$WAL/token" ]; then printf ',"token":"%s"' "$(rp_json_escape "$(cat "$WAL/token")")"; fi
 	if [ -f "$WAL/deadline" ]; then printf ',"deadline":"%s"' "$(rp_json_escape "$(cat "$WAL/deadline")")"; fi
 	if [ -f "$WAL/stage" ]; then printf ',"stage":"%s"' "$(rp_json_escape "$(cat "$WAL/stage")")"; fi

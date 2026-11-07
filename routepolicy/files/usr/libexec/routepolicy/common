@@ -322,24 +322,34 @@ rp_state_get() {
 }
 
 # shellcheck disable=SC3043
-rp_source_bootstrap_pending() {
-	# A bootstrap receipt stays authoritative; a retained WAL marker counts
-	# only while its transaction phase is unfinished (terminal WALs keep it as
-	# recovery evidence). Unknown or damaged phases stay conservatively pending.
-	local marker=$RP_STATE_DIR/init-transaction/current/source-bootstrap
-	local phase_file=$RP_STATE_DIR/init-transaction/current/phase
-	local bootstrap_phase=
-	if [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ]; then
-		return 0
-	fi
+rp_wal_source_bootstrap_pending() {
+	# True when the given transaction WAL retains an unconfirmed source
+	# bootstrap marker: the marker exists and the WAL phase is unfinished
+	# (terminal WALs keep the marker as recovery evidence). The global applied
+	# receipt is deliberately not consulted here; it belongs to no single WAL.
+	local wal=$1
+	local marker=$wal/source-bootstrap
+	local phase_file=$wal/phase
+	local wal_phase=
 	[ -e "$marker" ] || [ -L "$marker" ] || return 1
 	if [ ! -L "$phase_file" ] && [ -f "$phase_file" ]; then
-		bootstrap_phase=$(cat "$phase_file" 2>/dev/null) || bootstrap_phase=
+		wal_phase=$(cat "$phase_file" 2>/dev/null) || wal_phase=
 	fi
-	case "$bootstrap_phase" in
+	case "$wal_phase" in
 		rolled_back|confirmed|exited) return 1 ;;
 		*) return 0 ;;
 	esac
+}
+
+# shellcheck disable=SC3043
+rp_source_bootstrap_pending() {
+	# A bootstrap receipt stays authoritative; the current WAL marker counts
+	# only while its transaction phase is unfinished. Unknown or damaged
+	# phases stay conservatively pending.
+	if [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ]; then
+		return 0
+	fi
+	rp_wal_source_bootstrap_pending "$RP_STATE_DIR/init-transaction/current"
 }
 
 rp_smartdns_receipt_content() {

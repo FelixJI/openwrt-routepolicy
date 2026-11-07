@@ -101,6 +101,24 @@ for phase in applying pending rolling_back confirming conflict prepared expired 
 	grep -Fq '"applied":false' "$tmp/s-$phase.json" || { printf '阶段 %s 不得视为已应用\n' "$phase" >&2; exit 1; }
 done
 
+run_init_status() {
+	PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
+		"$ROOT/routepolicy/files/usr/sbin/routepolicyctl" init-status --json
+}
+
+# init-status 只按所报 WAL 判断（E19-458-01）：终态 marker 不再 pending。
+for phase in rolled_back confirmed exited; do
+	set_wal "$phase"; set_receipt 0
+	run_init_status >"$tmp/i-$phase.json"
+	grep -Fq '"phase":"'"$phase"'"' "$tmp/i-$phase.json" || { printf 'init-status 未报告阶段 %s\n' "$phase" >&2; cat "$tmp/i-$phase.json" >&2; exit 1; }
+	grep -Fq '"source_bootstrap":false' "$tmp/i-$phase.json" || { printf 'init-status 对终态 %s 仍报引导 pending\n' "$phase" >&2; cat "$tmp/i-$phase.json" >&2; exit 1; }
+done
+for phase in pending unknown; do
+	set_wal "$phase"; set_receipt 0
+	run_init_status >"$tmp/i-$phase.json"
+	grep -Fq '"source_bootstrap":true,"sources_state":"pending"' "$tmp/i-$phase.json" || { printf 'init-status 对阶段 %s 应保守报告引导 pending\n' "$phase" >&2; cat "$tmp/i-$phase.json" >&2; exit 1; }
+done
+
 # 真实未确认引导：pending + bootstrap 回执，diagnose 保留失败项。
 set_wal pending; set_receipt 1
 run_status_json >"$tmp/s-pending.json"
