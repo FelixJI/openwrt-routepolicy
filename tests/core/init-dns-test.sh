@@ -117,6 +117,21 @@ fi
 if [ -f "$TEST_DNS_TMP/kill-installed" ] && [ "$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/declarations/phase" 2>/dev/null)" = installed ]; then
 	rm "$TEST_DNS_TMP/kill-installed"; kill -KILL "$PPID"
 fi
+if [ -f "$TEST_DNS_TMP/fail-managed-sync" ] &&
+	grep -Fq 'smartdns90:address /firmware-local.lab19.test/' "$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied" 2>/dev/null; then
+	rm "$TEST_DNS_TMP/fail-managed-sync"; exit 1
+fi
+for candidate in "$ROUTEPOLICY_ROOT/tmp/routepolicy/"smartdns-apply.*/applied.candidate; do
+	[ -f "$candidate" ] || continue
+	if [ -f "$TEST_DNS_TMP/change-managed-receipt" ]; then
+		rm "$TEST_DNS_TMP/change-managed-receipt"
+		printf 'external_owner=keep\n' >>"$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied"
+	fi
+	if [ -f "$TEST_DNS_TMP/change-managed-file" ]; then
+		rm "$TEST_DNS_TMP/change-managed-file"
+		printf 'address /external-during-publish.test/203.0.114.99\n' >>"$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/90-routepolicy.conf"
+	fi
+done
 exit 0
 EOF
 # Keep the real planner ownership decision at the transaction/service fixture seam.
@@ -463,6 +478,157 @@ test_boot() {
 	rm -f "$RP_RESOLVER_ENTRY" "$RP_RESOLVER_FILE"
 	ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
 }
+managed_apply_dns() {
+	cp "$REAL_LIB/smartdns-control" "$tmp/lib/"
+	# The policy service fixture supplies the same typed content receipt as real apply.
+	{
+		printf 'schema=1\nboot_id=%s\ninit_generation=\nsource_bootstrap=0\n' "$(cat "$tmp/root/proc/sys/kernel/random/boot_id")"
+		printf 'route_table=200\nrule_priority=12000\nmark=0x100\nmark_mask=0x100\npolicy_interface=%s\npolicy_device=eth2\n' "$(uci -q get routepolicy.main.policy_interface)"
+		printf 'smartdns90_present=1\n'
+		sed 's/^/smartdns90:/' "$RP_SMARTDNS_FILE"
+	} >"$RP_STATE_DIR/applied"
+	"$tmp/lib/smartdns-control" status >"$tmp/managed-status"
+	managed_version=$(jsonfilter -i "$tmp/managed-status" -e '@.version')
+	printf 'version\t%s\ninitialize\t0\n' "$managed_version" | "$tmp/lib/smartdns-control" save >/dev/null
+	printf '203.0.114.30 firmware-local.lab19.test\n' | "$tmp/lib/smartdns-control" write-local-hosts >/dev/null
+}
+if [ "${1:-}" = --exit-managed ]; then
+	TEST_MANAGED_GREP=$(command -v grep); export TEST_MANAGED_GREP
+	cat >"$tmp/bin/grep" <<'SH'
+#!/bin/sh
+if [ "$1" = -Fq ] && [ "${2:-}" = '\' ] && [ -f "$TEST_DNS_TMP/fail-proof-read" ]; then exit 2; fi
+exec "$TEST_MANAGED_GREP" "$@"
+SH
+	chmod +x "$tmp/bin/grep"
+	TEST_MANAGED_MV=$(command -v mv); export TEST_MANAGED_MV
+	cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+for target do :; done
+if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied" ] && [ -f "$TEST_DNS_TMP/fail-managed-receipt" ]; then
+	rm "$TEST_DNS_TMP/fail-managed-receipt"; exit 1
+fi
+if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied" ] && [ -f "$TEST_DNS_TMP/fail-managed-restore" ] &&
+	grep -Fq 'smartdns90:address /firmware-local.lab19.test/' "$target"; then
+	rm "$TEST_DNS_TMP/fail-managed-restore"; exit 1
+fi
+"$TEST_MANAGED_MV" "$@" || exit $?
+if [ "$target" = "$ROUTEPOLICY_ROOT/etc/smartdns/conf.d/90-routepolicy.conf" ] && [ -f "$TEST_DNS_TMP/kill-managed-file" ]; then
+	rm "$TEST_DNS_TMP/kill-managed-file"; kill -KILL "$PPID"
+fi
+SH
+	chmod +x "$tmp/bin/mv"
+	for managed_case in immediate legacy-shape publish-fail publish-sync rollback-fail receipt-conflict file-conflict interrupted preboot preforeign premissing preoversize external77 oldboot duplicate badtuple bootstrap foreign90 real91 continuation proof-read-error; do
+		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+		active=$(rp_init_active_record)
+		cp -R "$active/origin" "$tmp/managed-origin-$managed_case"
+		managed_apply_dns
+		cp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
+		cp "$RP_SMARTDNS_FILE" "$tmp/managed90.before"
+		case "$managed_case" in
+			publish-fail) : >"$tmp/fail-managed-receipt" ;;
+			publish-sync) : >"$tmp/fail-managed-sync" ;;
+			rollback-fail) : >"$tmp/fail-managed-sync"; : >"$tmp/fail-managed-restore" ;;
+			receipt-conflict) : >"$tmp/change-managed-receipt" ;;
+			file-conflict) : >"$tmp/change-managed-file" ;;
+			interrupted) : >"$tmp/kill-managed-file" ;;
+			preboot) sed 's/^boot_id=.*/boot_id=00000000-0000-4000-8000-000000000099/' "$RP_STATE_DIR/applied" >"$tmp/corrupt"; cp "$tmp/corrupt" "$RP_STATE_DIR/applied" ;;
+			preforeign) printf 'address /foreign.test/203.0.114.99\n' >>"$RP_SMARTDNS_FILE" ;;
+			premissing) rm "$RP_STATE_DIR/applied" ;;
+			preoversize) dd if=/dev/zero bs=2097153 count=1 >"$RP_STATE_DIR/applied" 2>/dev/null ;;
+		esac
+		case "$managed_case" in preboot|preforeign|premissing|preoversize)
+			cp "$RP_SMARTDNS_UCI" "$tmp/pre-managed.uci"
+			cp "$RP_SMARTDNS_FILE" "$tmp/pre-managed90"
+			if "$tmp/lib/smartdns-control" apply >"$tmp/managed-refused" 2>&1; then printf 'unproven preflight succeeded\n' >&2; exit 1; fi
+			cmp "$RP_SMARTDNS_UCI" "$tmp/pre-managed.uci"; cmp "$RP_SMARTDNS_FILE" "$tmp/pre-managed90"
+			diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+			continue ;;
+		esac
+		case "$managed_case" in rollback-fail|receipt-conflict|file-conflict)
+			if "$tmp/lib/smartdns-control" apply >"$tmp/managed-failed" 2>&1; then printf 'compensation failure succeeded\n' >&2; exit 1; fi
+			grep -Fq '补偿未完整完成' "$tmp/managed-failed"
+			! grep -Fq '已恢复应用前配置' "$tmp/managed-failed"
+			case "$managed_case" in
+				receipt-conflict) grep -Fxq external_owner=keep "$RP_STATE_DIR/applied" ;;
+				file-conflict) grep -Fq external-during-publish.test "$RP_SMARTDNS_FILE" ;;
+				rollback-fail) grep -Fq 'smartdns90:address /firmware-local.lab19.test/' "$RP_STATE_DIR/applied" ;;
+			esac
+			[ -f "$RP_SMARTDNS_CANDIDATE" ] && [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]
+			diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+			continue ;;
+		esac
+		if [ "$managed_case" = publish-fail ] || [ "$managed_case" = publish-sync ] || [ "$managed_case" = interrupted ]; then
+			if "$tmp/lib/smartdns-control" apply >"$tmp/managed-failed" 2>&1; then printf 'managed failure succeeded\n' >&2; exit 1; fi
+			cmp "$RP_STATE_DIR/applied" "$tmp/managed-receipt.before"
+			[ -f "$RP_SMARTDNS_CANDIDATE" ] && [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]
+			if [ "$managed_case" != interrupted ]; then
+				cmp "$RP_SMARTDNS_FILE" "$tmp/managed90.before"
+				"$TX" exit-preview >/dev/null
+			else
+				if "$TX" exit-preview >"$tmp/managed-blocked"; then exit 1; fi
+				grep -Fq file:dns90 "$tmp/managed-blocked"
+			fi
+			diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+			continue
+		fi
+		"$tmp/lib/smartdns-control" apply >"$tmp/managed-applied"
+		grep -Fxq 'address /firmware-local.lab19.test/203.0.114.30' "$RP_SMARTDNS_FILE"
+		sed '/^smartdns90/d' "$tmp/managed-receipt.before" >"$tmp/managed-metadata.before"
+		sed '/^smartdns90/d' "$RP_STATE_DIR/applied" >"$tmp/managed-metadata.after"
+		cmp "$tmp/managed-metadata.before" "$tmp/managed-metadata.after"
+		if [ "$managed_case" = legacy-shape ]; then rm -rf "$RP_STATE_DIR/init-transaction/current"; fi
+		case "$managed_case" in
+			external77) uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/77-external.conf'; uci commit smartdns ;;
+			oldboot) sed 's/^boot_id=.*/boot_id=00000000-0000-4000-8000-000000000099/' "$RP_STATE_DIR/applied" >"$tmp/corrupt"; cp "$tmp/corrupt" "$RP_STATE_DIR/applied" ;;
+			duplicate) printf 'schema=1\n' >>"$RP_STATE_DIR/applied" ;;
+			badtuple) sed 's/^route_table=.*/route_table=999/' "$RP_STATE_DIR/applied" >"$tmp/corrupt"; cp "$tmp/corrupt" "$RP_STATE_DIR/applied" ;;
+			bootstrap) sed 's/^source_bootstrap=.*/source_bootstrap=1/' "$RP_STATE_DIR/applied" >"$tmp/corrupt"; cp "$tmp/corrupt" "$RP_STATE_DIR/applied" ;;
+			foreign90) printf 'address /foreign.test/203.0.114.99\n' >>"$RP_SMARTDNS_FILE" ;;
+			real91) printf 'cache-checkpoint-time 600\n' >>"$RP_SMARTDNS_EXTRA_FILE" ;;
+			continuation) printf '\\\n' >>"$active/origin/dns-file-new"; cp -R "$active/origin/." "$tmp/managed-origin-$managed_case/" ;;
+			proof-read-error) : >"$tmp/fail-proof-read" ;;
+		esac
+		if [ "$managed_case" != immediate ] && [ "$managed_case" != legacy-shape ]; then
+			if "$TX" exit-preview >"$tmp/managed-blocked"; then printf 'exit adopted %s\n' "$managed_case" >&2; exit 1; fi
+			if [ "$managed_case" = external77 ]; then
+				grep -Fq field:smartdns "$tmp/managed-blocked"
+				! grep -Fq file:dns "$tmp/managed-blocked"
+			fi
+			diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+			continue
+		fi
+		"$TX" exit-preview >/dev/null
+		output=$("$TX" exit-prepare); exit_token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+		"$TX" exit-apply "$exit_token" >"$tmp/managed-exit"
+		[ "$(cat "$RP_STATE_DIR/init-transaction/current/phase")" = exited ]
+		[ ! -e "$RP_SMARTDNS_FILE" ] && [ ! -e "$RP_SMARTDNS_EXTRA_FILE" ]
+		grep -Fxq '203.0.114.30 firmware-local.lab19.test' "$RP_LOCAL_HOSTS"
+		diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+	done
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/90-routepolicy.conf'
+	uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'
+	uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/77-external.conf'
+	uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/78-external.conf'; uci commit smartdns
+	managed_apply_dns; "$tmp/lib/smartdns-control" apply >/dev/null
+	for fragment in 90-routepolicy.conf 91-routepolicy-smartdns-extra.conf; do
+		[ "$(uci -q get 'smartdns.@smartdns[0].conf_files' | tr ' ' '\n' | grep -Fxc "/etc/smartdns/conf.d/$fragment")" = 1 ]
+	done
+	for adapter in 0 1; do
+		uci set "routepolicy.main.smartdns_enabled=$adapter"; uci commit routepolicy
+		"$tmp/lib/smartdns-control" status >"$tmp/managed-status"
+		managed_version=$(jsonfilter -i "$tmp/managed-status" -e '@.version')
+		printf 'version\t%s\ninitialize\t0\n' "$managed_version" | "$tmp/lib/smartdns-control" save >/dev/null
+		"$tmp/lib/smartdns-control" apply >/dev/null
+		grep -Fxq "smartdns90_present=$adapter" "$RP_STATE_DIR/applied"
+		[ "$(uci -q get 'smartdns.@smartdns[0].conf_files' | tr ' ' '\n' | grep -Fc /90-routepolicy.conf || true)" = "$adapter" ]
+		uci -q get 'smartdns.@smartdns[0].conf_files' | tr ' ' '\n' | grep -E '/7[78]-external.conf$' >"$tmp/unknown-order"
+		printf '/etc/smartdns/conf.d/77-external.conf\n/etc/smartdns/conf.d/78-external.conf\n' >"$tmp/unknown-expected"
+		cmp "$tmp/unknown-order" "$tmp/unknown-expected"
+	done
+	printf '%s\n' 'managed DNS exit: passed (immediate formal apply, exact receipts, failure/kill, foreign UCI/files, original ledger)'
+	exit 0
+fi
 if [ "${1:-}" = --resolver-repair ]; then
 	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
 	active=$(rp_init_active_record)
@@ -682,16 +848,21 @@ for target do :; done
 if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/previous" ] && [ -f "$TEST_DNS_TMP/kill-exit-promotion" ]; then
 	rm "$TEST_DNS_TMP/kill-exit-promotion"; kill -KILL "$PPID"
 fi
+if [ "$target" = "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current" ] &&
+	[ "$(cat "$target/kind" 2>/dev/null)" = exit ] && [ -f "$TEST_DNS_TMP/kill-exit-promoted" ]; then
+	rm "$TEST_DNS_TMP/kill-exit-promoted"; kill -KILL "$PPID"
+fi
 SH
 	chmod +x "$tmp/bin/cp"
 	chmod +x "$tmp/bin/mv"
-	for boundary in identity copy candidate promotion; do
+	for boundary in identity copy candidate promotion promoted promoted-boot; do
 		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+		managed_apply_dns; "$tmp/lib/smartdns-control" apply >/dev/null
 		txroot="$tmp/root/etc/routepolicy/state/init-transaction"
 		mkdir "$txroot/exiting"; printf 'unknown legacy stage\n' >"$txroot/exiting/user.keep"
 		output=$("$TX" exit-prepare); exit_token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
 		TEST_EXIT_TOKEN=$exit_token; export TEST_EXIT_TOKEN
-		: >"$tmp/kill-exit-$boundary"
+		if [ "$boundary" = promoted-boot ]; then : >"$tmp/kill-exit-promoted"; else : >"$tmp/kill-exit-$boundary"; fi
 		if "$TX" exit-apply "$exit_token" >"$tmp/exit-killed" 2>&1; then printf 'exit kill not reached: %s\n' "$boundary" >&2; exit 1; fi
 		if [ "$boundary" = copy ]; then
 			printf 'external\n' >"$txroot/exiting-$exit_token/user.keep"
@@ -699,10 +870,16 @@ SH
 			grep -Fxq external "$txroot/exiting-$exit_token/user.keep"
 			rm "$txroot/exiting-$exit_token/user.keep"
 		fi
-		"$TX" exit-apply "$exit_token" >"$tmp/exit-retry" || { printf 'exit stage retry blocked at %s\n' "$boundary" >&2; exit 1; }
+		case "$boundary" in
+			promoted|promoted-boot)
+				if [ "$boundary" = promoted-boot ]; then test_boot; "$TX" recover-early >"$tmp/exit-early"; fi
+				"$TX" recover >"$tmp/exit-retry"
+				[ "$(cat "$txroot/current/phase")" = exited ] ;;
+			*) "$TX" exit-apply "$exit_token" >"$tmp/exit-retry" || { printf 'exit stage retry blocked at %s\n' "$boundary" >&2; exit 1; } ;;
+		esac
 		[ ! -e "$txroot/active" ]; grep -Fxq 'unknown legacy stage' "$txroot/exiting/user.keep"
 	done
-	printf '%s\n' 'exit stage recovery: passed (identity/copy/candidate/promotion kill retry; unknown stages preserved)'
+	printf '%s\n' 'exit stage recovery: passed (identity/copy/candidate/promotion, promoted WAL, new-boot restore-files; unknown stages preserved)'
 	exit 0
 fi
 if [ "${1:-}" = --lifecycle ]; then

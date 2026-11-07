@@ -329,9 +329,24 @@ snapshot_file() {
 	fi
 }
 
+snapshot_matches() {
+	[ ! -L "$1" ] || return 1
+	if [ -f "$2.absent" ]; then [ ! -e "$1" ]
+	else [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; fi
+}
+
 restore_file() {
-	target=$1 saved=$2
+	target=$1 saved=$2 expected=$3
+	if snapshot_matches "$target" "$saved"; then return 0; fi
+	snapshot_matches "$target" "$expected" || return 1
 	if [ -f "$saved" ]; then
+		if [ "$target" = "$RP_STATE_DIR/applied" ]; then
+			restore_receipt=$(mktemp "$RP_STATE_DIR/applied.XXXXXX") || return 1
+			if cp "$saved" "$restore_receipt" && chmod 0600 "$restore_receipt" && sync &&
+				snapshot_matches "$target" "$expected" &&
+				mv -f "$restore_receipt" "$target" && sync; then return 0; fi
+			rm -f "$restore_receipt"; return 1
+		fi
 		mkdir -p "$(dirname "$target")" && cp "$saved" "$target"
 	else
 		rm -f "$target"
@@ -420,6 +435,15 @@ emit_uci_batch() {
 	rm -f "$named_deletes" "$anonymous_deletes"
 }
 
+fragment_registration() {
+	fragment=$1 wanted=$2
+	data=$(uci -q export smartdns | rp_uci_field_data "$root" conf_files 1) || return 1
+	count=$(printf '%s\n' "${data#*"$(printf '\t')"}" | tr '|' '\n' | awk -v path="$fragment" '$0==path{n++}END{print n+0}') || return 1
+	if [ "$count" = "$wanted" ]; then return 0; fi
+	printf "del_list smartdns.%s.conf_files='%s'\n" "$root" "$fragment" >>"$work/uci.batch"
+	[ "$wanted" = 0 ] || printf "add_list smartdns.%s.conf_files='%s'\n" "$root" "$fragment" >>"$work/uci.batch"
+}
+
 smartdns_apply() {
 	validate_candidate "$RP_SMARTDNS_CANDIDATE" || { rp_output_error smartdns-apply 'SmartDNS 候选校验失败'; return 1; }
 	baseline_unchanged || { rp_output_error smartdns-apply 'SmartDNS 配置已被外部修改，请刷新'; return 1; }
@@ -427,7 +451,7 @@ smartdns_apply() {
 	lock="$RP_RUN_DIR/smartdns-apply.lock"
 	rp_local_lock "$lock" || { rp_output_error smartdns-apply '另一个 SmartDNS 应用正在进行'; return 1; }
 	work=$(mktemp -d "$RP_RUN_DIR/smartdns-apply.XXXXXX") || { rp_local_unlock "$lock"; return 1; }
-	cleanup_apply() { rm -rf "$work"; rp_local_unlock "$lock"; }
+	cleanup_apply() { [ -z "${receipt_new:-}" ] || rm -f "$receipt_new"; rm -rf "$work"; rp_local_unlock "$lock"; }
 	trap cleanup_apply EXIT
 	trap 'exit 1' HUP INT TERM
 	current_export >"$work/smartdns.previous"
@@ -444,17 +468,34 @@ smartdns_apply() {
 	cat "$work/options.batch" >>"$work/uci.batch"
 	render_extra_fragment "$RP_SMARTDNS_CANDIDATE" "$work/91.candidate"
 	hosts_source=$RP_LOCAL_HOSTS
-	[ ! -f "$RP_LOCAL_HOSTS_CANDIDATE" ] || hosts_source=$RP_LOCAL_HOSTS_CANDIDATE
+	if [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]; then
+		[ ! -L "$RP_LOCAL_HOSTS_CANDIDATE" ] && cp "$RP_LOCAL_HOSTS_CANDIDATE" "$work/hosts.candidate" || return 1
+		hosts_source="$work/hosts.candidate"
+	fi
 	adapter_enabled=$(rp_uci_get main smartdns_enabled 1)
 	[ "$(rp_uci_get main enabled 0)" = 1 ] || adapter_enabled=0
 	if [ "$adapter_enabled" = 1 ]; then rp_render_smartdns90 "$work/90.candidate" "$hosts_source" || { rp_output_error smartdns-apply '生成 90 片段失败'; return 1; }; fi
-	printf "del_list smartdns.%s.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'\n" "$root" >>"$work/uci.batch"
-	printf "del_list smartdns.%s.conf_files='/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n" "$root" >>"$work/uci.batch"
-	if [ "$adapter_enabled" = 1 ]; then
-		printf "add_list smartdns.%s.conf_files='/etc/smartdns/conf.d/90-routepolicy.conf'\n" "$root" >>"$work/uci.batch"
-	fi
-	if [ -s "$work/91.candidate" ]; then
-		printf "add_list smartdns.%s.conf_files='/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf'\n" "$root" >>"$work/uci.batch"
+	[ "$adapter_enabled" = 1 ] || : >"$work/90.candidate.absent"
+	[ -s "$work/91.candidate" ] || : >"$work/91.candidate.absent"
+	fragment_registration /etc/smartdns/conf.d/90-routepolicy.conf "$adapter_enabled" &&
+		fragment_registration /etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf "$( [ -s "$work/91.candidate" ] && printf 1 || printf 0 )" || return 1
+	receipt_required=0
+	if [ -e "$RP_STATE_DIR/applied" ] || [ -L "$RP_STATE_DIR/applied" ] ||
+		{ rp_init_active_record >/dev/null && { [ "$adapter_enabled" = 1 ] || [ -e "$RP_SMARTDNS_FILE" ] || [ -L "$RP_SMARTDNS_FILE" ]; }; }; then
+		receipt_required=1
+		current_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") &&
+			[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] &&
+			[ "$(wc -c <"$RP_STATE_DIR/applied")" -le 2097152 ] &&
+			cp "$RP_STATE_DIR/applied" "$work/applied.previous" &&
+			rp_smartdns_receipt_content "$current_boot" "$work/applied.previous" 1 >"$work/90.receipt" &&
+			! grep -Fxq source_bootstrap=1 "$work/applied.previous" || {
+				rp_output_error smartdns-apply '当前启动的 90 内容回执缺失或非法；未修改配置与文件'; return 1;
+			}
+		if grep -Fxq smartdns90_present=1 "$work/applied.previous"; then
+			cmp -s "$work/90.previous" "$work/90.receipt" || { rp_output_error smartdns-apply '90 片段与已应用内容不符；已保留外部修改'; return 1; }
+		else
+			[ -f "$work/90.previous.absent" ] || { rp_output_error smartdns-apply '90 片段存在但回执未声明；已保留文件'; return 1; }
+		fi
 	fi
 	failed=
 	uci -q batch <"$work/uci.batch" || failed='写入 SmartDNS UCI 失败'
@@ -475,12 +516,9 @@ smartdns_apply() {
 			rm -f "$RP_SMARTDNS_EXTRA_FILE" || failed='删除空 91 片段失败'
 		fi
 	fi
-	if [ -z "$failed" ] && [ -f "$RP_LOCAL_HOSTS_CANDIDATE" ]; then
-		[ ! -L "$RP_LOCAL_HOSTS_CANDIDATE" ] || failed='本地主机候选不是安全普通文件'
-		if [ -z "$failed" ]; then
-			mkdir -p "$(dirname "$RP_LOCAL_HOSTS")"
-			cp "$RP_LOCAL_HOSTS_CANDIDATE" "$RP_LOCAL_HOSTS.new" && chmod 0600 "$RP_LOCAL_HOSTS.new" && mv -f "$RP_LOCAL_HOSTS.new" "$RP_LOCAL_HOSTS" || failed='安装本地主机文件失败'
-		fi
+	if [ -z "$failed" ] && [ -f "$work/hosts.candidate" ]; then
+		mkdir -p "$(dirname "$RP_LOCAL_HOSTS")"
+		cp "$work/hosts.candidate" "$RP_LOCAL_HOSTS.new" && chmod 0600 "$RP_LOCAL_HOSTS.new" && mv -f "$RP_LOCAL_HOSTS.new" "$RP_LOCAL_HOSTS" || failed='安装本地主机文件失败'
 	fi
 	enabled=$(candidate_value enabled "$RP_SMARTDNS_CANDIDATE")
 	[ -n "$enabled" ] || enabled=$(rp_uci_config_get smartdns "$root" enabled 1)
@@ -502,21 +540,46 @@ smartdns_apply() {
 			[ -n "$failed" ] || rm -f "$RP_ROOT$cache_file" || failed='删除已确认关闭的持久缓存文件失败'
 		fi
 	fi
-	if [ -n "$failed" ]; then
-		if [ -s "$work/smartdns.previous" ]; then uci -q import smartdns <"$work/smartdns.previous" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || true; fi
-		restore_file "$RP_SMARTDNS_FILE" "$work/90.previous"
-		restore_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous"
-		restore_file "$RP_LOCAL_HOSTS" "$work/hosts.previous"
-		if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
-			if [ "$service_was_running" = 1 ]; then rp_native_service smartdns start >/dev/null 2>&1 || true
-			else rp_native_service smartdns stop >/dev/null 2>&1 || true; fi
+	if [ -z "$failed" ] && [ "$receipt_required" = 1 ]; then
+		sed '/^smartdns90:/d; /^smartdns90_present=/d' "$work/applied.previous" >"$work/applied.candidate" || failed='生成内容回执失败'
+		if [ "$adapter_enabled" = 1 ]; then
+			cmp -s "$RP_SMARTDNS_FILE" "$work/90.candidate" &&
+				printf 'smartdns90_present=1\n' >>"$work/applied.candidate" &&
+				sed 's/^/smartdns90:/' "$work/90.candidate" >>"$work/applied.candidate" || failed='90 内容在回执发布前变化'
+		else
+			[ ! -e "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] &&
+				printf 'smartdns90_present=0\n' >>"$work/applied.candidate" || failed='90 片段在回执发布前重新出现'
 		fi
+		if [ -z "$failed" ]; then
+			receipt_new=$(mktemp "$RP_STATE_DIR/applied.XXXXXX") &&
+				cp "$work/applied.candidate" "$receipt_new" && chmod 0600 "$receipt_new" && sync &&
+				snapshot_matches "$RP_SMARTDNS_FILE" "$work/90.candidate" &&
+				[ ! -L "$RP_STATE_DIR/applied" ] && cmp -s "$RP_STATE_DIR/applied" "$work/applied.previous" &&
+				mv -f "$receipt_new" "$RP_STATE_DIR/applied" && sync || failed='发布内容回执失败'
+		fi
+	fi
+	if [ -n "$failed" ]; then
+		restore_failed=0
+		if [ -s "$work/smartdns.previous" ]; then uci -q import smartdns <"$work/smartdns.previous" >/dev/null 2>&1 && uci commit smartdns >/dev/null 2>&1 || restore_failed=1; fi
+		restore_file "$RP_SMARTDNS_FILE" "$work/90.previous" "$work/90.candidate" || restore_failed=1
+		restore_file "$RP_SMARTDNS_EXTRA_FILE" "$work/91.previous" "$work/91.candidate" || restore_failed=1
+		hosts_expected="$work/hosts.previous"; [ ! -f "$work/hosts.candidate" ] || hosts_expected="$work/hosts.candidate"
+		restore_file "$RP_LOCAL_HOSTS" "$work/hosts.previous" "$hosts_expected" || restore_failed=1
+		if [ "$receipt_required" = 1 ]; then
+			restore_file "$RP_STATE_DIR/applied" "$work/applied.previous" "$work/applied.candidate" || restore_failed=1
+		fi
+		if [ -x "$RP_ROOT/etc/init.d/smartdns" ]; then
+			if [ "$service_was_running" = 1 ]; then rp_native_service smartdns start >/dev/null 2>&1 || restore_failed=1
+			else rp_native_service smartdns stop >/dev/null 2>&1 || restore_failed=1; fi
+		fi
+		[ "$restore_failed" = 0 ] || { rp_output_error smartdns-apply "$failed；补偿未完整完成或存在外部修改，已保留候选和现场"; return 1; }
 		rp_output_error smartdns-apply "$failed；已恢复应用前配置与自有文件"
 		return 1
 	fi
-	current_export >"$RP_SMARTDNS_APPLIED"
-	cp "$RP_SMARTDNS_APPLIED" "$RP_SMARTDNS_BASELINE"
-	rm -f "$RP_SMARTDNS_CANDIDATE" "$RP_LOCAL_HOSTS_CANDIDATE"
+	uci -q export smartdns >"$RP_SMARTDNS_APPLIED" && cp "$RP_SMARTDNS_APPLIED" "$RP_SMARTDNS_BASELINE" &&
+		rm -f "$RP_SMARTDNS_CANDIDATE" "$RP_LOCAL_HOSTS_CANDIDATE" || {
+			rp_output_error smartdns-apply '文件和内容回执已应用，但管理基线或候选清理失败；请刷新检查'; return 1;
+		}
 	rp_output_ok smartdns-apply 'SmartDNS 候选已独立应用并验证加载状态'
 }
 

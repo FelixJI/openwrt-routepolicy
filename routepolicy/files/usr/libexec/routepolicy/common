@@ -292,6 +292,38 @@ rp_state_get() {
 	sed -n "s/^$key=//p" "$RP_STATE_DIR/applied" | sed -n '1p'
 }
 
+rp_smartdns_receipt_content() {
+	# shellcheck disable=SC3043
+	local receipt=${2:-$RP_STATE_DIR/applied} allow_absent=${3:-0} receipt_rc table priority mark mask n
+	# Exact installed bytes belong to the existing atomic receipt, never new UCI.
+	[ -f "$receipt" ] && [ ! -L "$receipt" ] && [ "$(wc -c <"$receipt")" -le 2097152 ] || return 1
+	if awk -v boot="$1" -v allow_absent="$allow_absent" '
+		/^smartdns90:/ {n++;bytes+=length($0)-10;if(length($0)>4108||bytes>1048576)bad=1;sub(/^smartdns90:/,"");print;next}
+		{
+			if(length($0)>4096||$0!~/^[a-z_0-9]+=/||$0~/[[:cntrl:]]/) {bad=1;next}
+			key=$0;sub(/=.*/,"",key);value=substr($0,length(key)+2)
+			if(seen[key]++)bad=1
+			if(index("|schema|boot_id|init_generation|source_bootstrap|route_table|rule_priority|mark|mark_mask|policy_interface|policy_device|policy_cidr|source_accounting|source_idle_timeout|source_max_entries|managed_devices|smartdns90_present|","|" key "|")==0)bad=1
+			if(key=="schema"&&value!="1")bad=1
+			if(key=="boot_id"&&value!=boot)bad=1
+			if(key=="source_bootstrap"&&value!~/^[01]$/)bad=1
+			if(key=="init_generation"&&value!=""&&(length(value)!=32||value!~/^[0-9a-f]+$/))bad=1
+			if(key=="smartdns90_present"){present=value;if(value!~/^[01]$/)bad=1}
+		}
+		END {
+			if(bad||!seen["schema"]||!seen["boot_id"]||!seen["route_table"]||!seen["rule_priority"]||!seen["mark"]||!seen["mark_mask"])exit 1
+			if(!seen["smartdns90_present"]){if(n)exit 1;exit 2}
+			if((present==1&&!n)||(present==0&&n))exit 1
+			if(present!=1&&allow_absent!=1)exit 1
+		}' "$receipt"; then receipt_rc=0; else receipt_rc=$?; [ "$receipt_rc" = 2 ] || return 1; fi
+	table=$(sed -n 's/^route_table=//p' "$receipt"); priority=$(sed -n 's/^rule_priority=//p' "$receipt")
+	mark=$(sed -n 's/^mark=//p' "$receipt"); mask=$(sed -n 's/^mark_mask=//p' "$receipt")
+	rp_uint_between "$table" 1 252 && rp_uint_between "$priority" 1 32765 &&
+		rp_is_mark_bit "$mark" && [ "$mark" = "$mask" ] || return 1
+	return "$receipt_rc"
+}
+
+
 rp_mark_conflicts() {
 	ours_mark=$1 ours_mask=$2 ours_priority=$3 ours_table=$4
 	previous_mark=${5-} previous_mask=${6-} previous_priority=${7-} previous_table=${8-}

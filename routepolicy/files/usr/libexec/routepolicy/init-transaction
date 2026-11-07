@@ -156,8 +156,31 @@ origin_publish() {
 	init_resolver_origin "$stage/origin" || return 1
 	origin_validate "$stage/origin"
 }
+exit_file_snapshot() {
+	local record=$1 key=$2 snapshot=$3 path proof receipt_boot result=1
+	case "$key" in dns-file) path=$RP_SMARTDNS_EXTRA_FILE ;; dns90) path=$RP_SMARTDNS_FILE ;; *) return 1 ;; esac
+	[ ! -L "$path" ] || return 1
+	if [ ! -e "$path" ]; then [ -f "$record/origin/$key-absent" ]; return; fi
+	[ -f "$path" ] && [ "$(wc -c <"$path")" -le 1048576 ] && cp "$path" "$snapshot" || return 1
+	if cmp -s "$snapshot" "$record/origin/$key-new" || cmp -s "$snapshot" "$record/origin/$key-old"; then return 0; fi
+	proof=$(mktemp "$RP_RUN_DIR/exit-proof.XXXXXX") || return 1
+	if [ "$key" = dns-file ]; then
+		# Without continuations, deleting empty physical lines preserves native syntax.
+		if [ -f "$record/origin/dns-file-new" ] && [ "$(wc -c <"$record/origin/dns-file-new")" -le 1048576 ]; then
+			if grep -Fq '\' "$record/origin/dns-file-new"; then :
+			elif [ "$?" = 1 ] && sed '/^$/d' "$record/origin/dns-file-new" >"$proof" &&
+				cmp -s "$snapshot" "$proof"; then result=0; fi
+		fi
+	else
+		receipt_boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || { rm -f "$proof"; return 1; }
+		if rp_smartdns_receipt_content "$receipt_boot" >"$proof" &&
+			! grep -Fxq source_bootstrap=1 "$RP_STATE_DIR/applied" && cmp -s "$snapshot" "$proof"; then result=0; fi
+	fi
+	rm -f "$proof"
+	return "$result"
+}
 exit_check() {
-	local record=$1 n i entry key present type value expected old missing=0 owned_keys='' child service state desired managed
+	local record=$1 n i entry key present type value expected old missing=0 owned_keys='' child service state desired managed file_work
 	origin_validate "$record/origin" || { printf 'invalid-origin\n'; return 1; }
 	init_resolver_exit_check "$record" || { printf 'resolver-origin-or-runtime\n'; return 1; }
 	[ ! -f "$record/origin/incomplete" ] || { cat "$record/origin/incomplete"; return 1; }
@@ -193,13 +216,11 @@ exit_check() {
 			if [ "$state" != "$managed" ] && [ "$state" != "$desired" ]; then printf 'service:%s:%s\n' "$service" "$key"; missing=1; fi
 		done
 	done
+	file_work=$(mktemp -d "$RP_RUN_DIR/exit-files.XXXXXX") || return 1
 	for key in dns-file dns90; do
-		case "$key" in dns-file) value=$RP_SMARTDNS_EXTRA_FILE ;; *) value=$RP_SMARTDNS_FILE ;; esac
-		[ ! -L "$value" ] || { printf 'file-link:%s\n' "$key"; missing=1; continue; }
-		if [ ! -e "$value" ] && [ -f "$record/origin/$key-absent" ]; then continue; fi
-		if [ -f "$value" ] && { cmp -s "$value" "$record/origin/$key-new" || cmp -s "$value" "$record/origin/$key-old"; }; then continue; fi
-		printf 'file:%s\n' "$key"; missing=1
+		if ! exit_file_snapshot "$record" "$key" "$file_work/$key"; then printf 'file:%s\n' "$key"; missing=1; fi
 	done
+	rm -rf "$file_work"
 	[ "$missing" = 0 ]
 }
 exit_finish() {
@@ -236,7 +257,7 @@ exit_apply() {
 			for path do
 				relative=${path#"$base"/}
 				case "$relative" in
-					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted) [ -f "$path" ] || printf "unknown\n" ;;
+					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted|dns-file-new|dns90-new) [ -f "$path" ] || printf "unknown\n" ;;
 					delta) [ -d "$path" ] || printf "unknown\n" ;;
 					*) if [ -d "$path" ]; then [ -d "$origin/$relative" ] || printf "unknown\n"; else [ -f "$path" ] && [ -f "$origin/$relative" ] || printf "unknown\n"; fi ;;
 				esac
@@ -249,6 +270,7 @@ exit_apply() {
 	staging=$(mktemp -d "$TX/exit-preparing.XXXXXX") || return 1
 	printf '%s\n' "$supplied" >"$staging/token" && printf 'exit\n' >"$staging/kind" && sync && mv "$staging" "$stage" && sync || return 1
 	cp -pR "$record/origin/." "$stage/" || return 1
+	for item in dns-file dns90; do exit_file_snapshot "$record" "$item" "$stage/$item-new" || return 1; done
 	for item in candidate parameters; do cp "$record/$item" "$stage/$item" || return 1; done
 	printf '%s\n' "$supplied" >"$stage/token"; printf 'exit\n' >"$stage/kind"
 	cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$stage/boot-id" || return 1

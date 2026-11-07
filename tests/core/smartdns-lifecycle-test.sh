@@ -50,7 +50,7 @@ cmp "$tmp/fragment-before" "$tmp/etc/smartdns/conf.d/90-routepolicy.conf"
 grep -Fxq reload "$log"
 
 cp "$tmp/etc/routepolicy/state/applied" "$tmp/receipt-good"
-for corruption in duplicate missing-content absent-with-content unknown-key duplicate-schema legacy; do
+for corruption in duplicate missing-content absent-with-content unknown-key duplicate-schema bad-table bad-mark bad-bootstrap bad-token legacy; do
 	cp "$tmp/receipt-good" "$tmp/etc/routepolicy/state/applied"
 	case "$corruption" in
 		duplicate) printf 'smartdns90_present=1\n' >>"$tmp/etc/routepolicy/state/applied" ;;
@@ -58,6 +58,10 @@ for corruption in duplicate missing-content absent-with-content unknown-key dupl
 		absent-with-content) sed 's/^smartdns90_present=1$/smartdns90_present=0/' "$tmp/receipt-good" >"$tmp/etc/routepolicy/state/applied" ;;
 		unknown-key) printf 'smartdns90_unknown=1\n' >>"$tmp/etc/routepolicy/state/applied" ;;
 		duplicate-schema) printf 'schema=1\n' >>"$tmp/etc/routepolicy/state/applied" ;;
+		bad-table) sed 's/^route_table=.*/route_table=999/' "$tmp/receipt-good" >"$tmp/etc/routepolicy/state/applied" ;;
+		bad-mark) sed 's/^mark=.*/mark=0x3/' "$tmp/receipt-good" >"$tmp/etc/routepolicy/state/applied" ;;
+		bad-bootstrap) sed 's/^source_bootstrap=.*/source_bootstrap=invalid/' "$tmp/receipt-good" >"$tmp/etc/routepolicy/state/applied" ;;
+		bad-token) sed 's/^init_generation=.*/init_generation=invalid/' "$tmp/receipt-good" >"$tmp/etc/routepolicy/state/applied" ;;
 		legacy) sed '/^smartdns90/d' "$tmp/receipt-good" >"$tmp/etc/routepolicy/state/applied" ;;
 	esac
 	if TEST_SMARTDNS_LOG="$log" TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" ROUTEPOLICY_LIBEXEC="$LIBEXEC" "$LIBEXEC/apply" teardown >/dev/null 2>&1; then

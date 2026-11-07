@@ -173,27 +173,6 @@ else
 fi
 admit_applied_boot
 
-smartdns_receipt_content() {
-	# Exact installed bytes belong to the existing atomic receipt, never new UCI.
-	[ -f "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ] && [ "$(wc -c <"$RP_STATE_DIR/applied")" -le 2097152 ] || return 1
-	awk -v boot="$current_boot" '
-		/^smartdns90:/ {n++;bytes+=length($0)-10;if(length($0)>4108||bytes>1048576)bad=1;sub(/^smartdns90:/,"");print;next}
-		{
-			if(length($0)>4096||$0!~/^[a-z_0-9]+=/||$0~/[[:cntrl:]]/) {bad=1;next}
-			key=$0;sub(/=.*/,"",key);value=substr($0,length(key)+2)
-			if(seen[key]++)bad=1
-			if(index("|schema|boot_id|init_generation|source_bootstrap|route_table|rule_priority|mark|mark_mask|policy_interface|policy_device|policy_cidr|source_accounting|source_idle_timeout|source_max_entries|managed_devices|smartdns90_present|","|" key "|")==0)bad=1
-			if(key=="schema"&&value!="1")bad=1
-			if(key=="boot_id"&&value!=boot)bad=1
-			if(key=="smartdns90_present"){present=value;if(value!~/^[01]$/)bad=1}
-		}
-		END {
-			if(bad||!seen["schema"]||!seen["boot_id"]||!seen["route_table"]||!seen["rule_priority"]||!seen["mark"]||!seen["mark_mask"])exit 1
-			if(!seen["smartdns90_present"]){if(n)exit 1;exit 2}
-			if((present==1&&!n)||(present==0&&n))exit 1
-			if(present!=1)exit 1
-		}' "$RP_STATE_DIR/applied"
-}
 
 if [ "$mode" = teardown ]; then
 	if [ "$IPR_CONTEXT" = 1 ] && [ "$IPR_ACTIVE" = 0 ] && [ ! -e "$IPR_INTENT" ] && [ ! -e "$RP_STATE_DIR/applied" ] && [ ! -L "$RP_STATE_DIR/applied" ]; then
@@ -234,7 +213,7 @@ if [ "$mode" = teardown ]; then
 		owned_state_found=1
 		[ -f "$RP_SMARTDNS_FILE" ] && [ ! -L "$RP_SMARTDNS_FILE" ] || { rp_output_error apply 'SmartDNS 片段不是安全的普通文件'; exit 1; }
 		teardown_expected=$(mktemp "$RP_RUN_DIR/teardown-expected.XXXXXX") || exit 1
-		if smartdns_receipt_content >"$teardown_expected"; then receipt_rc=0; else receipt_rc=$?; fi
+		if rp_smartdns_receipt_content "$current_boot" >"$teardown_expected"; then receipt_rc=0; else receipt_rc=$?; fi
 		if [ "$receipt_rc" = 2 ]; then
 			# Same-boot confirmed initialization can supply older receipts missing content.
 			receipt_generation=$(rp_state_get init_generation)
