@@ -48,6 +48,8 @@ grep -Fq 'nftables shellcheck' .github/workflows/release.yml || fail '发布工�
 if grep -R -Fq 'luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy' .github tests/luci/README.md; then fail 'CI 或测试说明仍引用错误的 rpcd exec 路径'; fi
 grep -Fq '+bind-dig' routepolicy/Makefile || fail '双协议 DNS 查询验证缺少 bind-dig 依赖'
 grep -Fq 'files/usr/libexec/routepolicy/init-dns' routepolicy/Makefile || fail '核心包未安装初始化 DNS 协调模块'
+grep -Fq '$(INSTALL_DATA) ./files/lib/upgrade/routepolicy.sh $(1)/lib/upgrade/routepolicy.sh' routepolicy/Makefile || fail '核心包未安装官方备份 hook'
+grep -Fq '$(INSTALL_BIN) ./files/usr/libexec/routepolicy/firmware-backup $(1)/usr/libexec/routepolicy/firmware-backup' routepolicy/Makefile || fail '核心包未安装固件备份依赖盘点器'
 grep -Fq 'smartdns-control' routepolicy/Makefile || fail '核心包未安装 SmartDNS 深模块'
 grep -Fq 'files/usr/libexec/routepolicy/observe' routepolicy/Makefile || fail '核心包未安装 observation 深模块'
 grep -Fq '/etc/routepolicy/user.d/local-hosts.list' routepolicy/Makefile || fail '本地主机文件未声明为 conffile'
