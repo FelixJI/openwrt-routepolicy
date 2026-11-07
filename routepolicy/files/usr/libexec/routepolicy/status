@@ -45,7 +45,7 @@ if [ -n "$status_boot" ] && [ "$receipt_boot" = "$status_boot" ] && [ "$table_pr
 	if [ "$(rp_uci_get main strict_enforcement 1)" != 1 ] || [ "$blackhole" = 1 ]; then applied=1; fi
 fi
 source_bootstrap=0
-if [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ] || [ -e "$RP_STATE_DIR/init-transaction/current/source-bootstrap" ] || [ -L "$RP_STATE_DIR/init-transaction/current/source-bootstrap" ]; then source_bootstrap=1; applied=0; fi
+if rp_source_bootstrap_pending; then source_bootstrap=1; applied=0; fi
 if resolver_active=$(rp_init_active_record); then
 	if ! grep -Eq '^set[[:space:]]dhcp\.[^.]+\.localuse[[:space:]]0$' "$resolver_active/candidate" || ! rp_system_resolver_ready; then applied=0; fi
 fi

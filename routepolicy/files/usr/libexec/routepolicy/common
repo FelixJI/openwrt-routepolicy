@@ -321,6 +321,27 @@ rp_state_get() {
 	sed -n "s/^$key=//p" "$RP_STATE_DIR/applied" | sed -n '1p'
 }
 
+# shellcheck disable=SC3043
+rp_source_bootstrap_pending() {
+	# A bootstrap receipt stays authoritative; a retained WAL marker counts
+	# only while its transaction phase is unfinished (terminal WALs keep it as
+	# recovery evidence). Unknown or damaged phases stay conservatively pending.
+	local marker=$RP_STATE_DIR/init-transaction/current/source-bootstrap
+	local phase_file=$RP_STATE_DIR/init-transaction/current/phase
+	local bootstrap_phase=
+	if [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ]; then
+		return 0
+	fi
+	[ -e "$marker" ] || [ -L "$marker" ] || return 1
+	if [ ! -L "$phase_file" ] && [ -f "$phase_file" ]; then
+		bootstrap_phase=$(cat "$phase_file" 2>/dev/null) || bootstrap_phase=
+	fi
+	case "$bootstrap_phase" in
+		rolled_back|confirmed|exited) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
 rp_smartdns_receipt_content() {
 	# shellcheck disable=SC3043
 	local receipt=${2:-$RP_STATE_DIR/applied} allow_absent=${3:-0} receipt_rc table priority mark mask n

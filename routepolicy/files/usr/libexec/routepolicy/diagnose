@@ -24,7 +24,7 @@ subnets_overlap() {
 
 if ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" >/dev/null 2>&1; then add_check uci pass '配置、来源和人工清单有效'; else add_check uci fail '配置、来源或人工清单校验失败'; fi
 if rp_config_admit; then add_check config-schema pass '配置 schema 受支持'; else add_check config-schema fail '配置 schema 不支持，禁止降级解释'; fi
-if [ -e "$RP_STATE_DIR/init-transaction/current/source-bootstrap" ] || [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ]; then add_check source-bootstrap fail '来源仍在未确认引导阶段，不能视为已应用'; fi
+if rp_source_bootstrap_pending; then add_check source-bootstrap fail '来源仍在未确认引导阶段，不能视为已应用'; fi
 if rp_sources_ready; then add_check source-snapshots pass '启用来源静态快照齐全'; else add_check source-snapshots fail '启用来源尚未验证齐全'; fi
 for required_command in uci ubus jsonfilter ip nft fw4 smartdns dig flock timeout; do
 	if rp_have "$required_command"; then add_check "dependency-$required_command" pass '依赖可用'; else add_check "dependency-$required_command" fail '依赖缺失；请先完成应用与依赖重装'; fi
