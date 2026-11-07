@@ -23,6 +23,19 @@ subnets_overlap() {
 }
 
 if ROUTEPOLICY_OUTPUT=text "$LIBEXEC/validate" >/dev/null 2>&1; then add_check uci pass '配置、来源和人工清单有效'; else add_check uci fail '配置、来源或人工清单校验失败'; fi
+if rp_config_admit; then add_check config-schema pass '配置 schema 受支持'; else add_check config-schema fail '配置 schema 不支持，禁止降级解释'; fi
+if rp_source_bootstrap_pending; then add_check source-bootstrap fail '来源仍在未确认引导阶段，不能视为已应用'; fi
+if rp_sources_ready; then add_check source-snapshots pass '启用来源静态快照齐全'; else add_check source-snapshots fail '启用来源尚未验证齐全'; fi
+for required_command in uci ubus jsonfilter ip nft fw4 smartdns dig flock timeout; do
+	if rp_have "$required_command"; then add_check "dependency-$required_command" pass '依赖可用'; else add_check "dependency-$required_command" fail '依赖缺失；请先完成应用与依赖重装'; fi
+done
+if [ -d "$RP_RUN_DIR/restore" ]; then add_check restore-candidate warn '存在未完成的导入候选；请检查 restore-status'; fi
+if diagnosis_record=$(rp_init_active_record); then
+	if grep -Eq '^set[[:space:]]dhcp\.[^.]+\.localuse[[:space:]]0$' "$diagnosis_record/candidate" && rp_system_resolver_ready; then add_check system-resolver pass '系统解析入口指向受管 IPv4 lo53；上游 bootstrap 文件保持独立';
+	else add_check system-resolver fail '系统 resolver 合同缺失或被修改；旧确认需显式重新初始化，不能视为 DNS 已恢复'; fi
+	if [ -f "$diagnosis_record/origin/incomplete" ] || [ ! -d "$diagnosis_record/origin" ]; then add_check exit-provenance warn '历史退出来源可能不完整；退出预览将拒绝猜测';
+	else add_check exit-provenance pass '保留累计逐字段退出来源'; fi
+fi
 table=$(rp_uci_get main route_table 200); priority=$(rp_uci_get main rule_priority 12000)
 mark=$(rp_uci_get main mark 0x100); mask=$(rp_uci_get main mark_mask 0x100)
 lan=$(rp_uci_get main lan_interface lan); default_if=$(rp_uci_get main default_interface wan); policy=$(rp_uci_get main policy_interface usbwan)

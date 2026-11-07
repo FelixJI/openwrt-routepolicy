@@ -138,6 +138,16 @@ chmod +x "$tmp/bin/nft"
 
 # Full rebuild preserves kernel DNS set objects: concurrent inserts and expiry
 # continue without a snapshot/reinsert window, even when a chain was missing.
+cat >"$tmp/etc/routepolicy/state/applied" <<'EOF'
+schema=1
+boot_id=00000000-0000-4000-8000-000000000001
+route_table=200
+rule_priority=12000
+mark=0x100
+mark_mask=0x100
+policy_interface=usbwan
+policy_device=usb0
+EOF
 : >"$tmp/nft.log"; rm -f "$tmp/nft.check" "$tmp/nft.atomic"
 if TEST_NFT_LOG="$tmp/nft.log" TEST_NFT_CHECK="$tmp/nft.check" TEST_NFT_ATOMIC="$tmp/nft.atomic" \
 	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
@@ -168,7 +178,7 @@ cmp -s "$tmp/nft.check" "$tmp/nft.atomic" || { printf 'validated batch differed 
 
 # Failure regression: a kernel rejection of the merged batch must fail the
 # apply and restore the previous table, never leave a member-less rebuild.
-rm -f "$tmp/etc/routepolicy/state/applied"
+cp "$tmp/etc/routepolicy/state/applied" "$tmp/applied.before"
 : >"$tmp/nft.log"; rm -f "$tmp/nft.check" "$tmp/nft.atomic"
 if TEST_LIVE_RESTORE_FAIL=1 TEST_NFT_LOG="$tmp/nft.log" TEST_NFT_CHECK="$tmp/nft.check" TEST_NFT_ATOMIC="$tmp/nft.atomic" \
 	PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
@@ -185,7 +195,7 @@ grep -Fxq ROLLBACK_OLD_TABLE "$tmp/nft.log" || { printf 'atomic batch failure di
 	printf 'expected the rejected merged batch plus rollback only, got %s commits\n' "$(grep -c -- '^-f ' "$tmp/nft.log")" >&2; exit 1
 }
 cmp -s "$tmp/nft.check" "$tmp/nft.atomic" || { printf 'validated batch differed from the committed batch\n' >&2; exit 1; }
-[ ! -e "$tmp/etc/routepolicy/state/applied" ] || { printf 'failed atomic apply published applied state\n' >&2; exit 1; }
+cmp "$tmp/applied.before" "$tmp/etc/routepolicy/state/applied" || { printf 'failed atomic apply changed the original receipt\n' >&2; exit 1; }
 
 : >"$tmp/nft.log"
 if TEST_LIVE_SAVE_FAIL=1 TEST_NFT_LOG="$tmp/nft.log" PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH" \

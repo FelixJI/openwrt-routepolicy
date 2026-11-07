@@ -23,9 +23,14 @@ RP_SMARTDNS_BASELINE_VERSION="$RP_STATE_DIR/smartdns-baseline.version"
 RP_SMARTDNS_APPLIED="$RP_STATE_DIR/smartdns-applied.uci"
 RP_LOCAL_HOSTS="$RP_USER_DIR/local-hosts.list"
 RP_LOCAL_HOSTS_CANDIDATE="$RP_RUN_DIR/local-hosts-candidate.list"
+RP_RESOLVER_ENTRY="$RP_ROOT/tmp/resolv.conf"
+RP_RESOLVER_FILE="$RP_ROOT/tmp/resolv.conf.d/routepolicy.conf"
 RP_TABLE_FAMILY=inet
 RP_TABLE_NAME=routepolicy
 RP_SCHEMA_VERSION=1
+RP_CONFIG_SCHEMA=1
+RP_INIT_WINDOW_SECONDS=180
+RP_INIT_CONFIRM_RESERVE_SECONDS=20
 
 rp_err() { printf '%s\n' "routepolicy: $*" >&2; }
 rp_die() { rp_err "$*"; exit 1; }
@@ -74,7 +79,7 @@ rp_is_smartdns_server_ref() {
 # Decode libuci's quoted export without evaluating configuration as shell code.
 # Lists use | internally; ambiguous/control-containing values fail before any write.
 rp_uci_field_data() {
-	awk -v section="$1" -v option="$2" '
+	awk -v section="$1" -v option="$2" -v missing="${3:-0}" '
 		function unquote(s, out,i,c) {
 			if(substr(s,1,1)!=q || substr(s,length(s),1)!=q){bad=1;return ""}
 			s=substr(s,2,length(s)-2);out=""
@@ -97,7 +102,7 @@ rp_uci_field_data() {
 			if(n && (kind!="list"||$1!="list"))bad=1
 			data=data (n?"|":"") value;kind=$1;n++
 		}
-		END{if(bad||!n||length(data)>4096)exit 1;print (kind=="list"?"list":"scalar") "\t" data}'
+		END{if(bad||length(data)>4096)exit 1;if(!n){if(missing==1){print "0\t-";exit}exit 1};print (kind=="list"?"list":"scalar") "\t" data}'
 }
 
 # Rebuild rules atomically while retaining the two DNS producer set objects.
@@ -144,6 +149,35 @@ rp_smartdns_fragment_loaded() {
 		$1 == "conf-file=" wanted || $1 == "conf_file=" wanted { found=1 }
 		END { exit !found }
 	' "$RP_SMARTDNS_GENERATED"
+}
+
+rp_dns_listener_rows() {
+	# shellcheck disable=SC3043
+	local listener_output
+	listener_output=$(timeout 3 netstat -lnptu) || return 1
+	# Different device-bound sockets can share the same displayed address.
+	printf '%s\n' "$listener_output" | awk -v owner="$1" -v ports=" $2 " '
+		$1~/^(tcp|udp)(6)?$/ && $NF~owner && $4~/:+[0-9]+$/ {
+			port=$4; sub(/^.*:/,"",port)
+			if(index(ports," " port " ")) print $1 " " $4
+		}' | LC_ALL=C sort
+}
+
+rp_exit_dns90_missing() {
+	[ -f "$1/kind" ] && [ ! -L "$1/kind" ] && [ "$(cat "$1/kind")" = exit ] &&
+		[ -f "$1/dns90-new-absent" ] && [ ! -L "$1/dns90-new-absent" ] &&
+		[ "$(cat "$1/dns90-new-absent")" = 1 ] &&
+		[ ! -e "$1/dns90-new" ] && [ ! -L "$1/dns90-new" ]
+}
+
+rp_exit_dns90_restore_admit() {
+	rp_exit_dns90_missing "$1" && [ ! -L "$RP_SMARTDNS_FILE" ] &&
+		[ ! -L "$1/dns90-old" ] && [ ! -L "$1/dns90-absent" ] || return 1
+	if [ -f "$1/dns90-old" ] && [ ! -e "$1/dns90-absent" ]; then
+		[ ! -e "$RP_SMARTDNS_FILE" ] || { [ -f "$RP_SMARTDNS_FILE" ] && cmp -s "$RP_SMARTDNS_FILE" "$1/dns90-old"; }
+	else
+		[ ! -e "$1/dns90-old" ] && [ -f "$1/dns90-absent" ] && [ ! -e "$RP_SMARTDNS_FILE" ]
+	fi
 }
 
 rp_smartdns_single_root() {
@@ -287,6 +321,69 @@ rp_state_get() {
 	sed -n "s/^$key=//p" "$RP_STATE_DIR/applied" | sed -n '1p'
 }
 
+# shellcheck disable=SC3043
+rp_wal_source_bootstrap_pending() {
+	# True when the given transaction WAL retains an unconfirmed source
+	# bootstrap marker: the marker exists and the WAL phase is unfinished
+	# (terminal WALs keep the marker as recovery evidence). The global applied
+	# receipt is deliberately not consulted here; it belongs to no single WAL.
+	local wal=$1
+	local marker=$wal/source-bootstrap
+	local phase_file=$wal/phase
+	local wal_phase=
+	[ -e "$marker" ] || [ -L "$marker" ] || return 1
+	if [ ! -L "$phase_file" ] && [ -f "$phase_file" ]; then
+		wal_phase=$(cat "$phase_file" 2>/dev/null) || wal_phase=
+	fi
+	case "$wal_phase" in
+		rolled_back|confirmed|exited) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+# shellcheck disable=SC3043
+rp_source_bootstrap_pending() {
+	# A bootstrap receipt stays authoritative; the current WAL marker counts
+	# only while its transaction phase is unfinished. Unknown or damaged
+	# phases stay conservatively pending.
+	if [ "$(rp_state_get source_bootstrap 2>/dev/null)" = 1 ]; then
+		return 0
+	fi
+	rp_wal_source_bootstrap_pending "$RP_STATE_DIR/init-transaction/current"
+}
+
+rp_smartdns_receipt_content() {
+	# shellcheck disable=SC3043
+	local receipt=${2:-$RP_STATE_DIR/applied} allow_absent=${3:-0} receipt_rc table priority mark mask n
+	# Exact installed bytes belong to the existing atomic receipt, never new UCI.
+	[ -f "$receipt" ] && [ ! -L "$receipt" ] && [ "$(wc -c <"$receipt")" -le 2097152 ] || return 1
+	if awk -v boot="$1" -v allow_absent="$allow_absent" '
+		/^smartdns90:/ {n++;bytes+=length($0)-10;if(length($0)>4108||bytes>1048576)bad=1;sub(/^smartdns90:/,"");print;next}
+		{
+			if(length($0)>4096||$0!~/^[a-z_0-9]+=/||$0~/[[:cntrl:]]/) {bad=1;next}
+			key=$0;sub(/=.*/,"",key);value=substr($0,length(key)+2)
+			if(seen[key]++)bad=1
+			if(index("|schema|boot_id|init_generation|source_bootstrap|route_table|rule_priority|mark|mark_mask|policy_interface|policy_device|policy_cidr|source_accounting|source_idle_timeout|source_max_entries|managed_devices|smartdns90_present|","|" key "|")==0)bad=1
+			if(key=="schema"&&value!="1")bad=1
+			if(key=="boot_id"&&value!=boot)bad=1
+			if(key=="source_bootstrap"&&value!~/^[01]$/)bad=1
+			if(key=="init_generation"&&value!=""&&(length(value)!=32||value!~/^[0-9a-f]+$/))bad=1
+			if(key=="smartdns90_present"){present=value;if(value!~/^[01]$/)bad=1}
+		}
+		END {
+			if(bad||!seen["schema"]||!seen["boot_id"]||!seen["route_table"]||!seen["rule_priority"]||!seen["mark"]||!seen["mark_mask"])exit 1
+			if(!seen["smartdns90_present"]){if(n)exit 1;exit 2}
+			if((present==1&&!n)||(present==0&&n))exit 1
+			if(present!=1&&allow_absent!=1)exit 1
+		}' "$receipt"; then receipt_rc=0; else receipt_rc=$?; [ "$receipt_rc" = 2 ] || return 1; fi
+	table=$(sed -n 's/^route_table=//p' "$receipt"); priority=$(sed -n 's/^rule_priority=//p' "$receipt")
+	mark=$(sed -n 's/^mark=//p' "$receipt"); mask=$(sed -n 's/^mark_mask=//p' "$receipt")
+	rp_uint_between "$table" 1 252 && rp_uint_between "$priority" 1 32765 &&
+		rp_is_mark_bit "$mark" && [ "$mark" = "$mask" ] || return 1
+	return "$receipt_rc"
+}
+
+
 rp_mark_conflicts() {
 	ours_mark=$1 ours_mask=$2 ours_priority=$3 ours_table=$4
 	previous_mark=${5-} previous_mask=${6-} previous_priority=${7-} previous_table=${8-}
@@ -309,6 +406,7 @@ rp_mark_conflicts() {
 
 rp_validate_main() {
 	main_errors=0
+	rp_config_admit || main_errors=$((main_errors + 1))
 	for command_name in uci ubus jsonfilter nft ip; do
 		rp_have "$command_name" || { rp_err "缺少命令: $command_name"; main_errors=$((main_errors + 1)); }
 	done
@@ -346,6 +444,121 @@ rp_validate_main() {
 	[ "$main_errors" -eq 0 ]
 }
 
+# shellcheck disable=SC3043
+rp_sources_ready() {
+	local ready_source ready_target ready_format ready_file ready_minimum
+	[ ! -L "$RP_ETC/managed.d" ] && [ ! -L "$RP_MANAGED_CURRENT" ] || { rp_err '静态快照目录不能是符号链接；备份不会隐式跟随链接'; return 1; }
+	for ready_source in $(rp_source_sections); do
+		[ "$(rp_uci_get "$ready_source" enabled 0)" = 1 ] || continue
+		rp_is_name "$ready_source" 32 || return 1
+		ready_target=$(rp_uci_get "$ready_source" target '')
+		case "$ready_target" in domain-policy|domain-default) ready_format=plain-domain ;; ipv4-policy|ipv4-default) ready_format=plain-ipv4 ;; *) return 1 ;; esac
+		ready_file="$RP_MANAGED_CURRENT/$ready_source.$ready_target.list"
+		[ -f "$ready_file" ] && [ ! -L "$ready_file" ] || { rp_err "启用来源缺少已验证静态快照: $ready_source"; return 1; }
+		ready_minimum=$(rp_uci_get "$ready_source" min_entries 1)
+		rp_uint_between "$ready_minimum" 1 10000000 && [ "$(rp_list_count "$ready_file")" -ge "$ready_minimum" ] || return 1
+		ROUTEPOLICY_CONVERTER_STRICT=1 "$LIBEXEC/converters/$ready_format" "$ready_file" >/dev/null 2>&1 || return 1
+	done
+}
+
+# shellcheck disable=SC3043
+rp_managed_equal() {
+	local left=$1 right=$2 differences left_count right_count
+	[ -d "$left" ] && [ ! -L "$left" ] && [ -d "$right" ] && [ ! -L "$right" ] || return 1
+	[ -z "$(find "$left" -mindepth 1 ! -type f)" ] && [ -z "$(find "$right" -mindepth 1 ! -type f)" ] || return 1
+	left_count=$(find "$left" -type f -exec printf x ';' | wc -c)
+	right_count=$(find "$right" -type f -exec printf x ';' | wc -c)
+	[ "$left_count" = "$right_count" ] || return 1
+	differences=$(find "$left" -type f -exec sh -c '
+		root=$1; shift
+		for file do target="$root/${file##*/}"; [ -f "$target" ] && [ ! -L "$target" ] && cmp -s "$file" "$target" || printf "different\n"; done' routepolicy-managed "$right" '{}' +) || return 1
+	[ -z "$differences" ]
+}
+
+# shellcheck disable=SC3043
+rp_managed_phase() {
+	local wal=$1 state=$2
+	printf '%s\n' "$state" >"$wal/managed-phase.new" && sync && mv "$wal/managed-phase.new" "$wal/managed-phase" && sync
+}
+
+# shellcheck disable=SC3043
+rp_managed_prepare() {
+	local wal=$1 name target
+	rp_ensure_dirs
+	for name in current previous; do
+		target="$RP_ETC/managed.d/$name"
+		[ -d "$target" ] && [ ! -L "$target" ] && [ -z "$(find "$target" -mindepth 1 ! -type f)" ] || return 1
+		[ ! -e "$wal/managed-before-$name" ] && [ ! -L "$wal/managed-before-$name" ] || return 1
+		cp -pR "$target" "$wal/managed-before-$name" || return 1
+	done
+	rp_managed_phase "$wal" prepared
+}
+
+# shellcheck disable=SC3043
+rp_managed_publish() {
+	local wal=$1 candidate=$2 swap="$RP_ETC/managed.d/previous.next.$$"
+	case "$candidate" in "$RP_ETC/managed.d/candidate."*) ;; *) return 1 ;; esac
+	[ -d "$candidate" ] && [ ! -L "$candidate" ] && [ -z "$(find "$candidate" -mindepth 1 ! -type f)" ] || return 1
+	[ ! -e "$wal/managed-expected" ] && [ ! -L "$wal/managed-expected" ] && [ ! -e "$swap" ] && [ ! -L "$swap" ] || return 1
+	rp_init_window_open "$wal" && cp -pR "$candidate" "$wal/managed-expected" &&
+		printf '%s\n' "${swap##*/}" >"$wal/managed-swap-name" && rp_managed_phase "$wal" publishing || return 1
+	rp_managed_equal "$RP_MANAGED_CURRENT" "$wal/managed-before-current" && rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" && rp_init_window_open "$wal" || return 1
+	mv "$RP_MANAGED_CURRENT" "$swap" && mv "$candidate" "$RP_MANAGED_CURRENT" || return 1
+	[ ! -e "$wal/managed-retired-previous" ] && [ ! -L "$wal/managed-retired-previous" ] &&
+		rp_managed_equal "$RP_MANAGED_PREVIOUS" "$wal/managed-before-previous" &&
+		mv "$RP_MANAGED_PREVIOUS" "$wal/managed-retired-previous" && sync && mv "$swap" "$RP_MANAGED_PREVIOUS" || return 1
+	rp_managed_phase "$wal" published
+}
+
+# shellcheck disable=SC3043
+rp_managed_restore() {
+	local wal=$1 state name target before expected displaced replacement swap swap_name
+	if [ ! -e "$wal/managed-phase" ] && [ ! -L "$wal/managed-phase" ]; then return 0; fi
+	[ -f "$wal/managed-phase" ] && [ ! -L "$wal/managed-phase" ] || return 1
+	state=$(cat "$wal/managed-phase") || return 1
+	case "$state" in restored) return 0 ;; prepared|publishing|published|restoring) ;; *) return 1 ;; esac
+	swap_name=$(cat "$wal/managed-swap-name" 2>/dev/null) || swap_name=
+	case "$swap_name" in previous.next.[0-9]*) case "${swap_name#previous.next.}" in *[!0-9]*) return 1 ;; esac ;; '') ;; *) return 1 ;; esac
+	swap="$RP_ETC/managed.d/${swap_name:-unused}"
+	if [ -e "$wal/managed-retired-previous" ] || [ -L "$wal/managed-retired-previous" ]; then
+		rp_managed_equal "$wal/managed-retired-previous" "$wal/managed-before-previous" || return 1
+	fi
+	if [ -e "$swap" ] || [ -L "$swap" ]; then rp_managed_equal "$swap" "$wal/managed-before-current" || return 1; fi
+	# Validate both public directories before the first recovery rename.
+	for name in current previous; do
+		target="$RP_ETC/managed.d/$name"; before="$wal/managed-before-$name"
+		[ -d "$before" ] && [ ! -L "$before" ] || return 1
+		if rp_managed_equal "$target" "$before"; then continue; fi
+		[ "$state" != prepared ] || return 1
+		expected="$wal/managed-expected"; [ "$name" != previous ] || expected="$wal/managed-before-current"
+		if rp_managed_equal "$target" "$expected"; then continue; fi
+		[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+		if rp_managed_equal "$swap" "$wal/managed-before-current"; then continue; fi
+		displaced="$wal/managed-displaced-$name"
+		rp_managed_equal "$displaced" "$expected" || return 1
+	done
+	rp_managed_phase "$wal" restoring || return 1
+	for name in current previous; do
+		target="$RP_ETC/managed.d/$name"; before="$wal/managed-before-$name"
+		rp_managed_equal "$target" "$before" && continue
+		expected="$wal/managed-expected"; [ "$name" != previous ] || expected="$wal/managed-before-current"
+		displaced="$wal/managed-displaced-$name"; replacement="$wal/managed-restore-$name"
+		if [ -e "$replacement" ] || [ -L "$replacement" ]; then
+			[ -d "$replacement" ] && [ ! -L "$replacement" ] && [ -z "$(find "$replacement" -mindepth 1 ! -type f)" ] && rm -rf "$replacement" || return 1
+		fi
+		cp -pR "$before" "$replacement" || return 1
+		if [ -e "$target" ] || [ -L "$target" ]; then
+			rp_managed_equal "$target" "$expected" || return 1
+			if [ -e "$displaced" ]; then rp_managed_equal "$displaced" "$expected" && rm -rf "$displaced" || return 1; fi
+			mv "$target" "$displaced" && sync || return 1
+		fi
+		mv "$replacement" "$target" && sync || return 1
+	done
+	# Public snapshots have converged before any fallible cleanup of retired bytes.
+	rp_managed_phase "$wal" restored || return 1
+	if [ -n "$swap_name" ] && [ -e "$swap" ]; then rm -rf "$swap" || true; fi
+}
+
 rp_validate_sources() {
 	source_errors=0
 	for section in $(rp_source_sections); do
@@ -375,6 +588,14 @@ rp_ensure_dirs() {
 	mkdir -p "$RP_USER_DIR" "$RP_MANAGED_CURRENT" "$RP_MANAGED_PREVIOUS" "$RP_STATE_DIR" "$RP_RUN_DIR/lists"
 }
 
+rp_user_list_has_content() {
+	LC_ALL=C awk '
+		/^[[:space:]]*($|[#;])/ { next }
+		{ found = 1; exit }
+		END { exit found ? 0 : 1 }
+	' "$1"
+}
+
 rp_merge_lists() {
 	target=$1
 	output=$2
@@ -387,8 +608,32 @@ rp_merge_lists() {
 	} | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$output"
 }
 
+rp_smartdns90_content() {
+	# shellcheck disable=SC3043
+	local group=$1 smartdns_hosts_file=${2:-$RP_LOCAL_HOSTS}
+	cat <<EOF || return 1
+# Generated by routepolicy. Do not edit.
+nftset-timeout yes
+domain-set -name routepolicy_policy -type list -file /tmp/routepolicy/active/domain-policy.list
+domain-set -name routepolicy_default -type list -file /tmp/routepolicy/active/domain-default.list
+nftset /domain-set:routepolicy_policy/#4:inet#routepolicy#domain_policy4
+nftset /domain-set:routepolicy_default/#4:inet#routepolicy#domain_default4
+domain-rules /domain-set:routepolicy_policy/ -nameserver $group -speed-check-mode none
+domain-rules /domain-set:routepolicy_default/ -speed-check-mode none
+EOF
+	if [ -s "$smartdns_hosts_file" ] && [ ! -L "$smartdns_hosts_file" ]; then
+		cat <<'EOF' || return 1
+hosts-file /etc/routepolicy/user.d/local-hosts.list
+expand-ptr-from-address yes
+EOF
+		awk 'NF >= 2 && $0 !~ /^[[:space:]]*[#;]/ { printf "address /%s/%s\n", $2, $1 }' "$smartdns_hosts_file" || return 1
+		printf '%s\n' 'expand-ptr-from-address no'
+	fi
+}
+
 rp_render_smartdns90() {
-	smartdns_output=$1 smartdns_hosts_file=${2:-$RP_LOCAL_HOSTS}
+	# shellcheck disable=SC3043
+	local smartdns_output=$1 smartdns_hosts_file=${2:-$RP_LOCAL_HOSTS} smartdns_work name result=0
 	rp_ensure_dirs
 	smartdns_work=$(mktemp -d "$RP_RUN_DIR/smartdns-render.XXXXXX") || return 1
 	for name in domain-policy domain-default; do
@@ -400,29 +645,77 @@ rp_render_smartdns90() {
 		fi
 		mv -f "$RP_RUN_DIR/lists/$name.list.new" "$RP_RUN_DIR/lists/$name.list"
 	done
-	group=$(rp_uci_get main smartdns_policy_group policy)
-	cat >"$smartdns_output" <<EOF
-# Generated by routepolicy. Do not edit.
-nftset-timeout yes
-domain-set -name routepolicy_policy -type list -file /tmp/routepolicy/active/domain-policy.list
-domain-set -name routepolicy_default -type list -file /tmp/routepolicy/active/domain-default.list
-nftset /domain-set:routepolicy_policy/#4:inet#routepolicy#domain_policy4
-nftset /domain-set:routepolicy_default/#4:inet#routepolicy#domain_default4
-domain-rules /domain-set:routepolicy_policy/ -nameserver $group -speed-check-mode none
-domain-rules /domain-set:routepolicy_default/ -speed-check-mode none
-EOF
-	if [ -s "$smartdns_hosts_file" ] && [ ! -L "$smartdns_hosts_file" ]; then
-		cat >>"$smartdns_output" <<'EOF'
-hosts-file /etc/routepolicy/user.d/local-hosts.list
-expand-ptr-from-address yes
-EOF
-		awk 'NF >= 2 && $0 !~ /^[[:space:]]*[#;]/ { printf "address /%s/%s\n", $2, $1 }' "$smartdns_hosts_file" >>"$smartdns_output"
-		printf '%s\n' 'expand-ptr-from-address no' >>"$smartdns_output"
-	fi
+	rp_smartdns90_content "$(rp_uci_get main smartdns_policy_group policy)" "$smartdns_hosts_file" >"$smartdns_output" || result=1
 	rm -rf "$smartdns_work"
+	return "$result"
 }
 
 rp_list_count() { awk 'NF && $0 !~ /^[[:space:]]*[#;]/ { n++ } END { print n+0 }' "$1"; }
+
+rp_normalize_local_hosts() {
+	awk '
+	function ipv4(s,a,i){if(split(s,a,".")!=4)return 0;for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0;return 1}
+	function ipv6(s){return index(s,":")&&s~/^[0-9A-Fa-f:]+$/&&s!~/:::/}
+	function host(s,n,a,i){if(length(s)<1||length(s)>253||s!~/^[A-Za-z0-9.-]+$/||s~/^[-.]|[-.]$|\.\./)return 0;n=split(s,a,".");for(i=1;i<=n;i++)if(length(a[i])>63||a[i]~/^[-]|[-]$/)return 0;return 1}
+	/^[[:space:]]*(#|;|$)/{next}
+	{if(NF<2||(!ipv4($1)&&!ipv6($1))){bad=1;next};ip=tolower($1);line=ip;for(i=2;i<=NF;i++){name=tolower($i);if(!host(name)||(seen[name]&&seen[name]!=ip)){bad=1;next};seen[name]=ip;line=line " " name};print line}
+	END{exit bad}'
+}
+
+rp_config_admit() {
+	rp_config_version=$(rp_uci_get main config_schema 0)
+	case "$rp_config_version" in 0|1) return 0 ;; *) rp_err '不支持配置 schema；拒绝执行或降级解释'; return 1 ;; esac
+}
+
+rp_init_now_cs() {
+	# /proc/uptime supplies boot-scoped centiseconds, independent of wall time.
+	LC_ALL=C awk '
+		NR!=1 || NF!=2 || $1 !~ /^[0-9]+\.[0-9][0-9]$/ || $1>=10000000000 {exit 1}
+		{printf "%.0f\n", $1*100}
+		END {if(NR!=1) exit 1}
+	' "$RP_ROOT/proc/uptime"
+}
+rp_init_window_seconds() {
+	# Transactions written before the window marker retain their 120 seconds.
+	if [ ! -e "$1/window-seconds" ] && [ ! -L "$1/window-seconds" ]; then
+		printf '%s\n' 120
+		return 0
+	fi
+	[ -f "$1/window-seconds" ] && [ ! -L "$1/window-seconds" ] &&
+		printf '%s\n' "$RP_INIT_WINDOW_SECONDS" | cmp -s - "$1/window-seconds" || return 1
+	printf '%s\n' "$RP_INIT_WINDOW_SECONDS"
+}
+# shellcheck disable=SC3043
+rp_init_remaining_cs() {
+	local started extra now window
+	[ -f "$1/uptime-start-cs" ] && [ ! -L "$1/uptime-start-cs" ] || return 1
+	{ IFS= read -r started && ! IFS= read -r extra && [ -z "$extra" ]; } <"$1/uptime-start-cs" || return 1
+	case "$started" in 0[0-9]*) return 1 ;; esac
+	rp_uint_between "$started" 0 999999999999 || return 1
+	window=$(rp_init_window_seconds "$1") && now=$(rp_init_now_cs) && [ "$now" -ge "$started" ] || return 1
+	printf '%s\n' "$((started + window * 100 - now))"
+}
+# shellcheck disable=SC3043
+rp_init_window_open() {
+	local remaining
+	remaining=$(rp_init_remaining_cs "$1") && [ "$remaining" -gt 0 ]
+}
+
+rp_utf8_text() {
+	# Validate bytes without depending on the router's optional locale database.
+	LC_ALL=C awk '
+	BEGIN{for(i=1;i<256;i++)ord[sprintf("%c",i)]=i}
+	{for(i=1;i<=length($0);i++){
+		b=ord[substr($0,i,1)];n=0;lo=128;hi=191
+		if(b>=32&&b<127)continue
+		if(b>=194&&b<=223)n=1
+		else if(b>=224&&b<=239){n=2;if(b==224)lo=160;if(b==237)hi=159}
+		else if(b>=240&&b<=244){n=3;if(b==240)lo=144;if(b==244)hi=143}
+		else{bad=1;break}
+		for(j=1;j<=n;j++){v=ord[substr($0,++i,1)];if(v<(j==1?lo:128)||v>(j==1?hi:191)){bad=1;break}}
+		if(bad)break
+	}}END{exit bad}'
+}
 
 rp_output_ok() {
 	operation=$1
@@ -447,7 +740,8 @@ rp_output_error() {
 rp_smartdns_init_probes() {
 	printf '%s\n' '# routepolicy initialization probes' \
 		'domain-rules /routepolicy-init-default.test/ -nameserver rp_init_default -speed-check-mode none' \
-		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none'
+		'domain-rules /routepolicy-init-policy.test/ -nameserver rp_init_policy -speed-check-mode none' \
+		'address /routepolicy-init-resolver.test/127.0.0.1'
 }
 
 # A confirmed DNS contract survives replacement of the reviewable candidate WAL.
@@ -458,7 +752,8 @@ rp_init_confirmed_record() {
 	active_token=$(cat "$active_tx/$1") || return 1
 	[ "${#active_token}" = 32 ] || return 1
 	case "$active_token" in *[!0-9a-f]*) return 1 ;; esac
-	active_record="$active_tx/confirmed-$active_token"
+	active_record="$active_tx/confirmed/$active_token"
+	[ -e "$active_record" ] || active_record="$active_tx/confirmed-$active_token"
 	[ -d "$active_record" ] && [ ! -L "$active_record" ] && [ ! -L "$active_record/token" ] && [ ! -L "$active_record/phase" ] &&
 		[ "$(cat "$active_record/token")" = "$active_token" ] && [ "$(cat "$active_record/phase")" = confirmed ] || return 1
 	printf '%s\n' "$active_record"
@@ -506,6 +801,22 @@ rp_dns_boot_pending() {
 	[ -f "$RP_STATE_DIR/init-transaction/current/dns-boot-pending" ] && return 0
 	active_pending=$(rp_init_active_record) || return 1
 	[ -f "$active_pending/dns-boot-pending" ]
+}
+# Only these exact standard permission strings are supported; other modes are conflicts.
+# shellcheck disable=SC3043
+rp_path_mode() {
+	local detail
+	detail=$(LC_ALL=C ls -ld "$1") || return 1
+	case "${detail%% *}" in
+		-rw-r--r--) printf 644 ;; drwxr-xr-x) printf 755 ;; drwxrwxrwt) printf 1777 ;; *) return 1 ;;
+	esac
+}
+rp_system_resolver_ready() {
+	[ -L "$RP_ROOT/etc/resolv.conf" ] && [ "$(readlink "$RP_ROOT/etc/resolv.conf")" = /tmp/resolv.conf ] &&
+		[ -L "$RP_RESOLVER_ENTRY" ] && [ "$(readlink "$RP_RESOLVER_ENTRY")" = /tmp/resolv.conf.d/routepolicy.conf ] &&
+		[ -d "$RP_ROOT/tmp/resolv.conf.d" ] && [ ! -L "$RP_ROOT/tmp/resolv.conf.d" ] &&
+		[ -f "$RP_RESOLVER_FILE" ] && [ ! -L "$RP_RESOLVER_FILE" ] && [ "$(rp_path_mode "$RP_RESOLVER_FILE")" = 644 ] &&
+		printf 'nameserver 127.0.0.1\n' | cmp -s - "$RP_RESOLVER_FILE"
 }
 
 # One kernel gate covers initialization, candidate publication and runtime writers.
@@ -563,6 +874,7 @@ rp_writer_drain_legacy() {
 }
 rp_writer_enter() {
 	rp_writer_role=$1
+	rp_config_admit || return 1
 	if [ -n "${ROUTEPOLICY_WRITER_OWNER:-}" ]; then
 		rp_writer_owned || { rp_err 'writer owner 已失效或未继承真实写锁'; return 1; }
 		[ "$rp_writer_role" != init ] || [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] || return 1
@@ -582,9 +894,24 @@ rp_writer_enter() {
 		export ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND
 		rp_writer_drain_legacy || { rp_err '已有 apply/update/SmartDNS writer 尚未退出或旧锁归属未知'; return 1; }
 	fi
+	if [ -e "$RP_STATE_DIR/init-transaction/declarations" ] || [ -L "$RP_STATE_DIR/init-transaction/declarations" ]; then
+		[ -d "$RP_STATE_DIR/init-transaction/declarations" ] && [ ! -L "$RP_STATE_DIR/init-transaction/declarations" ] &&
+			[ ! -L "$RP_STATE_DIR/init-transaction/declarations/phase" ] && [ ! -L "$RP_STATE_DIR/init-transaction/declarations/init-token" ] || return 1
+		rp_declaration_phase=$(cat "$RP_STATE_DIR/init-transaction/declarations/phase" 2>/dev/null) || rp_declaration_phase=preparing
+	else rp_declaration_phase=absent; fi
+	case "$rp_declaration_phase" in
+		absent|committed|rolled_back) ;;
+		installed)
+			if [ "${operation:-}" = restore-prepare ] || [ "${operation:-}" = restore-recover ]; then :
+			elif [ "${ROUTEPOLICY_DECLARATION_OWNER:-0}" = 1 ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned; then :
+			elif [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && [ -f "$RP_STATE_DIR/init-transaction/declarations/init-token" ] &&
+				[ "$(cat "$RP_STATE_DIR/init-transaction/declarations/init-token")" = "$(cat "$RP_STATE_DIR/init-transaction/current/token" 2>/dev/null)" ]; then :
+			else rp_err '导入声明等待网络确认或 restore-recover；禁止其他 writer'; return 1; fi ;;
+		*) [ "${operation:-}" = restore-recover ] || { rp_err '声明安装中断；先执行 restore-recover'; return 1; } ;;
+	esac
 	if [ "$rp_writer_role" != init ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" != init ]; then
 		if [ -e "$RP_STATE_DIR/init-transaction/active" ] || [ -L "$RP_STATE_DIR/init-transaction/active" ]; then rp_init_active_record >/dev/null || return 1; fi
-		case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in absent|expired|confirmed|rolled_back) ;; *) rp_err '初始化事务尚未完成'; return 1 ;; esac
+		case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in absent|expired|confirmed|rolled_back|exited) ;; *) rp_err '初始化事务尚未完成'; return 1 ;; esac
 		! rp_dns_boot_pending || { rp_err '已确认 DNS 启动尚未验证'; return 1; }
 	fi
 	if [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ]; then
@@ -595,7 +922,7 @@ rp_writer_enter() {
 rp_native_run() {
 	rp_native_timeout=$1; shift
 	timeout -k 2 "$rp_native_timeout" sh -c '
-		unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND ROUTEPOLICY_INIT_RESTORE ROUTEPOLICY_INIT_GENERATION ROUTEPOLICY_DNS_DEFER
+		unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND ROUTEPOLICY_INIT_RESTORE ROUTEPOLICY_INIT_GENERATION ROUTEPOLICY_DNS_DEFER ROUTEPOLICY_DECLARATION_OWNER
 		exec 9>&-
 		exec "$@"' routepolicy-native "$@"
 }

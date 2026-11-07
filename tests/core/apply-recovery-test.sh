@@ -141,6 +141,8 @@ if sh "$tmp/owner" apply >"$tmp/result" 2>&1; then printf 'unsafe publication wa
 [ -f "$state/applied" ]; no_mutation
 # Same-boot schema-1 cleanup still performs and verifies normal owned deletion.
 reset; cp "$wal/boot-id" "$ROUTEPOLICY_ROOT/proc/sys/kernel/random/boot_id"
+printf 'boot_id=%s\n' "$(cat "$wal/boot-id")" >>"$state/applied"
+printf nft >"$tmp/scenario"
 printf 1 >"$wal/policy-active"
 sh "$tmp/owner" >"$tmp/result" 2>&1
 [ ! -e "$state/applied" ]

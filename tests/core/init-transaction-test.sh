@@ -53,8 +53,9 @@ TEST_SYNC_BIN=$(command -v sync)
 TEST_FLOCK_BIN=$(command -v flock)
 TEST_DATE_BIN=$(command -v date)
 TEST_SLEEP_BIN=$(command -v sleep)
+TEST_TIMEOUT_BIN=$(command -v timeout)
 TEST_OWNER_PID=$$
-export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_DATE_BIN TEST_SLEEP_BIN TEST_OWNER_PID
+export TEST_NATIVE_UCI_PATH TEST_SYNC_BIN TEST_FLOCK_BIN TEST_DATE_BIN TEST_SLEEP_BIN TEST_TIMEOUT_BIN TEST_OWNER_PID
 export PATH="$tmp/bin:$PATH"
 TX="$tmp/lib/init-transaction"
 WAL="$tmp/root/etc/routepolicy/state/init-transaction/current"
@@ -153,6 +154,7 @@ case "$1" in
 			printf 'set\tfirewall.rp_init_policy\tzone\nset\tfirewall.rp_init_policy.name\trp_init_policy\nset\tfirewall.rp_init_policy.network\tusbwan\nset\tfirewall.rp_init_policy.input\tREJECT\nset\tfirewall.rp_init_policy.output\tACCEPT\nset\tfirewall.rp_init_policy.forward\tDROP\n'
 		fi ;;
 	verify)
+		[ ! -f "$TEST_TX_DIR/verify-clock" ] || cat "$TEST_TX_DIR/verify-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"
 		if [ -f "$TEST_TX_DIR/dhcp-test" ]; then
 			printf '%s\n' verify >>"$TEST_TX_DIR/dhcp-verify-calls"
 			current=$(ubus call network.interface dump)
@@ -319,6 +321,9 @@ EOF
 cat >"$tmp/bin/sync" <<'EOF'
 #!/bin/sh
 wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+if [ -f "$TEST_TX_DIR/pending-clock" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = pending ]; then
+	cat "$TEST_TX_DIR/pending-clock" >"$ROUTEPOLICY_ROOT/proc/uptime"; rm "$TEST_TX_DIR/pending-clock"
+fi
 if [ -f "$TEST_TX_DIR/wal-fault" ] && [ "$(cat "$wal/stage" 2>/dev/null)" = commit:routepolicy.main.lan_interface ]; then
 	fault=$(cat "$TEST_TX_DIR/wal-fault"); rm "$TEST_TX_DIR/wal-fault"
 	case "$fault" in sync) exit 1 ;; attempted) mkdir "$wal/fields/1/attempted" || exit 1 ;; esac
@@ -352,6 +357,11 @@ if [ "$#" = 1 ] && [ "$1" = 1 ] && { [ -f "$TEST_TX_DIR/dhcp-clock-active" ] || 
 	mv "$TEST_TX_DIR/uptime-next" "$ROUTEPOLICY_ROOT/proc/uptime"
 else exec "$TEST_SLEEP_BIN" "$@"; fi
 EOF
+cat >"$tmp/bin/timeout" <<'EOF'
+#!/bin/sh
+case " $* " in *' routepolicy-policy-sync '*) printf '%s\n' "$3" >>"$TEST_TX_DIR/policy-timeout" ;; esac
+exec "$TEST_TIMEOUT_BIN" "$@"
+EOF
 for service in network firewall dnsmasq odhcpd routepolicy-initguard; do
 	cat >"$tmp/root/etc/init.d/$service" <<'EOF'
 #!/bin/sh
@@ -363,7 +373,7 @@ case "$name" in
 	network) cat "$TEST_TX_DIR/db/network.lan.ipaddr" >"$TEST_TX_DIR/runtime-management" ;;
 	dnsmasq) cat "$TEST_TX_DIR/db/dhcp.lan.ignore" >"$TEST_TX_DIR/runtime-ignore" ;;
 esac
-[ "$name" != dnsmasq ] || [ ! -f "$TEST_TX_DIR/dhcp-short-window" ] || printf '1119.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"
+[ "$name" != dnsmasq ] || [ ! -f "$TEST_TX_DIR/dhcp-short-window" ] || printf '1179.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"
 EOF
 done
 chmod +x "$tmp/bin/"* "$tmp/lib/init-topology" "$tmp/root/etc/init.d/"*
@@ -377,6 +387,7 @@ reset() {
 	rm -f "$tmp/guard-delete"
 	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
 	rm -f "$tmp/"auto-*
+	rm -f "$tmp/verify-clock" "$tmp/pending-clock"
 	rm -f "$tmp/"dhcp-* "$tmp/"policy-* "$tmp/runtime-policy"
 	mkdir -p "$tmp/root/etc/config"
 	for config_package in network dhcp firewall routepolicy smartdns; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
@@ -450,11 +461,16 @@ dhcp_readiness_test() {
 	[ "$(cat "$tmp/dhcp-polls")" -ge 17 ]
 	[ "$(wc -l <"$tmp/dhcp-verify-calls")" = 1 ]
 	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]
-	[ "$(cat "$WAL/deadline")" = 1700000120 ]
+	[ "$(cat "$WAL/deadline")" = 1700000180 ]
 }
 policy_runtime_tests() {
 	policy_apply_test
 	policy_rollback_test
+	reset; enable_policy_fixture; prepare_policy
+	printf '1155.00 0.00\n' >"$tmp/verify-clock"
+	"$TX" apply "$token" >/dev/null; phase_is pending
+	[ "$(cat "$tmp/policy-timeout")" = 25 ]
+	"$TX" recover >/dev/null; phase_is rolled_back
 	# Disabled stays disabled; enabled-but-missing runtime must fail before any network write.
 	reset; prepare_policy; "$TX" apply "$token" >/dev/null; "$TX" recover >/dev/null
 	[ ! -f "$tmp/policy-apply-calls" ]
@@ -536,13 +552,13 @@ dhcp_readiness_tests() {
 	for incomplete in pending kernel-other-only; do
 		reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test"; printf '%s' "$incomplete" >"$tmp/dhcp-mode"
 		prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
-		[ "$(cat "$tmp/root/proc/uptime")" = '1100.00 0.00' ]
-		[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000120 ]
+		[ "$(cat "$tmp/root/proc/uptime")" = '1160.00 0.00' ]
+		[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000180 ]
 	done
 	reset; touch "$tmp/link-enabled" "$tmp/link-dhcp" "$tmp/dhcp-test" "$tmp/dhcp-short-window"
 	prepare_dhcp; bad "$TX" apply "$token"; phase_is rolled_back
 	[ ! -f "$tmp/dhcp-polls" ]
-	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000120 ]
+	[ "$(cat "$WAL/uptime-start-cs")" = 100000 ]; [ "$(cat "$WAL/deadline")" = 1700000180 ]
 }
 phase_is() { [ "$(cat "$WAL/phase")" = "$1" ]; }
 restored() {
@@ -566,6 +582,7 @@ stop_race_guard() { kill "$race_guard"; wait "$race_guard" 2>/dev/null || true; 
 guard_race_tests() {
 	# Healthy pending polling does not compete with confirm for the writer lock.
 	reset; prepare; "$TX" apply "$token" >/dev/null
+	printf '1179.99 0.00\n' >"$tmp/root/proc/uptime"
 	printf 9999999999 >"$WAL/deadline"; : >"$tmp/auto-arm"
 	"$TX" guard >"$tmp/auto-guard-output" 2>&1 & race_guard=$!
 	sleep 2
@@ -590,7 +607,7 @@ guard_race_tests() {
 	"$TX" recover >/dev/null; phase_is rolled_back; restored
 	# A delayed expiry observation must not roll back the next healthy prepared/applied generation.
 	reset; prepare; "$TX" apply "$token" >/dev/null
-	old_token=$token; printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"; : >"$tmp/auto-arm"
+	old_token=$token; printf '1180.00 0.00\n' >"$tmp/root/proc/uptime"; : >"$tmp/auto-arm"
 	"$TX" guard >"$tmp/auto-guard-output" 2>&1 & race_guard=$!
 	wait_auto_ready
 	"$TX" recover >/dev/null; phase_is rolled_back
@@ -617,11 +634,11 @@ confirm_boot_tests() {
 }
 backward_clock_test() {
 	reset; prepare; "$TX" apply "$token" >/dev/null
-	[ "$(cat "$WAL/deadline")" = 1700000120 ]
+	[ "$(cat "$WAL/deadline")" = 1700000180 ]
 	printf 1699996400 >"$tmp/wall-clock"
-	printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"
+	printf '1180.00 0.00\n' >"$tmp/root/proc/uptime"
 	"$TX" recover-auto >/dev/null
-	printf 'wall-clock backward at elapsed 120s: %s\n' "$(cat "$WAL/phase")"
+	printf 'wall-clock backward at elapsed 180s: %s\n' "$(cat "$WAL/phase")"
 	phase_is rolled_back; restored
 }
 forward_clock_test() {
@@ -631,29 +648,46 @@ forward_clock_test() {
 	"$TX" recover-auto >/dev/null
 	printf 'wall-clock forward at elapsed 1s: %s\n' "$(cat "$WAL/phase")"
 	phase_is pending
-	[ "$(cat "$WAL/deadline")" = 1700000120 ]
+	[ "$(cat "$WAL/deadline")" = 1700000180 ]
 	SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/null
 	phase_is confirmed
 }
 monotonic_clock_tests() {
 	backward_clock_test
 	forward_clock_test
-	# Fractional uptime must preserve a full 120-second window, including the last centisecond.
+	# Fractional uptime must preserve a full 180-second window, including the last centisecond.
 	reset; printf '1000.25 0.00\n' >"$tmp/root/proc/uptime"; prepare; "$TX" apply "$token" >/dev/null
 	[ "$(cat "$WAL/uptime-start-cs")" = 100025 ]
-	printf '1120.24 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is pending
-	printf '1120.25 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is rolled_back; restored
-	# Old WAL and unreadable/corrupt monotonic evidence cannot extend the window via epoch time.
-	for clock_fault in legacy invalid regressed unreadable; do
+	printf '1180.24 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is pending
+	printf '1180.25 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is rolled_back; restored
+	# A pending WAL from the previous version still expires at 120 seconds.
+	reset; prepare; "$TX" apply "$token" >/dev/null
+	rm "$WAL/window-seconds"; printf '1700000120\n' >"$WAL/deadline"
+	printf '1119.99 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is pending
+	"$TX" apply "$token" | grep -Fq '"deadline":"1700000120"'
+	[ ! -e "$WAL/window-seconds" ]
+	printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"; "$TX" recover-auto >/dev/null; phase_is rolled_back; restored
+	# Missing/invalid clock evidence or malformed duration is due immediately.
+	for clock_fault in missing invalid regressed unreadable uptime-link window-value window-extra window-link window-dangling; do
 		reset; prepare; "$TX" apply "$token" >/dev/null; printf 9999999999 >"$WAL/deadline"
 		case "$clock_fault" in
-			legacy) rm "$WAL/uptime-start-cs" ;;
+			missing) rm "$WAL/uptime-start-cs" ;;
 			invalid) printf 000009 >"$WAL/uptime-start-cs" ;;
 			regressed) printf '999.99 0.00\n' >"$tmp/root/proc/uptime" ;;
 			unreadable) printf unavailable >"$tmp/root/proc/uptime" ;;
+			uptime-link) mv "$WAL/uptime-start-cs" "$WAL/uptime-other"; ln -s uptime-other "$WAL/uptime-start-cs" ;;
+			window-value) printf '181\n' >"$WAL/window-seconds" ;;
+			window-extra) printf '180\n\n' >"$WAL/window-seconds" ;;
+			window-link) mv "$WAL/window-seconds" "$WAL/window-other"; ln -s window-other "$WAL/window-seconds" ;;
+			window-dangling) rm "$WAL/window-seconds"; ln -s missing "$WAL/window-seconds" ;;
 		esac
 		"$TX" recover-auto >/dev/null; phase_is rolled_back; restored
 	done
+	reset; prepare; ln -s "$tmp/window-target" "$WAL/window-seconds"
+	printf 'untouched\n' >"$tmp/window-target"
+	bad "$TX" apply "$token"; phase_is prepared
+	grep -Fxq untouched "$tmp/window-target"
+	[ ! -f "$tmp/commits" ]; [ ! -f "$tmp/link-log" ]; restored
 	reset; prepare; "$TX" apply "$token" >/dev/null; rm "$WAL/uptime-start-cs"
 	bad env SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token"
 	phase_is rolled_back; restored
@@ -662,7 +696,37 @@ monotonic_clock_tests() {
 	[ ! -f "$tmp/commits" ]; [ ! -f "$tmp/link-log" ]; restored
 }
 
+confirmation_budget_tests() {
+	reset
+	"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 | grep -Fq '"confirmation_timeout":180'
+	for finished in 1160.00 1160.01 1179.42; do
+		reset; prepare; printf '%s 0.00\n' "$finished" >"$tmp/verify-clock"
+		printf '%s\n' "$out" | grep -Fq '"confirmation_timeout":180'
+		[ ! -e "$WAL/window-seconds" ]
+		if [ "$finished" = 1160.00 ]; then
+			"$TX" apply "$token" >/dev/null; phase_is pending
+			[ "$(cat "$WAL/window-seconds")" = 180 ]
+			rm "$tmp/verify-clock"; printf '1179.99 0.00\n' >"$tmp/root/proc/uptime"
+			printf '1700003600\n' >"$tmp/wall-clock"
+			cp "$tmp/commits" "$tmp/retry-commits"; cp "$tmp/services" "$tmp/retry-services"
+			"$TX" apply "$token" | grep -Fq '"deadline":"1700000180"'; phase_is pending
+			[ "$(cat "$WAL/deadline")" = 1700000180 ] && [ "$(cat "$WAL/uptime-start-cs")" = 100000 ]
+			[ "$(cat "$WAL/window-seconds")" = 180 ]
+			cmp "$tmp/commits" "$tmp/retry-commits"; cmp "$tmp/services" "$tmp/retry-services"
+			printf '1180.01 0.00\n' >"$tmp/verify-clock"
+			SSH_CONNECTION='198.51.100.9 1234 192.0.2.2 22' "$TX" confirm "$token" >/dev/null; phase_is confirmed
+		else
+			bad "$TX" apply "$token"; phase_is rolled_back; restored
+			[ "$(cat "$WAL/failed-stage")" = confirmation-window ]
+		fi
+	done
+	reset; prepare; printf '1160.01 0.00\n' >"$tmp/pending-clock"
+	bad "$TX" apply "$token"; phase_is rolled_back; restored
+	[ "$(cat "$WAL/failed-stage")" = confirmation-window ]
+printf '%s\n' 'confirmation budget: passed (180s, 20s reserve, unchanged pending retry, phase persistence, one confirmation admission)'
+}
 case "${1:-}" in
+	--confirmation-budget) confirmation_budget_tests; exit 0 ;;
 	--guard-races) guard_race_tests; exit 0 ;;
 	--confirm-boot) confirm_boot_tests; exit 0 ;;
 	--clock-backward) backward_clock_test; exit 0 ;;
@@ -966,7 +1030,7 @@ printf '192.0.2.1\n' >"$tmp/db/network.lan.ipaddr"
 bad "$TX" prepare lan wan usbwan - - - - - - 192.0.2.2 24
 
 reset; prepare; "$TX" apply "$token" >/dev/null
-printf '1120.00 0.00\n' >"$tmp/root/proc/uptime"
+printf '1180.00 0.00\n' >"$tmp/root/proc/uptime"
 "$TX" guard & guard_pid=$!
 wait "$guard_pid"
 phase_is rolled_back
@@ -1023,6 +1087,7 @@ phase_is conflict
 guard_race_tests
 confirm_boot_tests
 monotonic_clock_tests
+confirmation_budget_tests
 policy_runtime_tests
 dhcp_readiness_tests
 

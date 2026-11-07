@@ -1,2 +1,7 @@
 /etc/config/routepolicy
-/etc/routepolicy/
+/etc/routepolicy/user.d/
+/etc/routepolicy/managed.d/current/
+/etc/routepolicy/state/init-transaction/active
+/etc/routepolicy/state/init-transaction/source
+/etc/routepolicy/state/init-transaction/confirmed/
+/etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf

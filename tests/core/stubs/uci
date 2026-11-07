@@ -31,7 +31,7 @@ case "${1:-}" in
 			routepolicy.main.rule_priority) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo -1 || echo "${TEST_RULE_PRIORITY:-12000}" ;;
 			routepolicy.main.mark) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo 0xzz || echo "${TEST_MARK:-0x100}" ;;
 			routepolicy.main.mark_mask) [ "${TEST_BAD_CONFIG:-0}" = 1 ] && echo 0xzz || echo "${TEST_MARK_MASK:-0x100}" ;;
-			routepolicy.main.smartdns_policy_group) echo policy ;;
+			routepolicy.main.smartdns_policy_group) echo "${TEST_SMARTDNS_POLICY_GROUP:-policy}" ;;
 			routepolicy.main.update_hour) echo 4 ;;
 			routepolicy.main.update_minute) echo 17 ;;
 			*) exit 1 ;;

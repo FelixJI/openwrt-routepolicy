@@ -3,8 +3,17 @@
 set -u
 LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
 . "$LIBEXEC/common"
-[ "$#" = 0 ] || { [ "$#" = 1 ] && [ "$1" = scheduled ]; } || { rp_output_error update '更新参数非法'; exit 1; }
+[ "$#" = 0 ] || { [ "$#" = 1 ] && { [ "$1" = scheduled ] || [ "$1" = init-stage ]; }; } || { rp_output_error update '更新参数非法'; exit 1; }
 rp_writer_enter update || { rp_output_error update '写入门禁忙或初始化尚未完成'; exit 1; }
+init_stage=0
+if [ "${1:-}" = init-stage ]; then
+	init_wal="$RP_STATE_DIR/init-transaction/current"
+	[ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned &&
+		[ -n "${ROUTEPOLICY_INIT_GENERATION:-}" ] && [ "$(cat "$init_wal/token" 2>/dev/null)" = "$ROUTEPOLICY_INIT_GENERATION" ] &&
+		[ "$(cat "$init_wal/phase" 2>/dev/null)" = applying ] && [ "$(cat "$init_wal/managed-phase" 2>/dev/null)" = prepared ] &&
+		rp_init_window_open "$init_wal" || { rp_output_error update 'init-stage 仅接受真实初始化 writer、当前 token、未过期窗口与写前快照'; exit 1; }
+	init_stage=1
+fi
 
 if [ "${1:-}" = scheduled ]; then
 	# Recheck and consume the daily attempt only after acquiring the shared writer gate.
@@ -26,6 +35,7 @@ rp_have curl || { rp_output_error update '缺少 curl'; exit 1; }
 rp_ensure_dirs
 lock="$RP_RUN_DIR/update.lock"
 rp_local_lock "$lock" || { rp_output_error update '另一个更新操作正在进行'; exit 1; }
+# shortcut: SIGKILL can leave this private unpublished candidate; general update cleanup is separate.
 candidate=$(mktemp -d "$RP_ETC/managed.d/candidate.XXXXXX") || { rp_local_unlock "$lock"; exit 1; }
 work=$(mktemp -d "$RP_RUN_DIR/update.XXXXXX") || { rm -rf "$candidate"; rp_local_unlock "$lock"; exit 1; }
 cleanup() { rm -rf "$work"; [ ! -d "$candidate" ] || rm -rf "$candidate"; rp_local_unlock "$lock"; }
@@ -37,6 +47,7 @@ sections=$(rp_source_sections)
 updated=0
 for section in $sections; do
 	[ "$(rp_uci_get "$section" enabled 0)" = 1 ] || continue
+	[ "$init_stage" != 1 ] || rp_init_window_open "$init_wal" || { rp_output_error update '来源下载前初始化窗口已过期'; exit 1; }
 	url=$(rp_uci_get "$section" url '')
 	format=$(rp_uci_get "$section" format '')
 	target=$(rp_uci_get "$section" target '')
@@ -80,13 +91,21 @@ for section in $sections; do
 done
 [ "$updated" -gt 0 ] || { rp_output_error update '没有启用的清单来源'; exit 1; }
 
+if [ "$init_stage" = 1 ]; then
+	rp_managed_publish "$init_wal" "$candidate" || { rp_output_error update '初始化清单发布中断、窗口过期或出现外部修改；保留恢复证据'; exit 1; }
+	candidate=
+	date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-update"
+	rp_output_ok update "已更新 $updated 个来源并保留 previous"
+	exit 0
+fi
+
 next_previous="$RP_ETC/managed.d/previous.next.$$"
 [ ! -e "$next_previous" ] || { rp_output_error update '内部候选目录冲突'; exit 1; }
 mv "$RP_MANAGED_CURRENT" "$next_previous" || exit 1
 mv "$candidate" "$RP_MANAGED_CURRENT" || { mv "$next_previous" "$RP_MANAGED_CURRENT"; exit 1; }
 candidate=
 
-if [ "$(rp_uci_get main enabled 0)" = 1 ]; then
+if [ "$init_stage" != 1 ] && [ "$(rp_uci_get main enabled 0)" = 1 ]; then
 	if ! ROUTEPOLICY_OUTPUT=text "$LIBEXEC/apply" >"$work/apply.log" 2>&1; then
 		failed_current="$RP_ETC/managed.d/failed.$$.tmp"
 		mv "$RP_MANAGED_CURRENT" "$failed_current"
@@ -98,7 +117,6 @@ if [ "$(rp_uci_get main enabled 0)" = 1 ]; then
 		exit 1
 	fi
 fi
-rm -rf "$RP_MANAGED_PREVIOUS"
-mv "$next_previous" "$RP_MANAGED_PREVIOUS"
+rm -rf "$RP_MANAGED_PREVIOUS" && mv "$next_previous" "$RP_MANAGED_PREVIOUS" || { rp_output_error update 'previous 发布中断；保留恢复证据'; exit 1; }
 date -u +%Y-%m-%dT%H:%M:%SZ >"$RP_STATE_DIR/last-update"
 rp_output_ok update "已更新 $updated 个来源并保留 previous"

@@ -1,7 +1,8 @@
 #!/bin/sh
 [ -z "${TEST_IP_LOG:-}" ] || printf '%s\n' "$*" >>"$TEST_IP_LOG"
 case "$*" in
-	'-4 rule show')
+	'-4 rule show'|'-4 -N rule show')
+		[ -f "${ROUTEPOLICY_ROOT:-}/etc/routepolicy/state/applied" ] || [ "${TEST_IP_PRESENT:-0}" = 1 ] || exit 0
 		if [ "${TEST_IP_RULE_DELETE_FAIL:-0}" = 1 ] || [ -z "${TEST_IP_LOG:-}" ] || ! grep -Fq -- '-4 rule del priority 12000 fwmark 0x100/0x100 lookup 200' "$TEST_IP_LOG"; then
 			echo '12000: from all fwmark 0x100/0x100 lookup 200'
 		fi
@@ -9,6 +10,7 @@ case "$*" in
 	'-4 rule del '*) [ "${TEST_IP_RULE_DELETE_FAIL:-0}" != 1 ] ;;
 	'-4 route flush table '*) [ "${TEST_IP_ROUTE_FLUSH_FAIL:-0}" != 1 ] ;;
 	'-4 route show table 200')
+		[ -f "${ROUTEPOLICY_ROOT:-}/etc/routepolicy/state/applied" ] || [ "${TEST_IP_PRESENT:-0}" = 1 ] || exit 0
 		if [ "${TEST_IP_ROUTE_FLUSH_FAIL:-0}" = 1 ] || [ -z "${TEST_IP_LOG:-}" ] || ! grep -Fq -- '-4 route flush table 200' "$TEST_IP_LOG"; then
 			printf 'default via 198.18.0.1 dev usb0 metric 10\nblackhole default metric 32760\n'
 		fi

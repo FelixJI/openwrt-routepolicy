@@ -13,6 +13,9 @@ Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollb
        routepolicyctl init-{discover|status|recover} [--json]
        routepolicyctl init-{preview|prepare} ACCESS DEFAULT POLICY NEW_ROLE NEW_DEVICE NEW_PROTO NEW_IP NEW_PREFIX NEW_GATEWAY MANAGEMENT_IP MANAGEMENT_PREFIX [DEFAULT_DNS POLICY_DNS]
        routepolicyctl init-{apply|confirm} TOKEN
+       routepolicyctl {config-export|config-import|restore-status|restore-prepare|restore-recover|migrate|package-preview|package-check|disable-preview|uninstall} [--json]
+       routepolicyctl exit-{preview|prepare} [--json]
+       routepolicyctl exit-apply TOKEN
 EOF
 	exit 2
 }
@@ -22,7 +25,21 @@ command_name=$1
 shift
 
 case "$command_name" in
-	init-discover|init-status|init-recover)
+	config-export|config-import|restore-status|restore-prepare|restore-recover|migrate|package-preview|package-check|disable-preview|uninstall|init-apply-request|exit-apply-request)
+		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then export ROUTEPOLICY_OUTPUT=json; elif [ "$#" -ne 0 ]; then usage; fi
+		exec "$LIBEXEC/lifecycle" "$command_name"
+		;;
+	exit-preview|exit-prepare)
+		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then shift; elif [ "$#" -ne 0 ]; then usage; fi
+		export ROUTEPOLICY_OUTPUT=json
+		exec "$LIBEXEC/init-transaction" "$command_name"
+		;;
+	exit-apply)
+		[ "$#" = 1 ] || usage
+		export ROUTEPOLICY_OUTPUT=json
+		exec "$LIBEXEC/init-transaction" "$command_name" "$1"
+		;;
+	init-discover|init-status|init-recover|init-repair)
 		if [ "$#" -eq 1 ] && [ "$1" = --json ]; then shift; elif [ "$#" -ne 0 ]; then usage; fi
 		export ROUTEPOLICY_OUTPUT=json
 		exec "$LIBEXEC/init-transaction" "${command_name#init-}" "$@"

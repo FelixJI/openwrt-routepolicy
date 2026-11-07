@@ -5,10 +5,20 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/common-test.sh"
 "$HERE/user-list-test.sh"
 "$HERE/cli-contract-test.sh"
+sh "$HERE/uninstall-test.sh"
+sh "$HERE/lifecycle-test.sh"
+sh "$HERE/ownership-boot-test.sh"
+sh "$HERE/managed-recovery-test.sh"
+sh "$HERE/resolver-test.sh"
+sh "$HERE/init-verification-test.sh"
 "$HERE/init-lifecycle-test.sh"
 "$HERE/init-topology-test.sh"
 "$HERE/init-transaction-test.sh"
 "$HERE/init-dns-test.sh"
+sh "$HERE/init-dns-test.sh" --exit-archive
+sh "$HERE/init-dns-test.sh" --exit-managed
+sh "$HERE/init-dns-test.sh" --exit-disabled
+sh "$HERE/firmware-backup-test.sh"
 sh "$HERE/init-dns-listener-test.sh"
 sh "$HERE/init-dns-structure-test.sh"
 sh "$HERE/init-dns-include-test.sh"

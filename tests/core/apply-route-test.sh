@@ -6,6 +6,19 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-apply-route-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/etc/config" "$tmp/etc/routepolicy/user.d" "$tmp/etc/routepolicy/managed.d/current" "$tmp/etc/routepolicy/managed.d/previous"
 : >"$tmp/etc/config/routepolicy"; : >"$tmp/ip.log"; : >"$tmp/nft.log"
+# The legacy nft topology belongs to this boot; an unbound old receipt is refused.
+mkdir -p "$tmp/etc/routepolicy/state"
+cat >"$tmp/etc/routepolicy/state/applied" <<EOF
+schema=1
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+route_table=200
+rule_priority=12000
+mark=0x100
+mark_mask=0x100
+policy_interface=usbwan
+policy_device=br-test
+policy_cidr=192.0.2.0/24
+EOF
 first_output=$(TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \
 	ROUTEPOLICY_LIBEXEC="$ROOT/routepolicy/files/usr/libexec/routepolicy" \
 	"$ROOT/routepolicy/files/usr/libexec/routepolicy/apply")
@@ -142,6 +155,7 @@ rule_priority=12000
 mark=0x100
 mark_mask=0x100
 EOF
+printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id)" >>"$tmp/etc/routepolicy/state/applied"
 : >"$tmp/ip.log"; : >"$tmp/nft.log"
 if TEST_IP_RULE_DELETE_FAIL=1 TEST_IP_LOG="$tmp/ip.log" TEST_NFT_LOG="$tmp/nft.log" \
 	PATH="$ROOT/tests/core/stubs:$PATH" ROUTEPOLICY_ROOT="$tmp" \

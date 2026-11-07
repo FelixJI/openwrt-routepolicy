@@ -56,8 +56,47 @@ const COMMANDS = {
     write_local_hosts: '/usr/sbin/routepolicyctl smartdns-write-local-hosts --json',
     import_legacy: '/usr/sbin/routepolicyctl import-legacy /etc/splitroute --json',
     observe_interfaces: '/usr/sbin/routepolicyctl observe-interfaces --json',
-    observe_sets: '/usr/sbin/routepolicyctl observe-sets --json'
+    observe_sets: '/usr/sbin/routepolicyctl observe-sets --json',
+    config_export: '/usr/sbin/routepolicyctl config-export --json',
+    restore_status: '/usr/sbin/routepolicyctl restore-status --json',
+    init_status: '/usr/sbin/routepolicyctl init-status --json',
+    init_recover: '/usr/sbin/routepolicyctl init-recover --json',
+    init_repair: '/usr/sbin/routepolicyctl init-repair --json',
+    restore_recover: '/usr/sbin/routepolicyctl restore-recover --json',
+    exit_preview: '/usr/sbin/routepolicyctl exit-preview --json',
+    exit_prepare: '/usr/sbin/routepolicyctl exit-prepare --json',
+    package_preview: '/usr/sbin/routepolicyctl package-preview --json',
+    disable_preview: '/usr/sbin/routepolicyctl disable-preview --json'
 };
+
+const LIFECYCLE_WRITES = {
+    config_import: { command: '/usr/sbin/routepolicyctl config-import --json', status: 'restore_status', limit: 2097152 },
+    restore_prepare: { command: '/usr/sbin/routepolicyctl restore-prepare --json', status: 'init_status', limit: 4096 },
+    init_apply: { command: '/usr/sbin/routepolicyctl init-apply-request --json', status: 'init_status', token: true, limit: 32 },
+    init_confirm: { token: true, limit: 32 },
+    exit_apply: { command: '/usr/sbin/routepolicyctl exit-apply-request --json', status: 'init_status', token: true, limit: 32 }
+};
+
+function lifecycle_write(operation, request) {
+    let spec = LIFECYCLE_WRITES[operation];
+    let req = request_args(request);
+    let content = spec.token ? req.token : req.content;
+    if (type(content) != 'string' || length(content) > spec.limit ||
+        (spec.token && !match(content, /^[0-9a-f]{32}$/)))
+        return result(false, '生命周期输入类型、长度或 token 非法');
+    if (operation == 'init_confirm')
+        return result(false, '请从目标管理地址的真实 LAN SSH 会话执行 init-confirm；HTTP 重连确认适配由后续向导提供', {
+            state: 'trusted_confirmation_required', confirmation_transport: 'trusted-ssh', http_confirmation_ready: false
+        });
+    let proc = popen(spec.command, 'w');
+    if (!proc)
+        return result(false, '无法启动生命周期事务');
+    let written = proc.write(content);
+    let exitcode = proc.close();
+    if (written != length(content) || exitcode != 0)
+        return result(false, '生命周期事务拒绝输入或尚未完成；请查看状态', { state: 'blocked', operation: operation });
+    return run(spec.status);
+}
 
 /*
  * OpenWrt 25.12 popen() is single-directional. Query input therefore never
@@ -383,6 +422,21 @@ function normalize_lines(content, kind) {
 return {
     routepolicy: {
     status: { args: {}, call: function(req) { return run('status'); } },
+    config_export: { args: {}, call: function(req) { return run('config_export'); } },
+    restore_status: { args: {}, call: function(req) { return run('restore_status'); } },
+    init_status: { args: {}, call: function(req) { return run('init_status'); } },
+    init_recover: { args: {}, call: function(req) { return run('init_recover'); } },
+    init_repair: { args: {}, call: function(req) { return run('init_repair'); } },
+    restore_recover: { args: {}, call: function(req) { return run('restore_recover'); } },
+    exit_preview: { args: {}, call: function(req) { return run('exit_preview'); } },
+    exit_prepare: { args: {}, call: function(req) { return run('exit_prepare'); } },
+    package_preview: { args: {}, call: function(req) { return run('package_preview'); } },
+    disable_preview: { args: {}, call: function(req) { return run('disable_preview'); } },
+    config_import: { args: { content: 'String' }, call: function(req) { return lifecycle_write('config_import', req); } },
+    restore_prepare: { args: { content: 'String' }, call: function(req) { return lifecycle_write('restore_prepare', req); } },
+    init_apply: { args: { token: 'String' }, call: function(req) { return lifecycle_write('init_apply', req); } },
+    init_confirm: { args: { token: 'String' }, call: function(req) { return lifecycle_write('init_confirm', req); } },
+    exit_apply: { args: { token: 'String' }, call: function(req) { return lifecycle_write('exit_apply', req); } },
     observe_interfaces: { args: {}, call: function(req) { return run('observe_interfaces'); } },
     observe_sets: { args: {}, call: function(req) { return run('observe_sets'); } },
     observe_query: {
