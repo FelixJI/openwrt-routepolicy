@@ -244,9 +244,11 @@ routepolicyctl exit-apply TOKEN
 
 固件恢复后，可直接使用已恢复的确认记录预览、准备和执行退出。预览和准备不会重建上一次启动的事务日志。
 
-确认默认网络和 DNS 可用后，再运行 `routepolicyctl package-preview --json`，用 `printf 'CONFIRM-REMOVE-ROUTEPOLICY\n' | routepolicyctl uninstall` 明确删除两个包。也可以明确选择保留接管配置后删除程序，但此时分流保护和应用管理都不可用，应安排重装或外部维护。
+确认默认网络和 DNS 可用后，再运行 `routepolicyctl package-preview --json`，用 `printf 'CONFIRM-REMOVE-ROUTEPOLICY\n' | routepolicyctl uninstall` 明确删除两个包。受支持卸载需要单人维护窗口：五份配置不得有未提交修改，且检测到 `/var/run/rpcd/snapshot-files` 或 `snapshot-delta`（待确认或遗留的原生 uci apply 快照）时会拒绝执行，必须先完成原操作（确认或回滚）。也可以明确选择保留接管配置后删除程序，但此时分流保护和应用管理都不可用，应安排重装或外部维护。
 
-原生 `apk del` 不等于退出，APK 的 pre-deinstall 失败也不能阻止删除。卸载只撤销自有分流和 90 适配登记，不启动 DHCP，不在程序删除后重载 DNS；91、用户 SmartDNS 上游、未知 `conf_files` 和用户声明保留。下次 SmartDNS 重启不再引用已撤下的 90 片段。没有新增 purge，也不删除旧方案文件。
+受支持入口在 `apk del` 之后仍会核实：rpcd `rc`/`uci` 对象健康、`routepolicy` 对象已注销、CLI 与 RPC 插件文件确已移除；核实失败会返回非零并明确提示“程序可能已移除但收尾未完成”：应先完成待确认或遗留的原生 uci apply（确认或回滚），确认安全后再按文档核对 rpcd 与 `routepolicy` 对象状态，不会自动重装、重试或重启。
+
+原生 `apk del` 不等于退出，APK 的 pre-deinstall 失败也不能阻止删除。卸载只撤销自有分流和 90 适配登记，不启动 DHCP，不在程序删除后重载 DNS；91、用户 SmartDNS 上游、未知 `conf_files` 和用户声明保留。下次 SmartDNS 重启不再引用已撤下的 90 片段。没有新增 purge，也不删除旧方案文件。存在待确认或遗留 rpcd 快照时，LuCI 包的卸载钩子同样会拒绝刷新接口（不 reload、不清理快照）并诚实报告未完成；原生 APK 绕过入口仍可能删除文件且不保证接口刷新。
 
 ## 安全边界
 

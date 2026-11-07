@@ -5,6 +5,7 @@ HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 "$HERE/common-test.sh"
 "$HERE/user-list-test.sh"
 "$HERE/cli-contract-test.sh"
+sh "$HERE/uninstall-test.sh"
 sh "$HERE/lifecycle-test.sh"
 sh "$HERE/ownership-boot-test.sh"
 sh "$HERE/managed-recovery-test.sh"

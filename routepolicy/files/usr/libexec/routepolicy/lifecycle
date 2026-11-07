@@ -289,6 +289,50 @@ EOF
 	[ "$(wc -c <"$DECL/init-token")" = 33 ] && sync || fail '声明与网络候选绑定失败；尚未应用网络'
 	cat "$DECL/init-result"
 }
+rpcd_snapshots_present() {
+	local path found=''
+	for path in "$RP_ROOT/var/run/rpcd/snapshot-files" "$RP_ROOT/var/run/rpcd/snapshot-delta"; do
+		[ ! -e "$path" ] && [ ! -L "$path" ] || found="$found $path"
+	done
+	[ -n "$found" ] || return 1
+	printf '%s\n' "$found"
+}
+verify_ubus_reconciled() {
+	local objects grep_status
+	# 官方 rpcd 的 uci configs 返回 {"configs":[...]} 对象；此处只要求有界调用
+	# 返回码成功以证明新 event loop 可响应，不消费也不解析其内容。
+	ubus -t 10 call uci configs >/dev/null 2>&1 || return 1
+	objects=$(ubus -t 2 list 2>/dev/null) || return 1
+	printf '%s\n' "$objects" | grep -qx rc || return 1
+	printf '%s\n' "$objects" | grep -qx uci || return 1
+	printf '%s\n' "$objects" | grep -qx routepolicy
+	grep_status=$?
+	[ "$grep_status" -eq 1 ] || return 1
+	return 0
+}
+package_uninstall() {
+	local request snapshot_paths apk_status
+	read_line 64; request=$REQUEST_LINE
+	[ "$request" = CONFIRM-REMOVE-ROUTEPOLICY ] || fail '请先查看 package-preview，再输入明确卸载确认'
+	no_pending || fail '未提交配置阻止受支持卸载入口'
+	if snapshot_paths=$(rpcd_snapshots_present); then
+		fail "检测到 rpcd 快照（$snapshot_paths；可能是待确认/回滚的原生 uci apply，或中断遗留）。为保留未提交配置与回滚数据，受支持卸载拒绝执行：未调用 apk、未发送信号、未清理快照或暂存。请先完成原操作（确认或回滚）后再卸载"
+	fi
+	unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND
+	exec 9>&-
+	# apk may remove this script and every sibling helper mid-call. The rest of
+	# this function only uses already-parsed shell code, helpers already
+	# sourced into this shell, and system binaries; never package files again.
+	apk del luci-app-routepolicy routepolicy
+	apk_status=$?
+	if [ "$apk_status" -ne 0 ]; then
+		fail "apk 删除未成功（退出码 $apk_status）；程序可能部分移除，请人工核对后再试"
+	fi
+	verify_ubus_reconciled || fail '程序可能已移除但收尾未完成：rpcd 健康或对象注销未核实（rc/uci 应存在且 routepolicy 应消失）。请先完成待确认或遗留的原生 uci apply（确认或回滚），确认安全后再按文档核对 rpcd 与 routepolicy 对象状态；受支持入口不会自动重装、重试或重启'
+	[ ! -e "$RP_ROOT/usr/sbin/routepolicyctl" ] && [ ! -L "$RP_ROOT/usr/sbin/routepolicyctl" ] || fail '程序可能已移除但收尾未完成：/usr/sbin/routepolicyctl 仍存在；请人工核对'
+	[ ! -e "$RP_ROOT/usr/share/rpcd/ucode/routepolicy" ] && [ ! -L "$RP_ROOT/usr/share/rpcd/ucode/routepolicy" ] || fail '程序可能已移除但收尾未完成：/usr/share/rpcd/ucode/routepolicy 仍存在；请人工核对'
+	rp_output_ok uninstall '两个包已删除并核实：rpcd rc/uci 健康、routepolicy 对象已注销、CLI 与 RPC 文件确已移除；DHCP/DNS 接管配置保留'
+}
 operation=${1:-}; [ "$#" = 0 ] || shift
 [ "$#" = 0 ] || fail '生命周期入口不接受文件路径或额外参数'
 case "$operation" in
@@ -332,12 +376,9 @@ EOF
 		[ "$comparison" != '>' ] || fail '不支持降级；请使用兼容原版本与外部备份恢复'
 		rp_output_ok package-check '版本与 schema 准入通过；此检查不安装或重启网络' ;;
 	uninstall)
-		read_line 64; request=$REQUEST_LINE
-		[ "$request" = CONFIRM-REMOVE-ROUTEPOLICY ] || fail '请先查看 package-preview，再输入明确卸载确认'
-		no_pending || fail '未提交配置阻止受支持卸载入口'
-		unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND
-		exec 9>&-
-		exec apk del luci-app-routepolicy routepolicy ;;
-	package-preview|disable-preview)
-		printf '{"ok":true,"operation":"%s","routing_will_stop":true,"takeover_configuration_retained":true,"dhcp_will_not_start":true,"explicit_exit_required":true,"native_apk_can_bypass":true,"warning":"停用或删除程序会失去分流保护；接管的 DHCP/DNS 配置保留。需要原网络时必须先显式退出；原生 APK 强装旧程序不受 schema 入口保护。"}\n' "$operation" ;;
+		package_uninstall ;;
+	package-preview)
+		printf '{"ok":true,"operation":"package-preview","routing_will_stop":true,"takeover_configuration_retained":true,"dhcp_will_not_start":true,"explicit_exit_required":true,"native_apk_can_bypass":true,"single_maintainer_window_required":true,"pending_or_leftover_rpcd_snapshot_blocks":true,"warning":"停用或删除程序会失去分流保护；接管的 DHCP/DNS 配置保留。需要原网络时必须先显式退出。卸载需要单人维护窗口：五份配置须无未提交修改，且 /var/run/rpcd/snapshot-files 与 snapshot-delta 不得存在（待确认或遗留快照会阻止受支持卸载；请先完成原操作）。受支持入口会在删除后核实 rpcd 健康与 routepolicy 对象注销；原生 APK 绕过入口仍可能删除文件且不保证接口刷新。"}\n' ;;
+	disable-preview)
+		printf '{"ok":true,"operation":"disable-preview","routing_will_stop":true,"takeover_configuration_retained":true,"dhcp_will_not_start":true,"explicit_exit_required":true,"native_apk_can_bypass":true,"warning":"停用或删除程序会失去分流保护；接管的 DHCP/DNS 配置保留。需要原网络时必须先显式退出；原生 APK 强装旧程序不受 schema 入口保护。"}\n' ;;
 esac
