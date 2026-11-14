@@ -1,0 +1,11 @@
+{
+  "admin/services/routepolicy/confirm": {
+    "action": {
+      "type": "function",
+      "module": "luci.controller.routepolicy",
+      "function": "confirm",
+      "post": true
+    },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  }
+}

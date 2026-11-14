@@ -31,8 +31,13 @@ case "$*" in
 	'call network.interface.policy status') echo policy ;;
 	'call network.interface.rp_init_policy status') echo new_policy ;;
 	'call network.interface.rp_init_default status') echo new_policy ;;
-	'call network.interface dump') echo '{"interface":[{"interface":"lan","proto":"static"}]}' ;;
-	'call network.device status') echo '{"eth3":{"present":true}}' ;;
+	'call network.interface dump')
+		[ "${TEST_DISCOVER_DUMP_FAIL:-0}" != 1 ] || exit 1
+		if [ -n "${TEST_DISCOVER_NETIFD:-}" ]; then printf '%s\n' "$TEST_DISCOVER_NETIFD"
+		else echo '{"interface":[{"interface":"lan","proto":"static"}]}'; fi ;;
+	'call network.device status')
+		if [ -n "${TEST_DISCOVER_DEVICES:-}" ]; then printf '%s\n' "$TEST_DISCOVER_DEVICES"
+		else echo '{"eth3":{"present":true}}'; fi ;;
 	'call service list')
 		[ "${TEST_UBUS_SERVICE_FAIL:-0}" != 1 ] || exit 1
 		printf '%s\n' "${TEST_SERVICE_JSON:-services}" ;;
@@ -44,7 +49,8 @@ EOF
 cat >"$tmp/bin/jsonfilter" <<'EOF'
 #!/bin/sh
 read -r data
-if [ -n "${TEST_SERVICE_JSON:-}" ] && [ "$data" = "$TEST_SERVICE_JSON" ] && [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
+if [ -n "${TEST_UCI_SDK_ROOT:-}" ] &&
+	{ [ "$data" = "${TEST_SERVICE_JSON:-}" ] || [ "$data" = "${TEST_DISCOVER_NETIFD:-}" ]; }; then
 	printf '%s\n' "$data" | "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/usr/bin/jsonfilter" "$@"
 	exit $?
 fi
@@ -76,6 +82,7 @@ case "$data:$2" in
 		[ "${TEST_ODHCPD_STATE:-true}" = absent ] || echo "${TEST_ODHCPD_STATE:-true}" ;;
 	*:'@.interface[*].l3_device') [ -z "${TEST_DYNAMIC_CLAIM:-}" ] || echo "$TEST_DYNAMIC_CLAIM" ;;
 	*:'@.interface[*].device') : ;;
+	'null:@.interface') exit 1 ;;
 	*:'@.interface') echo '[]' ;;
 esac
 EOF
@@ -113,6 +120,9 @@ case "$*" in
 		echo "default via ${TEST_DEFAULT_GATEWAY:-10.1.0.1} dev $device proto static ${TEST_FIB_TABLE:-}" ;;
 	'-4 route show table all') [ -z "${TEST_EXTRA_ROUTE:-}" ] || echo "$TEST_EXTRA_ROUTE" ;;
 	'-6 rule show') : ;;
+	'-4 -o addr show dev eth2') [ -z "${TEST_LINK_IPV4:-}" ] || echo "$TEST_LINK_IPV4" ;;
+	'-6 -o addr show dev eth2'|'-6 route show table all dev eth2') : ;;
+	'-4 route show table all dev eth2') [ -z "${TEST_LINK_ROUTE4:-}" ] || echo "$TEST_LINK_ROUTE4" ;;
 	'-4 -o addr show dev eth3') [ -z "${TEST_LINK_IPV4:-}" ] || echo "$TEST_LINK_IPV4" ;;
 	'-6 -o addr show dev eth3') echo "${TEST_LINK_IPV6:-5: eth3 inet6 fe80::1/64 scope link proto kernel_ll}" ;;
 	'-4 route show table all dev eth3') [ -z "${TEST_LINK_ROUTE4:-}" ] || echo "$TEST_LINK_ROUTE4" ;;
@@ -384,6 +394,108 @@ legacy_ownership_test() {
 	cmp "$tmp/config" "$tmp/legacy-config"
 	printf '%s\n' 'legacy section ownership: passed (base17 scalar WAL, explicit types, attempted/phase/symlink protection, unchanged configuration)'
 }
+discovery_device_tests() (
+	baseline
+	export ROUTEPOLICY_ROOT="$tmp/discovery-root"
+	sys="$ROUTEPOLICY_ROOT/sys/class/net"
+	# r7 fresh VM: netifd omits down eth2 and eth0's detail lacks master.
+	export TEST_DISCOVER_DEVICES='{"br-lan":{"type":"bridge","devtype":"bridge","bridge-members":["eth0"]},"eth0":{"type":"Network device","devtype":"ethernet"},"eth1":{},"lo":{}}'
+	export TEST_DISCOVER_NETIFD='{"interface":[{"interface":"lan","l3_device":"br-lan","device":"br-lan"},{"interface":"wan","l3_device":"eth1","device":"eth1"},{"interface":"wan6","device":"eth1"}]}'
+	awk -F '\t' '$1 !~ /^network\.policy($|\.)/' "$tmp/config" >"$tmp/discover-config"
+	mv "$tmp/discover-config" "$tmp/config"
+	printf 'network.bridge\tdevice\nnetwork.bridge.name\tbr-lan\nnetwork.bridge.ports\teth0\n' >>"$tmp/config"
+	cp "$tmp/config" "$tmp/discover-before"
+	for device in eth0 eth1 eth2 eth3; do
+		mkdir -p "$sys/$device/device"
+		index=$((${device#eth} + 2))
+		printf '%s\n' "$index" >"$sys/$device/ifindex"
+		printf '%s\n' "$index" >"$sys/$device/iflink"
+		printf '02:00:00:00:00:0%s\n' "${device#eth}" >"$sys/$device/address"
+		printf '0x1002\n' >"$sys/$device/flags"
+	done
+	printf '0x1303\n' >"$sys/eth0/flags"; printf '1\n' >"$sys/eth0/carrier"
+	mkdir -p "$sys/br-lan/bridge" "$sys/lo" "$sys/virt0"
+	ln -s "$sys/br-lan" "$sys/eth0/master"
+	printf '4\n' >"$sys/eth3/iflink"
+	"$tool" discover >"$tmp/device-discover"
+	grep -Fq "\"devices\":$TEST_DISCOVER_DEVICES" "$tmp/device-discover"
+	grep -Fq '"unclaimed_devices":[{"name":"eth2","up":false,"carrier":null}]' "$tmp/device-discover"
+	rm "$sys/eth0/master"
+	# A configured bridge port still cannot be claimed when its runtime master is absent.
+	"$tool" discover | grep -Fq '"unclaimed_devices":[{"name":"eth2","up":false,"carrier":null}]'
+	TEST_DYNAMIC_CLAIM=eth2 TEST_DISCOVER_NETIFD='' "$tool" discover | grep -Fq '"unclaimed_devices":[]'
+	TEST_LINK_IPV4='4: eth2 inet 10.3.0.2/24 scope global' "$tool" discover | grep -Fq '"unclaimed_devices":[]'
+	TEST_LINK_ROUTE4='default via 10.3.0.1' "$tool" discover | grep -Fq '"unclaimed_devices":[]'
+	TEST_DISCOVER_DUMP_FAIL=1 "$tool" discover | grep -Fq '"unclaimed_devices":[]'
+	cmp "$tmp/config" "$tmp/discover-before"
+	[ ! -e "$tmp/arping.log" ] && [ ! -e "$tmp/writes" ]
+	printf '%s\n' 'discovery devices: passed (r7 netifd omission, bridge port, configured/claimed/address/route/stacked/virtual rejection, read-only)'
+)
+discovery_device_tests
+if [ "${1:-}" = --discovery-devices ]; then exit 0; fi
+policy_connected_route_test() (
+	baseline
+	set -- lan wan rp_init_policy policy eth3 static 10.3.0.2 24 10.3.0.1 192.168.50.1 24
+	connected='10.3.0.0/24 dev eth3 proto kernel scope link src 10.3.0.2'
+	owned='10.3.0.0/24 dev eth3 table 200 scope link src 10.3.0.2 metric 10'
+	token=0123456789abcdef0123456789abcdef
+	boot=00000000-0000-0000-0000-000000000001
+	state="$tmp/root/etc/routepolicy/state"
+	mkdir -p "$state" "$tmp/root/proc/sys/kernel/random"
+	printf '%s\n' "$boot" >"$tmp/root/proc/sys/kernel/random/boot_id"
+	cat >"$state/applied" <<EOF
+schema=1
+boot_id=$boot
+init_generation=$token
+source_bootstrap=0
+route_table=200
+policy_interface=rp_init_policy
+policy_device=eth3
+policy_cidr=10.3.0.0/24
+EOF
+	# A matching receipt must never exempt the candidate from pre-apply overlap checks.
+	reject env ROUTEPOLICY_INIT_GENERATION="$token" TEST_EXTRA_ROUTE="$owned" "$tool" plan "$@"
+	grep -Fq 'intersects an existing non-default route 10.3.0.0/24' "$tmp/error"
+	"$tool" plan "$@" >"$tmp/static-policy-plan"
+	apply_mock_plan "$tmp/static-policy-plan"
+	sed -e 's/_policy/_rp_init_policy/g' -e 's/Handle policy /Handle rp_init_policy /g' \
+		-e 's/accept policy /accept rp_init_policy /g' -e 's/eth2/eth3/g' \
+		-e 's/192.168.1.0\/24/192.168.50.0\/24/g' "$tmp/nft" >"$tmp/static-policy.nft"
+	export TEST_MANAGEMENT_IP=192.168.50.1 TEST_NFT_FILE="$tmp/static-policy.nft"
+	TEST_EXTRA_ROUTE=$(printf '%s\n' "$connected" "$owned")
+	export TEST_EXTRA_ROUTE
+	ROUTEPOLICY_INIT_GENERATION="$token" "$tool" verify "$@" >"$tmp/static-policy-verified"
+	grep -Fq '"management_address":"192.168.50.1"' "$tmp/static-policy-verified"
+	[ "$(ROUTEPOLICY_INIT_GENERATION="$token" "$tool" management-address "$@")" = 192.168.50.1 ]
+
+	reject env ROUTEPOLICY_INIT_GENERATION=11111111111111111111111111111111 "$tool" verify "$@"
+	grep -Fq 'intersects an existing non-default route 10.3.0.0/24' "$tmp/error"
+	for foreign in \
+		'10.3.0.0/24 dev eth3 table 201 scope link src 10.3.0.2 metric 10' \
+		'10.3.0.0/24 dev eth3 table 200 proto static scope link src 10.3.0.2 metric 10' \
+		'10.3.0.0/24 via 10.3.0.1 dev eth3 table 200 scope link src 10.3.0.2 metric 10' \
+		'10.3.0.0/24 dev eth3 table 200 scope link src 10.3.0.2 metric 20' \
+		'10.3.0.0/24 dev eth3 table 200 scope link src 10.3.0.9 metric 10' \
+		'10.3.0.0/24 dev eth9 table 200 scope link src 10.3.0.2 metric 10'; do
+		reject env ROUTEPOLICY_INIT_GENERATION="$token" TEST_EXTRA_ROUTE="$(printf '%s\n' "$connected" "$owned" "$foreign")" "$tool" verify "$@"
+		grep -Fq 'intersects an existing non-default route 10.3.0.0/24' "$tmp/error"
+	done
+	sed 's/^source_bootstrap=0$/source_bootstrap=1/' "$state/applied" >"$state/bootstrap"
+	mv "$state/applied" "$state/complete"
+	mv "$state/bootstrap" "$state/applied"
+	reject env ROUTEPOLICY_INIT_GENERATION="$token" "$tool" verify "$@"
+	grep -Fq 'intersects an existing non-default route 10.3.0.0/24' "$tmp/error"
+	# After confirmation or reboot, a normal apply can republish its own receipt.
+	sed 's/^init_generation=.*/init_generation=/' "$state/complete" >"$state/applied"
+	[ "$(ROUTEPOLICY_INIT_GENERATION='' "$tool" management-address "$@")" = 192.168.50.1 ]
+	printf '%s\n' 00000000-0000-0000-0000-000000000002 >"$tmp/root/proc/sys/kernel/random/boot_id"
+	reject env ROUTEPOLICY_INIT_GENERATION= "$tool" verify "$@"
+	grep -Fq 'intersects an existing non-default route 10.3.0.0/24' "$tmp/error"
+	rm "$state/applied" "$state/complete" "$tmp/root/proc/sys/kernel/random/boot_id"
+	printf '%s\n' 'policy connected route: verified (runtime own tuple, prepare and foreign overlap refusal)'
+)
+policy_connected_route_test
+if [ "${1:-}" = --policy-connected-route ]; then exit 0; fi
 legacy_ownership_test
 if [ "${1:-}" = --legacy-upgrade ]; then exit 0; fi
 optional_service_test

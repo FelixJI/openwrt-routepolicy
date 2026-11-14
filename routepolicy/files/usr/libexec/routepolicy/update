@@ -42,7 +42,7 @@ cleanup() { rm -rf "$work"; [ ! -d "$candidate" ] || rm -rf "$candidate"; rp_loc
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-sections=$(rp_source_sections)
+sections=$(rp_source_sections 2>&1) || { rp_output_error update "$sections"; exit 1; }
 [ -n "$sections" ] || { rp_output_error update '没有配置清单来源'; exit 1; }
 updated=0
 for section in $sections; do

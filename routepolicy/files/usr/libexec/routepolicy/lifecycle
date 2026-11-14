@@ -13,15 +13,44 @@ MAIN='enabled lan_interface default_interface policy_interface strict_enforcemen
 SOURCE='enabled name url format target min_entries max_shrink_percent update_via_policy_interface'
 fail() { rp_output_error "${operation:-lifecycle}" "$*"; exit 1; }
 read_line() {
-	local maximum=$1 raw newline='
+	local maximum=$1 raw carriage newline='
 '
-	raw=$(dd bs=1024 count=$((maximum / 1024 + 1)) 2>/dev/null && printf '.') || fail '读取请求失败'
+	# Shell strings cannot represent NUL; reject it before shell parsing.
+	carriage=$(printf '\r')
+	raw=$(dd bs=1024 count=$((maximum / 1024 + 1)) 2>/dev/null | LC_ALL=C tr '\000' '\r' && printf '.') || fail '读取请求失败'
 	REQUEST_LINE=${raw%.}
+	case "$REQUEST_LINE" in *"$carriage"*) fail '请求包含非法控制字符' ;; esac
 	[ "$(printf '%s' "$REQUEST_LINE" | wc -c)" -le "$((maximum+1))" ] || fail '请求超过长度上限'
 	case "$REQUEST_LINE" in *"$newline") REQUEST_LINE=${REQUEST_LINE%"$newline"} ;; esac
 	[ "$(printf '%s' "$REQUEST_LINE" | wc -c)" -le "$maximum" ] || fail '请求超过长度上限'
 	case "$REQUEST_LINE" in *"$newline"*) fail '请求必须恰好一行' ;; esac
 }
+web_streams() {
+	# These descriptors come from the LuCI adapter, never from browser fields.
+	local input reply extra fd
+	IFS="$TAB" read -r input reply extra || fail '缺少 LuCI 请求通道'
+	[ -z "${extra:-}" ] && [ "$input" != "$reply" ] || fail 'LuCI 请求通道非法'
+	for fd in "$input" "$reply"; do
+		rp_uint_between "$fd" 3 1023 && [ -f "/proc/$$/fd/$fd" ] || fail 'LuCI 请求通道非法'
+		case "$(readlink "/proc/$$/fd/$fd")" in
+			'/tmp/routepolicy-lifecycle.'??????' (deleted)') ;;
+			*) fail 'LuCI 请求通道不是专用匿名文件' ;;
+		esac
+	done
+	exec <"/proc/$$/fd/$input" >"/proc/$$/fd/$reply"
+}
+
+init_request() {
+	local action=$1 access default_if policy new_role device proto address prefix gateway management management_prefix dns_default dns_policy
+	read_line 4096
+	# Shell IFS collapses adjacent tabs; reject an omitted column before splitting.
+	printf '%s\n' "$REQUEST_LINE" | LC_ALL=C awk -F '\t' 'NF!=13{exit 1}{for(i=1;i<=NF;i++)if($i!~/^[A-Za-z0-9_.:\/,#-]+$/||length($i)>256)exit 1}' || fail '初始化请求需要 13 个非空白名单字段'
+	IFS="$TAB" read -r access default_if policy new_role device proto address prefix gateway management management_prefix dns_default dns_policy <<EOF
+$REQUEST_LINE
+EOF
+	exec "$LIBEXEC/init-transaction" "$action" "$access" "$default_if" "$policy" "$new_role" "$device" "$proto" "$address" "$prefix" "$gateway" "$management" "$management_prefix" "$dns_default" "$dns_policy"
+}
+
 word_in() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 safe_file() {
 	local path=$1 parent
@@ -49,13 +78,13 @@ record() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$text"
 }
 export_content() {
-	local key value section list params record_path index parameter normalized format
+	local source_sections=$1 key value section list params record_path index parameter normalized format
 	printf 'routepolicy-config\t1\nsensitive\t1\n'
 	for key in $MAIN; do
 		value=$(uci -q get "routepolicy.main.$key") || continue
 		record main "$key" "$value"
 	done
-	for section in $(rp_source_sections); do
+	for section in $source_sections; do
 		rp_is_name "$section" 32 || fail '清单来源段名称非法'
 		for key in $SOURCE; do
 			value=$(uci -q get "routepolicy.$section.$key") || continue
@@ -90,9 +119,10 @@ export_content() {
 	done
 }
 export_config() {
-	local work bytes
+	local work bytes source_sections
+	source_sections=$(rp_source_sections 2>&1) || fail "$source_sections"
 	work=$(mktemp "$RP_RUN_DIR/export.XXXXXX") || fail '不能创建导出文件'
-	if ! export_content >"$work"; then rm -f "$work"; fail '导出声明失败'; fi
+	if ! export_content "$source_sections" >"$work"; then rm -f "$work"; fail '导出声明失败'; fi
 	bytes=$(wc -c <"$work")
 	[ "$bytes" -le 2097152 ] || { rm -f "$work"; fail '导出超过 2 MiB 上限'; }
 	if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
@@ -106,7 +136,8 @@ stage_config() {
 	mkdir "$work/config" "$work/delta" "$work/user.d" || fail '不能准备候选'
 	dd bs=1024 count=2049 of="$work/input" 2>/dev/null || { rm -rf "$work"; fail '读取导入失败'; }
 	size=$(wc -c <"$work/input")
-	if [ "$size" -gt 2097152 ] || ! LC_ALL=C awk 'NR==1{if($0!="routepolicy-config\t1")bad=1;next} NR==2{if($0!="sensitive\t1")bad=1;next} {if(NF!=3)bad=1;line=$0;gsub(/\t/,"",line);if(line~/[[:cntrl:]]/||length($3)>4096)bad=1;print line} END{exit bad||NR<2}' FS='\t' "$work/input" >"$work/text" || ! rp_utf8_text <"$work/text"; then
+	if [ "$size" -gt 2097152 ] || ! LC_ALL=C tr -d '\000' <"$work/input" | cmp -s "$work/input" - ||
+		! LC_ALL=C awk 'NR==1{if($0!="routepolicy-config\t1")bad=1;next} NR==2{if($0!="sensitive\t1")bad=1;next} {if(NF!=3)bad=1;line=$0;gsub(/\t/,"",line);if(line~/[[:cntrl:]]/||length($3)>4096)bad=1;print line} END{exit bad||NR<2}' FS='\t' "$work/input" >"$work/text" || ! rp_utf8_text <"$work/text"; then
 		rm -rf "$work"; fail '拒绝未知 schema、二进制、非法类型或超过 2 MiB 的导入'
 	fi
 	: >"$work/config/routepolicy"
@@ -158,9 +189,15 @@ stage_config() {
 	status_config
 }
 status_config() {
-	local pending=false unknown=''
+	local pending=false unknown='' init_token=''
 	if safe_file "$STAGE/input"; then pending=true; [ ! -f "$STAGE/unportable" ] || unknown=$(cat "$STAGE/unportable"); fi
-	printf '{"ok":true,"operation":"restore-status","schema":1,"candidate_pending":%s,"declaration_phase":"%s","interface_mapping_required":true,"danger_confirmation_required":true,"unportable_fields":"%s","runtime_imported":false}\n' "$pending" "$(rp_json_escape "$(cat "$DECL/phase" 2>/dev/null || printf absent)")" "$(rp_json_escape "$unknown")"
+	if safe_file "$DECL/init-token" && [ "$(wc -c <"$DECL/init-token")" = 33 ]; then
+		init_token=$(cat "$DECL/init-token") || init_token=
+		[ "${#init_token}" = 32 ] || init_token=
+		case "$init_token" in *[!0-9a-f]*) init_token= ;; esac
+	fi
+	printf '{"ok":true,"operation":"restore-status","schema":1,"candidate_pending":%s,"declaration_phase":"%s","init_token":"%s","interface_mapping_required":true,"danger_confirmation_required":true,"unportable_fields":"%s","runtime_imported":false}\n' \
+		"$pending" "$(rp_json_escape "$(cat "$DECL/phase" 2>/dev/null || printf absent)")" "$init_token" "$(rp_json_escape "$unknown")"
 }
 declaration_target() {
 	case "$1" in
@@ -211,12 +248,18 @@ declaration_install() {
 	declaration_phase installed
 }
 declaration_recover() {
-	local key target phase conflicts=''
+	local key target phase network_phase conflicts=''
 	[ -d "$DECL" ] && [ ! -L "$DECL" ] && [ -z "$(find "$DECL" -type l)" ] || fail '声明恢复区不安全或不存在'
 	phase=$(cat "$DECL/phase" 2>/dev/null) || phase=preparing
-	case "$phase" in committed|rolled_back) rp_output_ok restore-recover '声明事务已终结'; return ;; preparing) declaration_phase rolled_back && rp_output_ok restore-recover '准备阶段未修改公共声明，已取消候选'; return ;; prepared|installing|installed|recovering) ;; *) fail '声明阶段非法';; esac
+	case "$phase" in committed|rolled_back) rp_output_ok restore-recover '声明事务已终结'; return ;; preparing|prepared|installing|installed|recovering) ;; *) fail '声明阶段非法';; esac
+	network_phase=$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)
+	[ "$network_phase" != prepared ] || fail '先按当前 token 取消未应用的网络候选，再恢复应用声明'
+	if [ "$phase" = preparing ]; then
+		declaration_phase rolled_back && rp_output_ok restore-recover '准备阶段未修改公共声明，已取消候选'
+		return
+	fi
 	no_pending || fail '未提交修改阻止声明恢复'
-	if [ "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null)" = confirmed ] && { [ -e "$DECL/init-token" ] || [ -L "$DECL/init-token" ]; }; then
+	if [ "$network_phase" = confirmed ] && { [ -e "$DECL/init-token" ] || [ -L "$DECL/init-token" ]; }; then
 		# The network confirmation is the shared commit point, never undo its declarations.
 		safe_file "$DECL/init-token" && [ "$(wc -c <"$DECL/init-token")" = 33 ] &&
 			[ "$(cat "$DECL/init-token")" = "$(cat "$RP_STATE_DIR/init-transaction/current/token" 2>/dev/null)" ] || fail '已确认网络与本次声明绑定不匹配；未回滚声明'
@@ -225,7 +268,9 @@ declaration_recover() {
 		rp_output_ok restore-recover '网络已确认，应用声明提交已收敛'
 		return
 	fi
-	case "$(cat "$RP_STATE_DIR/init-transaction/current/phase" 2>/dev/null || printf absent)" in applying|pending|rolling_back|confirming|conflict) fail '先使用 init-recover 收敛网络事务，再恢复应用声明' ;; esac
+	case "$network_phase" in
+		applying|pending|rolling_back|confirming|conflict) fail '先使用 init-recover 收敛网络事务，再恢复应用声明' ;;
+	esac
 	for key in routepolicy domain-policy domain-default ipv4-policy ipv4-default local-hosts; do
 		target=$(declaration_target "$key") || fail '声明目标非法'
 		if ! declaration_matches "$target" "$DECL/before/$key" && ! declaration_matches "$target" "$DECL/expected/$key"; then conflicts="$conflicts $key"; fi
@@ -245,10 +290,12 @@ restore_prepare() {
 	safe_file "$STAGE/input" || fail '请先导入声明候选'
 	# One bounded, fixed-position request; no request text is shell source.
 	read_line 4096
+	printf '%s\n' "$REQUEST_LINE" | LC_ALL=C awk -F '\t' 'NF<14||NF>15{exit 1}{for(i=1;i<=NF;i++)if($i=="")exit 1}' || fail '恢复请求的固定字段缺失'
 	IFS="$TAB" read -r access default_if policy new_role device proto address prefix gateway management management_prefix dns_default dns_policy confirm unknown_confirm extra <<EOF
 $REQUEST_LINE
 EOF
 	[ -z "${extra:-}" ] && [ "${confirm:-}" = 1 ] || fail '恢复必须明确接口映射与危险确认'
+	case "$unknown_confirm" in ''|0|1) ;; *) fail '不可移植字段确认值非法' ;; esac
 	[ ! -s "$STAGE/unportable" ] || [ "${unknown_confirm:-}" = 1 ] || fail '必须明确确认已列出的不可移植 DNS 字段'
 	for value in "$access" "$default_if" "$policy" "$new_role" "$device" "$proto" "$address" "$prefix" "$gateway" "$management" "$management_prefix" "$dns_default" "$dns_policy"; do
 		[ -n "$value" ] && [ "${#value}" -le 256 ] || fail '映射参数非法'
@@ -336,11 +383,33 @@ package_uninstall() {
 operation=${1:-}; [ "$#" = 0 ] || shift
 [ "$#" = 0 ] || fail '生命周期入口不接受文件路径或额外参数'
 case "$operation" in
-	init-apply-request|exit-apply-request)
+	web-init-preview|web-init-prepare|web-restore-prepare|web-config-import|web-init-apply|web-exit-apply|web-init-confirm|web-init-cancel|web-init-finish)
+		web_streams
+		case "$operation" in
+			web-init-preview) init_request preview ;;
+			web-init-prepare) init_request prepare ;;
+			web-restore-prepare|web-config-import) operation=${operation#web-} ;;
+			web-init-apply) operation=init-apply-request ;;
+			web-exit-apply) operation=exit-apply-request ;;
+			web-init-confirm)
+				read_line 48
+				# Address is the HTTP server socket's local IPv4 address.
+				confirm_token=${REQUEST_LINE%%"$TAB"*}; confirm_address=${REQUEST_LINE#*"$TAB"}
+				[ "$REQUEST_LINE" = "$confirm_token$TAB$confirm_address" ] && rp_is_ipv4 "$confirm_address" || fail 'HTTP 确认的服务端 IPv4 地址非法'
+				exec "$LIBEXEC/init-transaction" confirm-http "$confirm_token" "$confirm_address" ;;
+		esac ;;
+esac
+case "$operation" in
+	init-apply-request|exit-apply-request|web-init-cancel|web-init-finish)
 		read_line 32; request=$REQUEST_LINE
 		[ "${#request}" = 32 ] || fail 'token 非法'
 		case "$request" in *[!0-9a-f]*) fail 'token 非法' ;; esac
-		case "$operation" in init-apply-request) action=apply ;; *) action=exit-apply ;; esac
+		case "$operation" in
+			init-apply-request) action=start-apply ;;
+			exit-apply-request) action=start-exit ;;
+			web-init-cancel) action=cancel-prepared ;;
+			web-init-finish) action=finish-confirmed ;;
+		esac
 		exec "$LIBEXEC/init-transaction" "$action" "$request" ;;
 esac
 case "$operation" in config-export|config-import|restore-status|restore-prepare|restore-recover|migrate|package-preview|package-check|disable-preview|uninstall) ;; *) fail '未知生命周期操作' ;; esac

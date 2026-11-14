@@ -10,7 +10,9 @@ class Value extends AbstractValue {}
 class ListValue extends AbstractValue {}
 class NetworkSelect extends AbstractValue {}
 class NamedSection {}
-class GridSection {}
+class GridSection {
+	handleAdd(ev, name) { this.map.data.add(this.map.config, this.sectiontype, name); }
+}
 
 class Element {
 	constructor(tagName) {
@@ -123,10 +125,16 @@ function createViewHarness(overrides) {
 		taboption: function(tab, OptionClass, name) { return this.option(OptionClass, name); }
 	};
 	class Map {
-		constructor() { currentMap = this; }
-		section() { return section; }
-		render() { return Promise.resolve(makeElement('div', { class: 'cbi-map' })); }
-		save() { events.push('save'); return Promise.resolve(); }
+		constructor(config) { currentMap = this; this.config = config; this.data = uci; }
+		section(SectionClass, sectiontype) {
+			Object.assign(section, { map: this, sectiontype: sectiontype });
+			return section;
+		}
+		render() { return Promise.resolve(this.root ??= makeElement('div', { class: 'cbi-map' })); }
+		save() {
+			events.push('save');
+			return overrides && overrides.mapSave ? overrides.mapSave(this) : Promise.resolve();
+		}
 		reset() { events.push('reset'); return Promise.resolve(); }
 		lookupOption(name, sectionId) {
 			const option = renderedOptions.find(function(candidate) { return candidate.option === name; });
@@ -134,11 +142,13 @@ function createViewHarness(overrides) {
 		}
 	}
 	const notifications = [];
-	const uci = {
+	const uci = Object.assign({
+		add: function(config, type, name) { events.push([ 'uci-add', config, type, name ]); },
+		load: function() { return Promise.resolve(); },
 		set: function(config, section, option, value) { events.push([ 'uci-set', config, section, option, value ].join(':')); },
 		save: function() { events.push('uci-save'); return Promise.resolve(); },
 		apply: function() { events.push('uci-apply'); return Promise.resolve(); }
-	};
+	}, overrides && overrides.uci);
 	const ui = {
 		changes: { apply: function() { events.push('apply'); return Promise.resolve(); } },
 		createHandlerFn: function(ctx, fn) {
@@ -149,6 +159,8 @@ function createViewHarness(overrides) {
 		addNotification: function(title, content, level) { notifications.push({ content: nodeText(content), level: level }); }
 	};
 	const api = Object.assign({
+		newSourceName: function() { return 'rp_src_0123456789abcdef01234567'; },
+		nameAnonymousSources: function() { return Promise.resolve(false); },
 		reload: function() { events.push('reload'); return Promise.resolve({ ok: true }); },
 		safeText: function(value, fallback) { return value === null || value === undefined || value === '' ? (fallback || '—') : String(value); },
 		notice: function(targetUi, reply, fallback) {
@@ -171,6 +183,7 @@ function createViewHarness(overrides) {
 			document: { querySelectorAll: function() { return []; } }
 		},
 		reloads: reloads,
+		section: section,
 		ui: ui,
 		api: api
 	};
@@ -198,6 +211,72 @@ async function formApplyContract(filename) {
 	await page.handleSaveApply(null, '0');
 	assert.deepStrictEqual(harness.events, [ 'save', 'apply' ],
 		'Save & Apply must commit staged UCI through LuCI before lifecycle reload triggers run');
+}
+
+async function sourceSaveContract(filename) {
+	let migrationError;
+	const harness = createViewHarness({ api: {
+		nameAnonymousSources: function() {
+			harness.events.push('name-anonymous');
+			return migrationError ? Promise.reject(new Error(migrationError)) : Promise.resolve(true);
+		}
+	} });
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	await page.render();
+	assert.deepStrictEqual(harness.events, [], 'opening the source page must not migrate the config');
+	const [ enabled ] = page.map.lookupOption('enabled', 'source');
+	assert.strictEqual(enabled.default, '0', 'a missing source flag must show the backend default of disabled');
+	assert.strictEqual(enabled.rmempty, false, 'the native flag must persist both explicit values');
+	await harness.section.handleAdd(null);
+	assert.deepStrictEqual(harness.events.splice(0), [ [ 'uci-add', 'routepolicy', 'source', 'rp_src_0123456789abcdef01234567' ] ],
+		'the native grid Add action must receive an explicit name');
+	await page.handleSave();
+	assert.deepStrictEqual(harness.events.splice(0), [ 'save', 'name-anonymous' ], 'ordinary Save stages the rename without applying');
+	await page.handleSaveApply(null, '0');
+	assert.deepStrictEqual(harness.events.splice(0), [ 'save', 'name-anonymous', 'apply' ], 'Save & Apply commits after the rename');
+	migrationError = 'rename RPC blocked';
+	await assert.rejects(page.handleSaveApply(null, '0'), /rename RPC blocked/);
+	assert.deepStrictEqual(harness.events, [ 'save', 'name-anonymous' ], 'a rename error must prevent apply');
+	assert.ok(harness.notifications.some(entry => entry.level === 'error' && entry.content.includes(migrationError)));
+	assert.strictEqual(page.map.root.inert, false, 'the saved draft must remain accessible after an error');
+}
+
+async function sourceSaveReadRetryContract(filename) {
+	let firstMigration = true, failRead = false, cachedLoad;
+	const harness = createViewHarness({
+		mapSave: map => map.data.load('routepolicy'),
+		uci: {
+			load: function() {
+				return (cachedLoad ??= failRead ? Promise.reject(new Error('read failed')) : Promise.resolve());
+			},
+			unload: function(config) {
+				assert.strictEqual(config, 'routepolicy');
+				harness.events.push('clear-failed-load');
+				cachedLoad = null;
+			}
+		},
+		api: {
+			nameAnonymousSources: function() {
+				harness.events.push('name-anonymous');
+				if (firstMigration) {
+					firstMigration = false;
+					cachedLoad = null;
+					failRead = true;
+					return Promise.reject(new Error('rename interrupted'));
+				}
+				return Promise.resolve(true);
+			}
+		}
+	});
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	await page.render();
+	await assert.rejects(page.handleSaveApply(null, '0'), /rename interrupted/);
+	assert.deepStrictEqual(harness.events, [ 'save', 'name-anonymous', 'clear-failed-load' ]);
+	assert.ok(harness.notifications.some(entry => entry.level === 'error' && entry.content.includes('rename interrupted')));
+	// The next Map.save() must be able to read again before it invokes migration.
+	failRead = false;
+	await page.handleSaveApply(null, '0');
+	assert.deepStrictEqual(harness.events.slice(3), [ 'save', 'name-anonymous', 'apply' ]);
 }
 
 async function statusContract(filename) {
@@ -374,6 +453,8 @@ async function main() {
 		[ 'RPC error visibility', function() { return loadApi(path.join(repo, 'luci-app-routepolicy/htdocs/luci-static/resources/routepolicy/api.js')); } ],
 		[ 'settings Save & Apply', function() { return formApplyContract(path.join(viewDir, settingsView)); } ],
 		[ 'sources Save & Apply', function() { return formApplyContract(path.join(viewDir, 'sources.js')); } ],
+		[ 'source names and migration', function() { return sourceSaveContract(path.join(viewDir, 'sources.js')); } ],
+		[ 'source save retries after a failed read', function() { return sourceSaveReadRetryContract(path.join(viewDir, 'sources.js')); } ],
 		[ 'status controls', function() { return statusContract(path.join(viewDir, 'status.js')); } ],
 		[ 'status enable failure feedback', function() { return statusEnableFailureContract(path.join(viewDir, 'status.js')); } ],
 		[ 'status enable success refresh', function() { return statusEnableSuccessContract(path.join(viewDir, 'status.js')); } ],

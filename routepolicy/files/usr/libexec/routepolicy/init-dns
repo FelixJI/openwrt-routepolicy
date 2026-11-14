@@ -770,18 +770,132 @@ $(printf '%s\n' "$files" | tr '|' '\n')
 EOF
 }
 
+init_dns_cache_baseline() {
+	[ -f "$1/baseline" ] && [ ! -L "$1/baseline" ] || return 1
+	awk -F '\t' '$1~/^smartdns\.[^.]+\.cache_file$/ {n++; if(NF!=3||($2!="scalar"&&($2!="0"||$3!="-")))bad=1; print}
+		END{exit bad||n!=1}' "$1/baseline"
+}
+init_dns_cache_preserved() {
+	local boot
+	[ -f "$1/dns-cache-preserve" ] && [ ! -L "$1/dns-cache-preserve" ] && boot=$(init_resolver_boot) && [ -n "$boot" ] &&
+		printf '%s\n' "$boot" | cmp -s "$1/dns-cache-preserve" -
+}
+init_dns_cache_exit_matches() {
+	local record=$1 baseline=$2 key=${2%%"$TAB"*} boot item count i=0 field entry='' old origin_value
+	for item in kind exit-complete boot-id schema count; do [ -f "$record/$item" ] && [ ! -L "$record/$item" ] || return 1; done
+	[ "$(cat "$record/kind")" = exit ] && printf '1\n' | cmp -s "$record/exit-complete" - || return 1
+	boot=$(init_resolver_boot) && [ -n "$boot" ] && printf '%s\n' "$boot" | cmp -s "$record/boot-id" - || return 1
+	[ "$(cat "$record/schema")" = 1 ] && [ -d "$record/fields" ] && [ ! -L "$record/fields" ] || return 1
+	count=$(cat "$record/count") && rp_uint_between "$count" 1 2048 || return 1
+	# The exit WAL includes UCI namespace symlinks. Only its bounded field journal is evidence here.
+	while [ "$i" -lt "$count" ]; do
+		i=$((i + 1)); field="$record/fields/$i"
+		[ -d "$field" ] && [ ! -L "$field" ] && [ -f "$field/key" ] && [ ! -L "$field/key" ] &&
+			origin_read_value <"$field/key" || return 1
+		if [ "$origin_value" = "$key" ]; then [ -z "$entry" ] || return 1; entry=$field; fi
+	done
+	[ -n "$entry" ] || return 1
+	for item in attempted existed type old expected expected-type; do [ -f "$entry/$item" ] && [ ! -L "$entry/$item" ] || return 1; done
+	[ "$(cat "$entry/type")" = scalar ] && [ "$(cat "$entry/expected-type")" = scalar ] &&
+		[ "$(cat "$entry/expected")" = /tmp/routepolicy/smartdns.cache ] || return 1
+	old=$(cat "$entry/old") || return 1
+	case "$(cat "$entry/existed")" in
+		0) [ -z "$old" ] && [ "$baseline" = "$key${TAB}0$TAB-" ] ;;
+		1) [ "$baseline" = "$key${TAB}scalar$TAB$old" ] ;;
+		*) return 1 ;;
+	esac
+}
+init_dns_cache_prepare() {
+	local prior=$1 cache="$RP_RUN_DIR/smartdns.cache" baseline key boot
+	[ ! -L "$RP_RUN_DIR" ] && [ ! -L "$cache" ] && { [ ! -e "$cache" ] || [ -f "$cache" ]; } || fail 'SmartDNS 专用缓存路径不是安全普通文件；未移动缓存'
+	[ -f "$cache" ] || return 0
+	baseline=$(init_dns_cache_baseline "$WAL") || fail '无法读取 SmartDNS 缓存原配置；未移动缓存'
+	key=${baseline%%"$TAB"*}
+	[ "$baseline" != "$key${TAB}scalar$TAB/tmp/routepolicy/smartdns.cache" ] || return 0
+	# A completed exit proves the config transition, not ownership of the bytes at this path.
+	[ -d "$prior" ] && [ ! -L "$prior" ] && [ -f "$prior/phase" ] && [ ! -L "$prior/phase" ] &&
+		[ -f "$prior/token" ] && [ ! -L "$prior/token" ] && valid_token "$(cat "$prior/token")" &&
+		[ ! -e "$TX/active" ] && [ ! -L "$TX/active" ] && [ ! -e "$TX/source" ] && [ ! -L "$TX/source" ] ||
+		fail 'SmartDNS 专用缓存仍存在，但没有可信的本次启动退出记录；未移动缓存'
+	case "$(cat "$prior/phase")" in
+		exited) init_dns_cache_exit_matches "$prior" "$baseline" || fail 'SmartDNS 专用缓存与本次启动的退出记录不匹配；未移动缓存' ;;
+		prepared|expired|rolled_back)
+			[ ! -e "$prior/kind" ] && [ ! -L "$prior/kind" ] && init_dns_cache_preserved "$prior" &&
+				[ "$(init_dns_cache_baseline "$prior")" = "$baseline" ] ||
+				fail 'SmartDNS 专用缓存的退出证据或原配置已变化；未移动缓存' ;;
+		*) fail 'SmartDNS 专用缓存仍存在，但没有可信的本次启动退出记录；未移动缓存' ;;
+	esac
+	boot=$(init_resolver_boot) && [ -n "$boot" ] && printf '%s\n' "$boot" >"$WAL/dns-cache-preserve"
+}
+init_dns_cache_admit() {
+	local cache="$RP_RUN_DIR/smartdns.cache" token temp baseline key item
+	[ ! -L "$RP_RUN_DIR" ] && [ ! -L "$cache" ] && { [ ! -e "$cache" ] || [ -f "$cache" ]; } || return 1
+	token=$(cat "$WAL/token") && valid_token "$token" || return 1
+	temp="$cache.init-$token"
+	[ ! -e "$temp" ] && [ ! -L "$temp" ] || return 1
+	if [ -e "$WAL/dns-cache-preserve" ] || [ -L "$WAL/dns-cache-preserve" ]; then
+		for item in dns-cache-move dns-cache-move.new dns-cache-absent; do
+			[ ! -e "$WAL/$item" ] && [ ! -L "$WAL/$item" ] || return 1
+		done
+		init_dns_cache_preserved "$WAL" && [ -f "$cache" ] && [ ! -e "$temp.failed" ] && [ ! -L "$temp.failed" ]
+	elif [ -f "$cache" ]; then
+		baseline=$(init_dns_cache_baseline "$WAL") || return 1
+		key=${baseline%%"$TAB"*}
+		[ "$baseline" = "$key${TAB}scalar$TAB/tmp/routepolicy/smartdns.cache" ]
+	fi
+}
+init_dns_cache_move() {
+	[ -f "$1" ] && [ ! -L "$1" ] && [ ! -e "$2" ] && [ ! -L "$2" ] &&
+		mv -nT "$1" "$2" && [ ! -e "$1" ] && [ ! -L "$1" ] && [ -f "$2" ] && [ ! -L "$2" ]
+}
+init_dns_cache_move_state() {
+	local move="$WAL/dns-cache-move"
+	[ -f "$move" ] && [ ! -L "$move" ] && [ ! -L "$move.new" ] && { [ ! -e "$move.new" ] || [ -f "$move.new" ]; } &&
+		printf '%s\n' "$1" >"$move.new" && sync && mv "$move.new" "$move" && sync
+}
+init_dns_cache_restore_preserved() {
+	local cache=$1 temp=$2 move="$WAL/dns-cache-move" item state=not-started boot original_boot
+	[ ! -L "$RP_RUN_DIR" ] || return 1
+	for item in "$cache" "$temp" "$temp.failed" "$move" "$move.new"; do
+		[ ! -L "$item" ] && { [ ! -e "$item" ] || [ -f "$item" ]; } || return 1
+	done
+	if [ -f "$move" ]; then
+		state=$(cat "$move") && printf '%s\n' "$state" | cmp -s "$move" - || return 1
+		case "$state" in preserve-intent|preserve-moved|preserve-restoring) ;; *) return 1 ;; esac
+	fi
+	if [ "$state" = not-started ] && init_dns_cache_preserved "$WAL"; then
+		[ -f "$cache" ] && [ ! -e "$temp" ] && [ ! -e "$temp.failed" ]; return
+	fi
+	# /tmp may lose both backups on reboot, but a missing backup in this boot is not a completed move.
+	[ -f "$WAL/boot-id" ] && [ ! -L "$WAL/boot-id" ] && [ -f "$WAL/dns-cache-preserve" ] && [ ! -L "$WAL/dns-cache-preserve" ] &&
+		cmp -s "$WAL/boot-id" "$WAL/dns-cache-preserve" || return 1
+	boot=$(init_resolver_boot) && original_boot=$(cat "$WAL/boot-id") && [ -n "$boot" ] && [ -n "$original_boot" ] &&
+		printf '%s\n' "$original_boot" | cmp -s "$WAL/boot-id" - || return 1
+	if [ "$boot" != "$original_boot" ]; then [ ! -e "$temp" ] && [ ! -e "$temp.failed" ]; return; fi
+	case "$state" in
+		preserve-intent)
+			[ ! -e "$temp.failed" ] || return 1
+			if [ ! -e "$temp" ]; then [ -f "$cache" ]; return; fi
+			[ ! -e "$cache" ] || return 1 ;;
+		preserve-moved)
+			[ -f "$temp" ] || { rp_err '本次启动已移走的 SmartDNS 原缓存备份缺失'; return 1; }
+			# Neither a new cache nor an unexpected replacement is disposable here.
+			if [ -e "$cache" ] || [ -L "$cache" ]; then init_dns_cache_move "$cache" "$temp.failed" || return 1; fi ;;
+		preserve-restoring)
+			if [ ! -e "$temp" ]; then [ -f "$cache" ]; return; fi
+			init_dns_cache_move "$temp" "$cache"; return ;;
+		*) return 1 ;;
+	esac
+	init_dns_cache_move_state preserve-restoring && init_dns_cache_move "$temp" "$cache"
+}
 init_dns_coordinate() {
-	local action=$1 port answer protocol probe access_dev service running enabled section address group device temp remaining restore_failed=0 cache="$RP_RUN_DIR/smartdns.cache" path=$RP_SMARTDNS_EXTRA_FILE
+	local action=$1 port answer protocol probe rcode access_dev service running enabled section address group device temp remaining restore_failed=0 cache="$RP_RUN_DIR/smartdns.cache" path=$RP_SMARTDNS_EXTRA_FILE
 	# Old #17 WALs contain no DNS fields and retain their original recovery path.
 	init_dns_owned || return 0
 	case "$action" in
 		prepare)
 			init_resolver_prepare || return 1
-			[ ! -L "$cache" ] && { [ ! -e "$cache" ] || [ -f "$cache" ]; } || return 1
-			if [ -e "$cache" ]; then
-				section=$(rp_smartdns_single_root) || return 1
-				[ "$(uci -q get "smartdns.$section.cache_file")" = /tmp/routepolicy/smartdns.cache ] || return 1
-			fi
+			init_dns_cache_prepare "$2" || return 1
 			[ ! -L "$path" ] && { [ ! -e "$path" ] || [ -f "$path" ]; } || return 1
 			if [ -e "$path" ]; then cp -p "$path" "$WAL/dns-file-old" || return 1; else : >"$WAL/dns-file-absent"; fi
 			{ [ ! -f "$WAL/dns-file-old" ] || cat "$WAL/dns-file-old"; } >"$WAL/dns-file-new" || return 1
@@ -850,9 +964,12 @@ init_dns_coordinate() {
 			# A fresh table must not consume a warm cache left by a previous disable.
 			# Keep this application's old /tmp cache only until confirm or rollback.
 			temp="$cache.init-$(cat "$WAL/token")"
-			[ ! -L "$cache" ] && [ ! -L "$temp" ] && [ ! -e "$temp" ] || return 1
-			if [ -e "$cache" ]; then
-				printf '%s' '' >"$WAL/dns-cache-move" && sync && mv "$cache" "$temp" || return 1
+			init_dns_cache_admit || return 1
+			if [ -f "$WAL/dns-cache-preserve" ]; then
+				printf 'preserve-intent\n' >"$WAL/dns-cache-move" && sync && init_dns_cache_move "$cache" "$temp" &&
+					init_dns_cache_move_state preserve-moved || return 1
+			elif [ -e "$cache" ]; then
+				printf '%s' '' >"$WAL/dns-cache-move" && sync && init_dns_cache_move "$cache" "$temp" || return 1
 			else printf '%s' '' >"$WAL/dns-cache-absent" && sync || return 1; fi
 			;;
 		start)
@@ -909,14 +1026,18 @@ init_dns_coordinate() {
 			if [ "${operation:-}" = boot-dns ] && [ "$(uci_committed get routepolicy.main.enabled)" = 0 ]; then
 				address=$(init_dns_management_address) || return 1
 			else address=$(topology management-address) || return 1; fi
+			: >"$WAL/dns-evidence.new" || return 1
 			for protocol in +notcp +tcp; do
 				for probe in default policy; do
 					[ "$probe" != policy ] || [ "${operation:-}" != boot-dns ] || [ "$(uci_committed get routepolicy.main.enabled)" = 1 ] || continue
 					answer=$(timeout 6 dig "$protocol" +time=2 +tries=1 +noall +comments +answer "@$address" "routepolicy-init-$probe.test" A) || return 1
 					printf '%s\n' "$answer" >>"$WAL/dns-query-result"
-					printf '%s\n' "$answer" | grep -Eq 'status: (NOERROR|NXDOMAIN),' || return 1
+					rcode=$(printf '%s\n' "$answer" | sed -n 's/.*status: \(NOERROR\|NXDOMAIN\),.*/\1/p' | head -n 1)
+					[ -n "$rcode" ] || return 1
+					printf '%s\t%s\t%s\n' "$probe" "${protocol#+}" "$rcode" >>"$WAL/dns-evidence.new" || return 1
 				done
 			done
+			mv "$WAL/dns-evidence.new" "$WAL/dns-evidence" || return 1
 			;;
 		rollback)
 			if [ "${recovery_early:-0}" != 1 ] && [ -f "$WAL/dns-service-attempted" ]; then init_dns_stop || return 1; fi
@@ -959,13 +1080,20 @@ init_dns_coordinate() {
 			[ "$action" != restore-files ] || { init_resolver_restore; return; }
 			[ -f "$WAL/dns-service-attempted" ] || [ -f "$WAL/dns-boot-quarantined" ] || return 0
 			temp="$cache.init-$(cat "$WAL/token")"
-			[ ! -L "$temp" ] && [ ! -L "$cache" ] || return 1
-			if [ -f "$temp" ]; then rm -f "$cache" && mv "$temp" "$cache" || return 1
-			elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
+			if [ -e "$WAL/dns-cache-preserve" ] || [ -L "$WAL/dns-cache-preserve" ]; then
+				if ! init_dns_cache_restore_preserved "$cache" "$temp"; then
+					rp_err 'SmartDNS 缓存恢复有冲突；保留现有文件供检查'
+					restore_failed=1
+				fi
+			else
+				[ ! -L "$temp" ] && [ ! -L "$cache" ] || return 1
+				if [ -f "$temp" ]; then rm -f "$cache" && mv "$temp" "$cache" || return 1
+				elif [ -f "$WAL/dns-cache-absent" ]; then rm -f "$cache" || return 1; fi
+			fi
 			# An existing confirmed contract owns cold boot DNS admission after rollback.
 			if rp_dns_boot_pending; then
 				if ! init_dns_restore_admit smartdns; then init_dns_restore_blocked smartdns || return 1; return 1; fi
-				init_dns_restore_bookkeeping && init_resolver_restore; return
+				init_dns_restore_bookkeeping && init_resolver_restore && [ "$restore_failed" = 0 ]; return
 			fi
 			# Complete native SmartDNS callbacks before the final dnsmasq runtime convergence.
 			for service in smartdns dnsmasq; do
@@ -1010,7 +1138,11 @@ init_dns_coordinate() {
 		confirm)
 			init_resolver_verify || return 1
 			temp="$cache.init-$(cat "$WAL/token")"
-			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } && rm -f "$temp" || return 1
+			[ ! -L "$temp" ] && { [ ! -e "$temp" ] || [ -f "$temp" ]; } || return 1
+			if [ -e "$WAL/dns-cache-preserve" ] || [ -L "$WAL/dns-cache-preserve" ]; then
+				init_dns_cache_preserved "$WAL" && [ -f "$temp" ] && [ -f "$WAL/dns-cache-move" ] && [ ! -L "$WAL/dns-cache-move" ] &&
+					[ "$(cat "$WAL/dns-cache-move")" = preserve-moved ] || return 1
+			else rm -f "$temp" || return 1; fi
 			uci_layout || return 1
 			case "$(uci_committed get routepolicy.main.enabled)" in 0) return 0 ;; 1) ;; *) return 1 ;; esac
 			if [ "$(init_dns_service_state routepolicy)" != 1 ]; then

@@ -86,6 +86,26 @@ fi
 cat >"$tmp/bin/uci" <<'EOF'
 #!/bin/sh
 native-uci -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_DNS_TMP/external" "$@" || exit $?
+if [ -n "${TEST_EXIT_UCI_TRACE:-}" ]; then
+	printf '%s\n' "$*" >>"$TEST_EXIT_UCI_TRACE"
+	case " $* " in *' export '*_smartdns' ')
+		if [ -f "$TEST_DNS_TMP/exit-origin-change" ]; then
+			mode=$(cat "$TEST_DNS_TMP/exit-origin-change")
+			rm "$TEST_DNS_TMP/exit-origin-change"
+			case "$mode" in
+				missing) rm "$TEST_EXIT_ORIGIN_FIELD/expected" ;;
+				tab) printf 'scalar\t1' >"$TEST_EXIT_ORIGIN_FIELD/expected-type" ;;
+				key) printf 'firewall.rp_init_dns.src' >"$TEST_EXIT_ORIGIN_FIELD/key" ;;
+			esac
+		fi
+		if [ -f "$TEST_DNS_TMP/exit-uci-change" ]; then
+			mode=$(cat "$TEST_DNS_TMP/exit-uci-change")
+			rm "$TEST_DNS_TMP/exit-uci-change"
+			native-uci -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_DNS_TMP/external" set routepolicy.main.user_note=EXTERNAL || exit 1
+			if [ "$mode" = committed ]; then native-uci -c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_DNS_TMP/external" commit routepolicy || exit 1; fi
+		fi ;;
+	esac
+fi
 case " $* " in *' commit '*)
 	if [ -f "$TEST_DNS_TMP/kill-stage" ] && [ "$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/stage")" = "$(cat "$TEST_DNS_TMP/kill-stage")" ]; then
 		rm "$TEST_DNS_TMP/kill-stage"; kill -KILL "$PPID"
@@ -114,9 +134,11 @@ if [ -f "$TEST_DNS_TMP/kill-exit-identity" ]; then
 		fi
 	done
 fi
-if [ -f "$TEST_DNS_TMP/kill-installed" ] && [ "$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/declarations/phase" 2>/dev/null)" = installed ]; then
-	rm "$TEST_DNS_TMP/kill-installed"; kill -KILL "$PPID"
-fi
+for interrupted_phase in preparing installed; do
+	if [ -f "$TEST_DNS_TMP/kill-$interrupted_phase" ] && [ "$(cat "${wal%/current}/declarations/phase" 2>/dev/null)" = "$interrupted_phase" ]; then
+		rm "$TEST_DNS_TMP/kill-$interrupted_phase"; kill -KILL "$PPID"
+	fi
+done
 if [ -f "$TEST_DNS_TMP/fail-managed-sync" ] &&
 	grep -Fq 'smartdns90:address /firmware-local.lab19.test/' "$ROUTEPOLICY_ROOT/etc/routepolicy/state/applied" 2>/dev/null; then
 	rm "$TEST_DNS_TMP/fail-managed-sync"; exit 1
@@ -174,7 +196,9 @@ case "$1" in
 		init_dns_plan ;;
 	link-plan) printf 'required\t0\n' ;;
 	management-address) [ ! -f "$TEST_DNS_TMP/policy-down" ] || exit 1; uci -q get network.lan.ipaddr ;;
-	verify) own_section firewall.rp_init_dns ;;
+	verify)
+		own_section firewall.rp_init_dns
+		printf '{"ok":true,"operation":"verify","management_address":"192.0.2.1","default_egress":"verified"}\n' ;;
 	*) exit 1 ;;
 esac
 EOF
@@ -263,7 +287,12 @@ EOF
 cat >"$tmp/bin/nft" <<'EOF'
 #!/bin/sh
 if [ "$1:${2:-}" = list:tables ]; then [ ! -f "$TEST_DNS_TMP/policy-running" ] || printf 'table inet routepolicy\n'; exit 0; fi
-[ -f "$TEST_DNS_TMP/policy-running" ]
+[ -f "$TEST_DNS_TMP/policy-running" ] || exit 1
+if [ "$1" = -t ]; then
+	printf 'table inet routepolicy {\n\tchain classify {\n\t}\n\tset domain_policy4 {\n\t}\n\tset domain_default4 {\n\t}\n\tset static_policy4 {\n\t}\n'
+	[ -f "$TEST_DNS_TMP/nft-missing-set" ] || printf '\tset static_default4 {\n\t}\n'
+	printf '}\n'
+fi
 EOF
 cat >"$tmp/bin/ip" <<'EOF'
 #!/bin/sh
@@ -516,6 +545,337 @@ test_boot() {
 	rm -f "$RP_RESOLVER_ENTRY" "$RP_RESOLVER_FILE"
 	ln -s /tmp/resolv.conf.d/resolv.conf.auto "$RP_RESOLVER_ENTRY"
 }
+if [ "${1:-}" = --boot-watch ]; then
+	: "${TEST_UCI_SDK_ROOT:?provide the official OpenWrt rootfs for rc.common}"
+	boot_case=${2:-all}
+	case "$boot_case" in all|current|coordinated) ;; *) exit 1 ;; esac
+	n=$TEST_UCI_SDK_ROOT; rc_root="$tmp/rc-root"
+	mkdir -p "$rc_root/lib/functions" "$rc_root/usr/share/libubox" "$rc_root/var/lock" "$rc_root/etc/rc.d"
+	cp "$n/lib/functions/procd.sh" "$rc_root/lib/functions/procd.sh"
+	cp "$n/usr/share/libubox/jshn.sh" "$rc_root/usr/share/libubox/jshn.sh"
+	cat >"$rc_root/lib/functions.sh" <<'SH'
+list_contains() { eval "case \" \$$1 \" in *\" $2 \"*) return 0 ;; *) return 1 ;; esac"; }
+config_load() { :; }
+config_get_bool() { [ "$1" = enabled ] && enabled=$(uci -q get routepolicy.main.enabled); }
+SH
+	: >"$rc_root/lib/functions/service.sh"
+	cat >"$tmp/bin/jshn" <<'SH'
+#!/bin/sh
+exec "$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" "$TEST_UCI_SDK_ROOT/usr/bin/jshn" "$@"
+SH
+	chmod +x "$tmp/bin/jshn"
+	native_rc() {
+		IPKG_INSTROOT="$rc_root" timeout -k 2 12 "$n/lib/ld-musl-x86_64.so.1" --library-path "$n/lib:$n/usr/lib" \
+			"$n/bin/busybox" ash "$n/etc/rc.common" "$@"
+	}
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	txroot="$RP_STATE_DIR/init-transaction"; active=$(rp_init_active_record)
+	quarantine_boot() {
+		rm -rf "$RP_RUN_DIR"; rm -f "$tmp/policy-running"; test_boot
+		printf 0 >"$tmp/svc/smartdns.running"
+		ROUTEPOLICY_INIT_TRANSACTION="$TX" native_rc "$ROOT/routepolicy/files/etc/init.d/routepolicy-prerecover" boot
+		[ -f "$active/dns-boot-pending" ]
+	}
+	quarantine_boot
+	"$TX" boot-dns >/dev/null
+	boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id")
+	[ "$(cat "$active/dns-boot-ready")" = "$boot_now" ] && [ "$(cat "$active/boot-id")" != "$boot_now" ] || exit 1
+	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")" = 11 ] && [ -f "$tmp/policy-running" ] || exit 1
+	receipt="$RP_STATE_DIR/applied"
+	printf 'schema=1\nboot_id=%s\nsource_bootstrap=0\nmark=0x100\nmark_mask=0x100\n' "$boot_now" >>"$receipt"
+	uci set routepolicy.main.mark=0x200; uci set routepolicy.main.mark_mask=0x200; uci commit routepolicy
+	ready="$active/dns-boot-ready"
+	mv "$tmp/bin/ubus" "$tmp/bin/boot-fixture-ubus"
+	cat >"$tmp/bin/ubus" <<'SH'
+#!/bin/sh
+case "$1:${2:-}:${3:-}:${4:-}" in
+	call:service:set:*|call:service:add:*)
+		if [ "${TEST_BOOT_RACE:-0}" = 1 ]; then
+			pid=$(cat "$TEST_DNS_TMP/boot-rc-pid") || exit 91
+			readlink "/proc/$pid/fd/1000" >"$TEST_DNS_TMP/boot-procd-lock" || exit 91
+			if "$TEST_BOOT_FLOCK" -n "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/lock" true; then exit 92; fi
+		fi
+		printf '%s\n' "$4" >>"$TEST_DNS_TMP/boot-procd"; exit 0 ;;
+	call:service:delete:*'"routepolicy"'*) exit 0 ;;
+esac
+exec "$TEST_DNS_TMP/bin/boot-fixture-ubus" "$@"
+SH
+	cat >"$tmp/bin/boot-transaction" <<'SH'
+#!/bin/sh
+rc=0
+if [ "$1" = recover-startup ]; then printf '%s\n' "$PPID" >"$TEST_DNS_TMP/boot-rc-pid"; fi
+if [ "$1:${2:-}" != recover-startup:boot ]; then
+	"$TEST_BOOT_TX" "$@" || rc=$?
+	printf '%s %s\n' "$1" "$rc" >>"$TEST_DNS_TMP/boot-tx-trace"
+	exit "$rc"
+fi
+"$TEST_BOOT_TX" "$@" >"$TEST_DNS_TMP/boot-recovery-result" || rc=$?
+printf '%s %s\n' "$1" "$rc" >>"$TEST_DNS_TMP/boot-tx-trace"
+if [ "$rc" = 0 ] && [ -n "${TEST_BOOT_COORDINATE:-}" ]; then
+	dns_rc=0
+	"$TEST_BOOT_TX" boot-dns >"$TEST_DNS_TMP/boot-dns.stdout" 2>"$TEST_DNS_TMP/boot-dns.stderr" || dns_rc=$?
+	printf '%s\n' "$dns_rc" >"$TEST_DNS_TMP/boot-dns.rc"
+fi
+if [ "$rc:${TEST_BOOT_RACE:-0}" = 0:1 ]; then
+	printf 'window\n' >"$TEST_DNS_TMP/boot-lock-window"
+	remaining=500
+	while [ ! -s "$TEST_DNS_TMP/boot-lock-held" ]; do
+		[ "$remaining" -gt 0 ] || exit 92
+		remaining=$((remaining - 1)); sleep 0.01
+	done
+fi
+cat "$TEST_DNS_TMP/boot-recovery-result"
+exit "$rc"
+SH
+	TEST_BOOT_FLOCK=$(command -v flock); export TEST_BOOT_FLOCK
+	cat >"$tmp/bin/flock" <<'SH'
+#!/bin/sh
+if [ "$1:${2:-}:${3:-}:${TEST_BOOT_RACE:-0}" = -w:180:9:1 ]; then
+	pid=$(cat "$TEST_DNS_TMP/boot-rc-pid") || exit 93
+	[ ! -e "/proc/$pid/fd/1000" ] || exit 94
+	if "$TEST_BOOT_FLOCK" -n 9; then exit 95; fi
+	printf 'waiting before procd\n' >"$TEST_DNS_TMP/boot-recovery-wait"
+fi
+exec "$TEST_BOOT_FLOCK" "$@"
+SH
+	mv "$tmp/lib/apply" "$tmp/lib/boot-fixture-apply"
+	cat >"$tmp/lib/apply" <<'SH'
+#!/bin/sh
+set -eu
+. "$ROUTEPOLICY_LIBEXEC/common"
+mark=$(uci -q get routepolicy.main.mark); mask=$(uci -q get routepolicy.main.mark_mask)
+if rp_writer_owned; then
+	case "$ROUTEPOLICY_WRITER_KIND" in
+		apply)
+			[ "$ROUTEPOLICY_DNS_DEFER:$ROUTEPOLICY_INIT_RESTORE:${ROUTEPOLICY_INIT_GENERATION:-}:$ROUTEPOLICY_SOURCE_BOOTSTRAP:$ROUTEPOLICY_DECLARATION_OWNER" = 0:0::0:0 ]
+			pid=$(cat "$TEST_DNS_TMP/boot-rc-pid")
+			[ ! -e "/proc/$pid/fd/1000" ]
+			printf 'startup apply %s %s\n' "$mark" "$mask" >>"$TEST_DNS_TMP/boot-inner-apply" ;;
+		init) [ "$ROUTEPOLICY_DNS_DEFER" = 1 ]; printf 'coordinator apply\n' >>"$TEST_DNS_TMP/boot-coordinator-apply" ;;
+		*) exit 1 ;;
+	esac
+fi
+if "$ROUTEPOLICY_LIBEXEC/boot-fixture-apply" "$@"; then
+	printf 'mark=%s\nmark_mask=%s\n' "$mark" "$mask" >>"$RP_STATE_DIR/applied"
+else
+	printf 'boot-policy-applied\n'
+	exit 1
+fi
+SH
+	cat >"$tmp/bin/boot-ctl" <<'SH'
+#!/bin/sh
+printf '%s\n' "$1" >>"$TEST_DNS_TMP/boot-apply"
+exec "$TEST_BOOT_CTL" "$@"
+SH
+	chmod +x "$tmp/bin/ubus" "$tmp/bin/boot-transaction" "$tmp/bin/boot-ctl" "$tmp/bin/flock" "$tmp/lib/apply"
+	export TEST_BOOT_TX="$TX" TEST_BOOT_CTL="$ROOT/routepolicy/files/usr/sbin/routepolicyctl"
+	export ROUTEPOLICY_INIT_TRANSACTION="$tmp/bin/boot-transaction" ROUTEPOLICY_CTL="$tmp/bin/boot-ctl"
+	export ROUTEPOLICY_WATCH="$tmp/watch" ROUTEPOLICY_APPLY=true
+	ln -s "$TEST_DNS_REAL_INIT" "$rc_root/etc/rc.d/S95routepolicy"
+	check_watcher() {
+		[ "$(jsonfilter -i "$tmp/boot-procd" -e '@.instances.*.command[0]' | grep -Fxc "$tmp/watch")" = 1 ] || {
+			cat "$tmp/boot-recovery-result" "$tmp/boot-tx-trace" "$tmp/boot-procd"
+			printf '%s\n' 'expected exactly one watcher' >&2; return 1;
+		}
+	}
+	run_boot_entry() {
+		: >"$tmp/boot-procd"; : >"$tmp/boot-apply"; : >"$tmp/boot-tx-trace"; : >"$tmp/boot-inner-apply"
+		: >"$tmp/boot-coordinator-apply"
+		native_rc "$1" "$2" >"$tmp/boot-$2.stdout" 2>"$tmp/boot-$2.stderr"
+	}
+	wait_marker() {
+		remaining=500
+		while [ ! -s "$1" ]; do
+			[ "$remaining" -gt 0 ] || return 1
+			remaining=$((remaining - 1)); sleep 0.01
+		done
+	}
+	boot_link="$rc_root/etc/rc.d/S95routepolicy"
+	run_contended_boot() {
+		for marker in before-held recovery-wait lock-window lock-held lock-release procd-lock; do rm -f "$tmp/boot-$marker"; done
+		(
+			exec 9>"$txroot/lock"; flock -n 9
+			printf 'held\n' >"$tmp/boot-before-held"
+			wait_marker "$tmp/boot-recovery-wait"; flock -u 9
+			wait_marker "$tmp/boot-lock-window"; flock -n 9
+			printf 'held\n' >"$tmp/boot-lock-held"
+			wait_marker "$tmp/boot-lock-release"
+		) & guard_pid=$!
+		wait_marker "$tmp/boot-before-held"
+		TEST_BOOT_RACE=1 TEST_BOOT_COORDINATE="$1" run_boot_entry "$boot_link" boot
+		printf 'release\n' >"$tmp/boot-lock-release"; wait "$guard_pid"; guard_pid=
+		grep -Fxq 'recover-startup 0' "$tmp/boot-tx-trace"
+		[ -s "$tmp/boot-recovery-wait" ] && [ -s "$tmp/boot-procd-lock" ] && [ -s "$tmp/boot-lock-held" ] || exit 1
+	}
+	if [ "$boot_case" != coordinated ]; then
+		# active_publish clears this leftover copy while holding FD9. The archive is already ready.
+		cp "$ready" "$txroot/current/dns-boot-pending"
+		run_contended_boot ''
+		[ ! -e "$txroot/current/dns-boot-pending" ]
+		check_watcher
+		[ "$(cat "$tmp/boot-recovery-result")" = boot-policy-applied ] &&
+			[ "$(cat "$tmp/boot-inner-apply")" = 'startup apply 0x200 0x200' ] || exit 1
+		grep -Fxq 'mark=0x200' "$receipt" && grep -Fxq 'mark_mask=0x200' "$receipt" && [ ! -s "$tmp/boot-apply" ] || exit 1
+		printf '%s\n' 'cold boot: current pending cleared, committed mark/mask applied under FD9, later FD9 owner did not prevent one watcher'
+		[ "$boot_case" != current ] || exit 0
+	fi
+	quarantine_boot
+	run_contended_boot complete
+	[ "$(cat "$tmp/boot-dns.rc")" = 0 ] && [ ! -e "$active/dns-boot-pending" ] || exit 1
+	cmp "$ready" "$RP_ROOT/proc/sys/kernel/random/boot_id"
+	check_watcher
+	[ "$(cat "$tmp/boot-recovery-result")" = boot-policy-coordinated ] && [ ! -s "$tmp/boot-inner-apply" ] &&
+		[ ! -s "$tmp/boot-apply" ] && [ "$(cat "$tmp/boot-coordinator-apply")" = 'coordinator apply' ] || exit 1
+	printf '%s\n' 'cold boot: coordinator completed after recovery, later FD9 owner did not cause apply or prevent one watcher'
+	[ "$boot_case" != coordinated ] || exit 0
+	quarantine_boot
+	: >"$tmp/policy-fail"
+	TEST_BOOT_COORDINATE=fail run_boot_entry "$boot_link" boot
+	check_watcher
+	[ "$(cat "$tmp/boot-recovery-result")" = boot-policy-coordinated ] && [ "$(cat "$tmp/boot-dns.rc")" != 0 ] &&
+		[ -f "$active/dns-boot-pending" ] && [ ! -f "$tmp/policy-running" ] &&
+		[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] &&
+		[ "$(cat "$tmp/boot-coordinator-apply")" = 'coordinator apply' ] || exit 1
+	grep -Fq '启动策略/DNS 验证失败' "$tmp/boot-dns.stderr"
+	if cmp -s "$ready" "$RP_ROOT/proc/sys/kernel/random/boot_id"; then exit 1; fi
+	printf '%s\n' 'cold boot: failed coordinator kept pending and registered only the watcher'
+	rm "$tmp/policy-fail"; "$TX" boot-dns >/dev/null
+	cp "$ready" "$tmp/boot-ready"; cp "$active/boot-id" "$tmp/old-boot"
+	: >"$tmp/policy-fail"
+	if run_boot_entry "$rc_root/etc/rc.d/S95routepolicy" boot; then printf '%s\n' 'failed boot apply returned success' >&2; exit 1; fi
+	[ -s "$tmp/boot-inner-apply" ] && [ ! -s "$tmp/boot-procd" ] && [ ! -s "$tmp/boot-apply" ] || exit 1
+	grep -Fq '启动策略应用失败' "$tmp/boot-boot.stderr"
+	rm "$tmp/policy-fail"
+	for action in start restart; do
+		run_boot_entry "$TEST_DNS_REAL_INIT" "$action"
+		[ "$(cat "$tmp/boot-apply")" = apply ] && [ ! -s "$tmp/boot-inner-apply" ] || exit 1
+		check_watcher
+	done
+	if "$TX" recover-startup boot extra >/dev/null || "$TX" recover-startup invalid >/dev/null || "$TX" recover boot >/dev/null; then exit 1; fi
+	for edge in missing-ready old-ready malformed-ready ready-link pending-link same-boot disabled legacy; do
+		case "$edge" in
+			missing-ready) rm "$ready" ;;
+			old-ready) cp "$tmp/old-boot" "$ready" ;;
+			malformed-ready) printf '\n' >>"$ready" ;;
+			ready-link) rm "$ready"; ln -s "$tmp/boot-ready" "$ready" ;;
+			pending-link) ln -s "$tmp/absent" "$active/dns-boot-pending" ;;
+			same-boot) cp "$tmp/boot-ready" "$active/boot-id" ;;
+			disabled) uci set routepolicy.main.enabled=0; uci commit routepolicy ;;
+			legacy) mv "$txroot" "$tmp/boot-saved-tx" ;;
+		esac
+		: >"$tmp/boot-inner-apply"
+		[ "$("$TX" recover-startup boot)" = boot-policy-deferred ] && [ ! -s "$tmp/boot-inner-apply" ] || {
+			printf 'unexpected pre-procd apply: %s\n' "$edge" >&2; exit 1;
+		}
+		case "$edge" in
+			disabled) run_boot_entry "$rc_root/etc/rc.d/S95routepolicy" boot
+				[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] || exit 1
+				if jsonfilter -i "$tmp/boot-procd" -e '@.instances.*.command[0]' | grep -Fxq "$tmp/watch"; then exit 1; fi
+				uci set routepolicy.main.enabled=1; uci commit routepolicy ;;
+			legacy) boot_policy_result=boot-policy-applied run_boot_entry "$rc_root/etc/rc.d/S95routepolicy" boot
+				[ "$(cat "$tmp/boot-apply")" = apply ]; check_watcher; break ;;
+		esac
+		rm -f "$ready" "$active/dns-boot-pending" "$txroot/current/dns-boot-pending"
+		cp "$tmp/boot-ready" "$ready"; cp "$tmp/old-boot" "$active/boot-id"
+	done
+	printf '%s\n' 'cold boot watcher: failed apply, ordinary start/restart, legacy fallback and invalid boot evidence passed'
+	exit 0
+fi
+if [ "${1:-}" = --prerecover-upgrade ]; then
+	: "${TEST_UCI_SDK_ROOT:?provide the official OpenWrt rootfs for rc.common}"
+	prerecover_entry() {
+		IPKG_INSTROOT="$tmp/rc-root" ROUTEPOLICY_INIT_TRANSACTION="$TX" \
+			"$TEST_UCI_SDK_ROOT/lib/ld-musl-x86_64.so.1" --library-path "$TEST_UCI_SDK_ROOT/lib:$TEST_UCI_SDK_ROOT/usr/lib" \
+			"$TEST_UCI_SDK_ROOT/bin/busybox" ash "$TEST_UCI_SDK_ROOT/etc/rc.common" \
+			"$ROOT/routepolicy/files/etc/init.d/routepolicy-prerecover" "$1"
+	}
+	post_upgrade_start() { PKG_UPGRADE=1 APK_SCRIPT=post-upgrade prerecover_entry start; }
+	assert_dns_online() {
+		[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/smartdns.running")" = 11 ] || {
+			printf '%s\n' 'post-upgrade start disabled or stopped confirmed SmartDNS' >&2; return 1;
+		}
+		[ "$(cat "$tmp/svc/dnsmasq.enabled")$(cat "$tmp/svc/dnsmasq.running")" = 00 ]
+	}
+	mkdir -p "$tmp/rc-root/lib/functions"
+	cp "$TEST_UCI_SDK_ROOT/lib/functions.sh" "$tmp/rc-root/lib/"
+	cp "$TEST_UCI_SDK_ROOT/lib/functions/service.sh" "$tmp/rc-root/lib/functions/"
+	txdir="$RP_STATE_DIR/init-transaction"
+	current="$txdir/current"
+	baseline 0 0 1 1
+	post_upgrade_start
+	[ ! -e "$txdir" ] && [ ! -e "$tmp/service-log" ] && restored
+	prepare; confirm_dns
+	active=$(rp_init_active_record)
+	assert_dns_online
+	cp "$tmp/service-log" "$tmp/post-upgrade-before"
+	post_upgrade_start
+	assert_dns_online
+	[ ! -e "$current/dns-boot-quarantined" ] && [ ! -e "$active/dns-boot-pending" ]
+	cmp "$tmp/service-log" "$tmp/post-upgrade-before"
+
+	# Cold boot still removes the S19 links and S94 restores verified native DNS.
+	rm -rf "$RP_RUN_DIR"; rm -f "$tmp/policy-running"
+	test_boot
+	printf 0 >"$tmp/svc/smartdns.running"
+	prerecover_entry boot
+	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
+	[ -f "$current/dns-boot-quarantined" ] && [ -f "$active/dns-boot-pending" ]
+	"$TX" boot-dns >/dev/null
+	assert_dns_online
+	boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id")
+	[ "$(cat "$current/boot-id")" != "$boot_now" ]
+	[ "$(cat "$active/dns-boot-ready")" = "$boot_now" ] && [ ! -e "$active/dns-boot-pending" ]
+	cp "$tmp/service-log" "$tmp/post-upgrade-before"
+	post_upgrade_start
+	assert_dns_online
+	cmp "$tmp/service-log" "$tmp/post-upgrade-before"
+
+	# A repair intent can coexist with a previous ready marker until it converges.
+	printf '%s\n' "$boot_now" >"$active/dns-boot-pending"
+	post_upgrade_start
+	[ "$(cat "$tmp/svc/smartdns.enabled")" = 0 ] && [ -f "$active/dns-boot-pending" ]
+	"$TX" boot-dns >/dev/null
+	assert_dns_online
+	printf '%s\n\n' "$boot_now" >"$active/dns-boot-ready"
+	post_upgrade_start
+	[ "$(cat "$tmp/svc/smartdns.enabled")" = 0 ] && [ -f "$active/dns-boot-pending" ]
+	"$TX" boot-dns >/dev/null
+	assert_dns_online
+	# Matching bytes in a symlink cannot stand in for verified boot readiness.
+	mv "$active/dns-boot-ready" "$tmp/boot-ready-record"
+	ln -s "$tmp/boot-ready-record" "$active/dns-boot-ready"
+	post_upgrade_start
+	[ "$(cat "$tmp/svc/smartdns.enabled")" = 0 ] && [ -f "$active/dns-boot-pending" ]
+
+	for point in intent pointer; do
+		baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
+		printf '%s\n' "$point" >"$tmp/kill-confirm"
+		if SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >"$tmp/upgrade-killed" 2>&1; then exit 1; fi
+		[ "$(cat "$current/phase")" = confirming ]
+		post_upgrade_start
+		[ "$(cat "$current/phase")" = confirmed ] && [ "$(cat "$txdir/active")" = "$token" ]
+		assert_dns_online
+		[ ! -e "$current/dns-boot-quarantined" ]
+	done
+
+	baseline 0 0 1 1; prepare; "$TX" apply "$token" >/dev/null
+	post_upgrade_start
+	[ "$(cat "$current/phase")" = pending ] && assert_dns_online
+	printf 'conflict\n' >"$current/phase"
+	if post_upgrade_start; then printf '%s\n' 'post-upgrade start hid a recovery conflict' >&2; exit 1; fi
+	[ "$(cat "$tmp/svc/smartdns.enabled")$(cat "$tmp/svc/dnsmasq.enabled")" = 00 ]
+	# A router affected before upgrading uses the existing explicit repair command.
+	baseline 0 0 1 1; prepare; confirm_dns
+	"$tmp/root/etc/init.d/smartdns" disable
+	: >"$current/dns-boot-quarantined"
+	post_upgrade_start
+	[ "$(cat "$tmp/svc/smartdns.enabled")" = 0 ]
+	"$TX" repair >/dev/null
+	assert_dns_online
+	[ -f "$current/dns-boot-quarantined" ]
+	printf '%s\n' 'native prerecover upgrade: fresh, confirmed, recovered boot, pending repair, invalid ready marker, confirmation interruption, conflict and explicit repair passed'
+	exit 0
+fi
 managed_apply_dns() {
 	cp "$REAL_LIB/smartdns-control" "$tmp/lib/"
 	# The policy service fixture supplies the same typed content receipt as real apply.
@@ -825,7 +1185,7 @@ if [ "${1:-}" = --restore-prior-confirmed ] || [ "${1:-}" = --migrate ]; then
 	printf '%s\n' 'prior confirmed declaration recovery: passed (real installed sync kill, no new token, original declarations and resolver preserved)'
 	exit 0
 fi
-if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
+if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ] || [ "${1:-}" = --restore-cancel ]; then
 	cp "$REAL_LIB/lifecycle" "$REAL_LIB/validate" "$REAL_LIB/converter-lib" "$tmp/lib/"
 	chmod +x "$tmp/lib/lifecycle" "$tmp/lib/validate" "$tmp/lib/converter-lib"
 	for restore_case in success failure; do
@@ -840,22 +1200,70 @@ if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
 		cp -pR "$tmp/root/etc/routepolicy/managed.d" "$tmp/restore-before-$restore_case"
 		ROUTEPOLICY_OUTPUT=text "$tmp/lib/lifecycle" config-export >"$tmp/restore-export"
 		"$tmp/lib/lifecycle" config-import <"$tmp/restore-export" >/dev/null
+		cp "$RP_UCI_CONFIG" "$tmp/restore-app.before"
 		mapping=$(printf 'lan\twan\twan2\t-\t-\t-\t-\t-\t-\t-\t-\t192.0.2.53\t198.51.100.53\t1\t1\n')
+		decl="$tmp/root/etc/routepolicy/state/init-transaction/declarations"
+		network="$RP_STATE_DIR/init-transaction/current"
+		if [ "${1:-}" = --restore-cancel ] && [ "$restore_case" = success ]; then
+			prepare_dns 192.0.2.53
+			: >"$tmp/kill-preparing"
+			if printf '%s\n' "$mapping" | "$tmp/lib/lifecycle" restore-prepare >/dev/null 2>&1; then exit 1; fi
+			[ "$(cat "$decl/phase")" = preparing ] && [ "$(cat "$network/phase")" = prepared ]
+			if "$tmp/lib/lifecycle" restore-recover >"$tmp/restore-recover-blocked"; then exit 1; fi
+			grep -Fq '先按当前 token 取消' "$tmp/restore-recover-blocked"
+			[ "$(cat "$decl/phase")" = preparing ] && [ "$(cat "$network/phase")" = prepared ]
+			"$TX" cancel-prepared "$token" >/dev/null
+			"$tmp/lib/lifecycle" restore-recover >/dev/null
+			[ "$(cat "$decl/phase")" = rolled_back ] && [ "$(cat "$network/phase")" = expired ]
+			cmp "$RP_UCI_CONFIG" "$tmp/restore-app.before"
+			prepare_dns 192.0.2.53
+			"$tmp/lib/lifecycle" restore-recover >/dev/null
+			[ "$(cat "$decl/phase")" = rolled_back ] && [ "$(cat "$network/phase")" = prepared ]
+		fi
 		output=$(printf '%s\n' "$mapping" | "$tmp/lib/lifecycle" restore-prepare)
 		token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
-		decl="$tmp/root/etc/routepolicy/state/init-transaction/declarations"
+		if [ "${1:-}" = --restore-cancel ]; then
+			"$tmp/lib/lifecycle" restore-status | grep -Fq "\"init_token\":\"$token\""
+			# Reproduce the durable boundary after prepare publishes but before binding is complete.
+			if [ "$restore_case" = success ]; then rm "$decl/init-token"; else printf '%s' "$token" >"$decl/init-token"; fi
+			"$tmp/lib/lifecycle" restore-status | grep -Fq '"init_token":""'
+			cp "$RP_UCI_CONFIG" "$tmp/restore-app.installed"
+			if "$tmp/lib/lifecycle" restore-recover >"$tmp/restore-recover-blocked"; then exit 1; fi
+			grep -Fq '先按当前 token 取消' "$tmp/restore-recover-blocked"
+			if "$tmp/lib/apply" >/dev/null 2>&1 || "$TX" apply "$token" >/dev/null 2>&1; then exit 1; fi
+			if "$TX" cancel-prepared bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >/dev/null; then exit 1; fi
+			[ "$(cat "$network/phase")" = prepared ] && [ "$(cat "$decl/phase")" = installed ]
+			cmp "$RP_UCI_CONFIG" "$tmp/restore-app.installed"
+			"$ROOT/routepolicy/files/usr/sbin/routepolicyctl" init-cancel "$token" >/dev/null
+			"$TX" cancel-prepared "$token" | grep -Fq '"phase":"expired"'
+			[ "$(cat "$decl/phase")" = installed ]
+			"$tmp/lib/lifecycle" restore-recover >/dev/null
+			[ "$(cat "$decl/phase")" = rolled_back ]
+			cmp "$RP_UCI_CONFIG" "$tmp/restore-app.before"
+			prepare_dns 192.0.2.53
+			continue
+		fi
 		if [ "${1:-}" = --restore-confirmed ]; then
 			confirm_dns
 			# Durable network commit exists; declaration phase publication was interrupted.
 			printf 'installed\n' >"$decl/phase"
 			cp "$RP_UCI_CONFIG" "$tmp/confirmed-app"
+			printf 'watcher retry\n' >"$network/confirm-error"; printf 0 >"$tmp/svc/routepolicy.running"
+			if "$TX" finish-confirmed bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >/dev/null; then exit 1; fi
+			[ "$(cat "$decl/phase")" = installed ] && [ -f "$network/confirm-error" ] &&
+				[ "$(cat "$tmp/svc/routepolicy.running")" = 0 ]
+			"$TX" finish-confirmed "$token" >/dev/null
+			"$TX" finish-confirmed "$token" >/dev/null
+			[ "$(cat "$decl/phase")" = committed ] && [ ! -e "$network/confirm-error" ] &&
+				[ "$(cat "$tmp/svc/routepolicy.running")" = 1 ]
+			printf 'installed\n' >"$decl/phase"
 			"$tmp/lib/lifecycle" restore-recover >"$tmp/confirmed-recover"
 			cmp "$RP_UCI_CONFIG" "$tmp/confirmed-app"
 			[ "$(cat "$decl/phase")" = committed ]
 			printf 'installed\n' >"$decl/phase"; printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$decl/init-token"
 			if "$tmp/lib/lifecycle" restore-recover >/dev/null 2>&1; then printf 'mismatched confirmed token recovered declarations\n' >&2; exit 1; fi
 			cmp "$RP_UCI_CONFIG" "$tmp/confirmed-app"
-			printf '%s\n' 'confirmed declaration recovery: passed (commit gap converged; mismatched token preserves declarations)'
+			printf '%s\n' 'confirmed declaration recovery: passed (scoped watcher finish, commit gap converged; mismatched token preserves declarations)'
 			exit 0
 		fi
 		if [ "$restore_case" = failure ]; then
@@ -870,6 +1278,10 @@ if [ "${1:-}" = --restore-empty ] || [ "${1:-}" = --restore-confirmed ]; then
 			[ ! -s "$tmp/restored-merged" ]
 		fi
 	done
+	if [ "${1:-}" = --restore-cancel ]; then
+		printf '%s\n' 'prepared declaration recovery: passed (preparing interruption, terminal idempotence, absent/partial binding, scoped cancellation and exact recovery)'
+		exit 0
+	fi
 	printf '%s\n' 'source-free restore: passed (empty published snapshot; failure restores current/previous and unknown files)'
 	exit 0
 fi
@@ -1054,6 +1466,257 @@ if [ "${1:-}" = --exit-archive ]; then
 	printf '%s\n' 'confirmed-only exit: passed (no current, same/new boot, preview/prepare create no current, real exit, unknown child preserved)'
 	exit 0
 fi
+if [ "${1:-}" = --cache-reinit ]; then
+	cache="$RP_RUN_DIR/smartdns.cache"
+	txroot="$RP_STATE_DIR/init-transaction"; wal="$txroot/current"
+	setup_exited_cache() {
+		baseline 0 0 1 1
+		uci -q delete 'smartdns.@smartdns[0].cache_file'; uci commit smartdns
+		canonical smartdns >"$tmp/smartdns.before"
+		prepare_dns 192.0.2.53; confirm_dns
+		[ "$(cat "$cache")" = FRESH ]
+		printf '%s\n' 'unknown old cache bytes' >"$tmp/cache-before"; cp "$tmp/cache-before" "$cache"
+		"$TX" exit-prepare >"$tmp/cache-exit-review"
+		exit_token=$(jsonfilter -i "$tmp/cache-exit-review" -e '@.token')
+		"$TX" exit-apply "$exit_token" >/dev/null
+		[ "$(cat "$wal/phase")" = exited ]; restored; cmp "$tmp/cache-before" "$cache"
+	}
+	prepare_cache_again() {
+		if ! prepare_dns 192.0.2.53; then printf 'reinitialize after completed exit failed: %s\n' "$output" >&2; exit 1; fi
+		cmp "$tmp/cache-before" "$cache"
+		[ -f "$wal/dns-cache-preserve" ] && [ ! -e "$cache.init-$token" ] || exit 1
+	}
+	setup_exited_cache
+	prepare_cache_again
+	"$TX" cancel-prepared "$token" >/dev/null
+	[ "$(cat "$wal/phase")" = expired ] && [ ! -e "$wal/boot-id" ] || exit 1
+	restored
+	prepare_cache_again; prepare_cache_again
+	cat >"$tmp/bin/fw4" <<'SH'
+#!/bin/sh
+[ "$1" != check ] || [ ! -f "$TEST_DNS_TMP/fail-before-cache-move" ]
+SH
+	: >"$tmp/fail-before-cache-move"
+	if "$TX" apply "$token" >"$tmp/cache-before-move-failed"; then exit 1; fi
+	rm "$tmp/fail-before-cache-move"
+	[ "$(cat "$wal/phase")" = rolled_back ] && [ ! -e "$wal/dns-cache-move" ] || exit 1
+	grep -Fq 'firewall-check' "$tmp/cache-before-move-failed"
+	restored; cmp "$tmp/cache-before" "$cache"
+	prepare_cache_again
+	TEST_CACHE_MV=$(command -v mv); export TEST_CACHE_MV
+	cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+"$TEST_CACHE_MV" "$@" || exit $?
+case "${2:-}:${3:-}" in */smartdns.cache:*/smartdns.cache.init-*)
+	if [ -f "$TEST_DNS_TMP/kill-cache-move" ]; then rm "$TEST_DNS_TMP/kill-cache-move"; kill -KILL "$PPID"; fi ;;
+	*/smartdns.cache.init-*:*/smartdns.cache)
+		if [ -f "$TEST_DNS_TMP/kill-cache-restore" ]; then rm "$TEST_DNS_TMP/kill-cache-restore"; kill -KILL "$PPID"; fi ;;
+esac
+SH
+	chmod +x "$tmp/bin/mv"
+	: >"$tmp/kill-cache-move"
+	if "$TX" apply "$token" >"$tmp/cache-kill-output" 2>&1; then exit 1; fi
+	[ "$(cat "$wal/dns-cache-move")" = preserve-intent ] && [ ! -e "$cache" ] || exit 1
+	cmp "$tmp/cache-before" "$cache.init-$token"
+	"$TX" recover >/dev/null; restored; cmp "$tmp/cache-before" "$cache"
+	[ ! -e "$cache.init-$token" ]
+	prepare_cache_again
+	: >"$tmp/query-fail"
+	if "$TX" apply "$token" >"$tmp/cache-apply-failed"; then exit 1; fi
+	rm "$tmp/query-fail"
+	[ "$(cat "$wal/phase")" = rolled_back ]; restored; cmp "$tmp/cache-before" "$cache"
+	[ "$(cat "$cache.init-$token.failed")" = FRESH ]
+	prepare_cache_again
+	"$TX" apply "$token" >/dev/null
+	[ "$(cat "$cache")" = FRESH ]; cmp "$tmp/cache-before" "$cache.init-$token"
+	mv "$cache" "$tmp/cache-generated"; ln -s "$tmp/cache-generated" "$cache"
+	if "$TX" recover >"$tmp/cache-conflict"; then exit 1; fi
+	[ "$(cat "$wal/phase")" = conflict ] && [ -L "$cache" ] && [ "$(cat "$cache")" = FRESH ] || exit 1
+	cmp "$tmp/cache-before" "$cache.init-$token"; restored
+	mv "$cache.init-$token" "$tmp/cache-displaced-backup"
+	if "$TX" recover >"$tmp/cache-missing-backup" 2>"$tmp/cache-missing-backup.stderr"; then
+		printf '%s\n' 'missing preserved backup with live symlink reported successful rollback' >&2; exit 1
+	fi
+	grep -Fq 'SmartDNS 缓存恢复有冲突' "$tmp/cache-missing-backup.stderr"
+	[ "$(cat "$wal/phase")" = conflict ] && [ -L "$cache" ] && [ "$(cat "$cache")" = FRESH ] || exit 1
+	cmp "$tmp/cache-before" "$tmp/cache-displaced-backup"
+	rm "$cache"; mv "$tmp/cache-generated" "$cache"
+	if "$TX" recover >"$tmp/cache-missing-ordinary" 2>"$tmp/cache-missing-ordinary.stderr"; then printf '%s\n' 'ordinary target hid missing backup' >&2; exit 1; fi
+	grep -Fq '本次启动已移走的 SmartDNS 原缓存备份缺失' "$tmp/cache-missing-ordinary.stderr"
+	[ "$(cat "$wal/phase")" = conflict ] && [ "$(cat "$cache")" = FRESH ] || exit 1
+	mv "$tmp/cache-displaced-backup" "$cache.init-$token"
+	mkdir "$cache.init-$token.failed"
+	if "$TX" recover >"$tmp/cache-failed-path-conflict"; then exit 1; fi
+	[ -d "$cache.init-$token.failed" ] && [ "$(cat "$cache")" = FRESH ] || exit 1
+	cmp "$tmp/cache-before" "$cache.init-$token"; rmdir "$cache.init-$token.failed"
+	: >"$tmp/kill-cache-restore"
+	if "$TX" recover >"$tmp/cache-restore-killed" 2>&1; then exit 1; fi
+	[ "$(cat "$wal/dns-cache-move")" = preserve-restoring ] && [ ! -e "$cache.init-$token" ] || exit 1
+	cmp "$tmp/cache-before" "$cache"
+	"$TX" recover >/dev/null; restored; cmp "$tmp/cache-before" "$cache"
+	prepare_cache_again
+	confirm_dns
+	[ "$(cat "$cache")" = FRESH ]; cmp "$tmp/cache-before" "$cache.init-$token"
+	[ "$(cat "$tmp/root/etc/smartdns/user.cache")" = USER-CACHE ]
+	printf '%s\n' 'cache reinit: canceled preparation, untouched rollback, interrupted move/restore, missing backup conflicts and confirmation preserve bytes'
+	setup_exited_cache; prepare_cache_again
+	"$TX" apply "$token" >/dev/null
+	[ "$(cat "$wal/dns-cache-move")" = preserve-moved ]
+	# Both token backups and the live cache are in the volatile /tmp namespace.
+	rm "$cache" "$cache.init-$token"; test_boot
+	ln -s "$tmp/cache-before" "$cache"
+	if "$TX" recover >"$tmp/cache-reboot-link-conflict"; then exit 1; fi
+	[ "$(cat "$wal/phase")" = conflict ] && [ -L "$cache" ] || exit 1
+	rm "$cache"
+	"$TX" recover >/dev/null; restored
+	[ "$(cat "$wal/phase")" = rolled_back ] && [ ! -e "$cache" ] || exit 1
+	printf '%s\n' 'cache reinit: after reboot volatile backups may be absent without a same-boot restore claim'
+	setup_exited_cache
+	boot_file="$RP_ROOT/proc/sys/kernel/random/boot_id"; cp "$boot_file" "$tmp/cache-original-boot"
+	for edge in symlink directory forged cross-boot changed-config; do
+		case "$edge" in
+			symlink) mv "$cache" "$tmp/cache-displaced"; ln -s "$tmp/cache-displaced" "$cache" ;;
+			directory) mv "$cache" "$tmp/cache-displaced"; mkdir "$cache" ;;
+			forged) mv "$wal/exit-complete" "$tmp/cache-exit-complete" ;;
+			cross-boot) printf '00000000-0000-4000-8000-000000000099\n' >"$boot_file" ;;
+			changed-config) uci set 'smartdns.@smartdns[0].cache_file=/etc/smartdns/other.cache'; uci commit smartdns ;;
+		esac
+		if prepare_dns 192.0.2.53; then printf 'accepted conflicting cache: %s\n' "$edge" >&2; exit 1; fi
+		printf '%s\n' "$output" | grep -Fq '未移动缓存'
+		[ "$(cat "$wal/phase")" = exited ]
+		case "$edge" in
+			symlink) [ -L "$cache" ]; rm "$cache"; mv "$tmp/cache-displaced" "$cache" ;;
+			directory) rmdir "$cache"; mv "$tmp/cache-displaced" "$cache" ;;
+			forged) mv "$tmp/cache-exit-complete" "$wal/exit-complete" ;;
+			cross-boot) cp "$tmp/cache-original-boot" "$boot_file" ;;
+			changed-config) uci -q delete 'smartdns.@smartdns[0].cache_file'; uci commit smartdns ;;
+		esac
+		cmp "$tmp/cache-before" "$cache"
+	done
+	baseline 0 0 1 1; mkdir -p "$RP_RUN_DIR"; cp "$tmp/cache-before" "$cache"
+	if prepare_dns 192.0.2.53; then exit 1; fi
+	printf '%s\n' "$output" | grep -Fq '没有可信的本次启动退出记录'
+	cmp "$tmp/cache-before" "$cache"; restored
+	printf '%s\n' 'cache reinit: symlink, directory, missing exit proof, other boot, changed configuration and unrelated cache rejected'
+	exit 0
+fi
+if [ "${1:-}" = --web-exit ]; then
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	txroot="$RP_STATE_DIR/init-transaction"
+	"$TX" status >"$tmp/web-health"
+	[ "$(jsonfilter -i "$tmp/web-health" -e '@.health.rules_loaded')" = true ]
+	[ "$(jsonfilter -i "$tmp/web-health" -e '@.health.sets_loaded')" = true ]
+	[ "$(jsonfilter -i "$tmp/web-health" -e '@.health.dns_queries[*].rcode' | grep -c '^NOERROR$')" = 4 ]
+	touch "$tmp/nft-missing-set"
+	"$TX" status >"$tmp/web-health"
+	[ "$(jsonfilter -i "$tmp/web-health" -e '@.health.sets_loaded')" = false ]
+	rm "$tmp/nft-missing-set"
+	cat >"$tmp/root/etc/init.d/routepolicy-initguard" <<'EOF'
+#!/bin/sh
+[ "$1" != start ] || "$ROUTEPOLICY_LIBEXEC/init-transaction" guard-needed
+EOF
+	prepare_web_exit() {
+		"$TX" exit-prepare >"$tmp/exit-review"
+		"$TX" exit-candidate >"$tmp/exit-reopened"
+		cmp "$tmp/exit-review" "$tmp/exit-reopened"
+		exit_token=$(jsonfilter -i "$tmp/exit-review" -e '@.token')
+	}
+	wait_web_exit() {
+		polls=0
+		while ! grep -q "^$exit_token " "$txroot/job-result" 2>/dev/null; do
+			polls=$((polls + 1)); [ "$polls" -lt 600 ] || { "$TX" status; return 1; }
+			sleep 0.05
+		done
+	}
+	prepare_web_exit
+	grep -Fq 'dnsmasq\trunning\t0\t1' "$tmp/exit-review"
+	uci add_list network.lan.ip6addr=2001:db8::1/64; uci commit network
+	"$TX" start-exit "$exit_token" >/dev/null; wait_web_exit
+	"$TX" status | grep -Fq '"state":"failed","error":"退出候选的原值或服务状态已变化'
+	[ "$(cat "$txroot/current/phase")" = confirmed ]
+	uci -q delete network.lan.ip6addr; uci commit network
+	"$TX" start-exit "$exit_token" | grep -Fq '"state":"failed"'
+	TEST_EXIT_CP=$(command -v cp); TEST_EXIT_MV=$(command -v mv)
+	export TEST_EXIT_CP TEST_EXIT_MV
+	cat >"$tmp/bin/cp" <<'SH'
+#!/bin/sh
+case "$1:${2:-}" in -pR:*/origin/.)
+	if [ -f "$TEST_DNS_TMP/exit-copy-fail" ]; then
+		txroot="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction"
+		for item in output error result.new; do
+			[ -f "$txroot/job-$item" ] || printf '%s\n' "$item" >>"$TEST_DNS_TMP/unreserved-job-files"
+		done
+		"$TEST_EXIT_CP" "$2/schema" "$3/schema" || exit 1
+		printf '%s\n' 'simulated storage failure during origin copy' >&2
+		exit 1
+	fi ;;
+esac
+exec "$TEST_EXIT_CP" "$@"
+SH
+	cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+case "$1" in */job-result.new)
+	if [ -f "$TEST_DNS_TMP/exit-result-fail" ]; then
+		: >"$TEST_DNS_TMP/exit-result-failed"
+		exit 1
+	fi ;;
+esac
+exec "$TEST_EXIT_MV" "$@"
+SH
+	chmod +x "$tmp/bin/cp" "$tmp/bin/mv"
+	cp -R "$tmp/root/etc/config" "$tmp/exit-config-before"
+	cp -R "$txroot/current" "$tmp/exit-current-before"
+	active=$(rp_init_active_record); cp -R "$active" "$tmp/exit-active-before"
+	copy_failure() {
+		: >"$tmp/exit-copy-fail"
+		"$TX" start-exit "$exit_token" >/dev/null
+		polls=0
+		while ! flock -n "$txroot/lock" true; do
+			polls=$((polls + 1)); [ "$polls" -lt 600 ] || return 1
+			sleep 0.05
+		done
+		rm "$tmp/exit-copy-fail"
+		"$TX" status >"$tmp/exit-copy-status"
+		[ "$(jsonfilter -i "$tmp/exit-copy-status" -e '@.job.token')" = "$exit_token" ]
+		grep -Fq '"state":"failed","error":"无法复制退出归属记录' "$tmp/exit-copy-status"
+		grep -Fq '可创建文件数量（inode）' "$tmp/exit-copy-status"
+		grep -Fq '尚未恢复网络配置' "$tmp/exit-copy-status"
+		[ ! -s "$tmp/unreserved-job-files" ]
+		[ -f "$txroot/exiting-$exit_token/schema" ] && [ ! -e "$txroot/previous" ]
+		grep -Fq '无法复制退出归属记录' "$txroot/job-output"
+		diff -r "$tmp/exit-current-before" "$txroot/current"
+		diff -r "$tmp/exit-active-before" "$(rp_init_active_record)"
+		diff -r "$tmp/exit-config-before" "$tmp/root/etc/config"
+	}
+	prepare_web_exit; copy_failure
+	grep -Fxq "$exit_token failed" "$txroot/job-result"
+	for item in request result error output; do cp "$txroot/job-$item" "$tmp/exit-prior-$item"; done
+	prepare_web_exit
+	chmod 400 "$txroot/job-output"
+	if [ -w "$txroot/job-output" ]; then mkdir "$txroot/job-request.new"; fi
+	if "$TX" start-exit "$exit_token" >"$tmp/exit-reservation-failed"; then exit 1; fi
+	grep -Fq '无法预留后台事务记录' "$tmp/exit-reservation-failed"
+	if [ ! -w "$txroot/job-output" ]; then grep -Fq '可创建文件数量（inode）' "$tmp/exit-reservation-failed"; fi
+	for item in request result error output; do cmp "$tmp/exit-prior-$item" "$txroot/job-$item"; done
+	[ ! -e "$txroot/exiting-$exit_token" ]
+	chmod 600 "$txroot/job-output"
+	[ ! -d "$txroot/job-request.new" ] || rmdir "$txroot/job-request.new"
+	: >"$tmp/exit-result-fail"; copy_failure
+	[ -f "$tmp/exit-result-failed" ]
+	cmp "$tmp/exit-prior-result" "$txroot/job-result"
+	grep -Fxq "$exit_token failed" "$txroot/job-result.new"
+	rm "$tmp/exit-result-fail"
+	prepare_web_exit
+	"$TX" start-exit "$exit_token" >/dev/null
+	"$TX" start-exit "$exit_token" >/dev/null
+	wait_web_exit
+	"$TX" status | grep -Fq '"phase":"exited"'
+	"$TX" start-exit "$exit_token" | grep -Fq '"state":"done"'
+	restored
+	[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 11 ]
+	printf '%s\n' 'web exit: exact review, external change rejected, storage and publication failures preserved, guard, idempotent exit and original DNS restored'
+	exit 0
+fi
 if [ "${1:-}" = --exit-stage ]; then
 	TEST_EXIT_CP=$(command -v cp); export TEST_EXIT_CP
 	cat >"$tmp/bin/cp" <<'SH'
@@ -1107,6 +1770,102 @@ SH
 		[ ! -e "$txroot/active" ]; grep -Fxq 'unknown legacy stage' "$txroot/exiting/user.keep"
 	done
 	printf '%s\n' 'exit stage recovery: passed (identity/copy/candidate/promotion, promoted WAL, new-boot restore-files; unknown stages preserved)'
+	exit 0
+fi
+if [ "${1:-}" = --exit-snapshot ]; then
+	baseline 0 0 1 1
+	output=$("$TX" prepare lan wan wan2 - - - - - - - - 192.0.2.53,192.0.2.54,192.0.2.55,192.0.2.56 198.51.100.53,198.51.100.54,198.51.100.55,198.51.100.56)
+	token=$(printf '%s' "$output" | sed -n 's/.*"token":"\([a-f0-9]*\)".*/\1/p')
+	[ "${#token}" = 32 ]; confirm_dns
+	active=$(rp_init_active_record)
+	origin="$active/origin"
+	cp -R "$origin" "$tmp/exit-origin-before"
+	cp "$RP_UCI_CONFIG" "$tmp/exit-routepolicy-before"
+	cp "$RP_SMARTDNS_UCI" "$tmp/exit-smartdns-before"
+	start=$(awk '{print $1}' /proc/uptime)
+	TEST_EXIT_UCI_TRACE="$tmp/exit-trace" "$TX" exit-preview >"$tmp/exit-ready"
+	finish=$(awk '{print $1}' /proc/uptime)
+	fields=$(cat "$origin/count")
+	exports=$(grep -c ' export ' "$tmp/exit-trace")
+	awk -v fields="$fields" -v exports="$exports" -v start="$start" -v finish="$finish" \
+		'BEGIN {printf "native exit preview: %d fields, %d UCI exports, %.2fs\n", fields, exports, finish-start}'
+	grep -Fq '"state":"ready","conflicts":""' "$tmp/exit-ready"
+	[ "$exports" -eq 10 ]
+	! grep -Eq ' get rp_[0-9a-f]+_[^. ]+\.[^. ]+\.[^. ]+' "$tmp/exit-trace"
+	diff -r "$origin" "$tmp/exit-origin-before"
+	cmp "$RP_UCI_CONFIG" "$tmp/exit-routepolicy-before"
+	cmp "$RP_SMARTDNS_UCI" "$tmp/exit-smartdns-before"
+	exit_refused() {
+		if TEST_EXIT_UCI_TRACE="$tmp/exit-trace" "$TX" exit-preview >"$tmp/exit-refused"; then
+			printf 'exit preview accepted invalid evidence: %s\n' "$1" >&2; exit 1
+		fi
+		grep -Fq "$1" "$tmp/exit-refused"
+	}
+	for mode in committed pending; do
+		printf '%s\n' "$mode" >"$tmp/exit-uci-change"
+		exit_refused uci-changed-during-exit-check
+		[ "$(uci get routepolicy.main.user_note)" = EXTERNAL ]
+		[ "$mode" != pending ] || uci revert routepolicy
+		cp "$tmp/exit-routepolicy-before" "$RP_UCI_CONFIG"
+	done
+	exit_field=$(find "$origin/fields" -name key -exec grep -lFx firewall.rp_init_dns.name '{}' ';')
+	[ -n "$exit_field" ]; exit_field=${exit_field%/key}
+	TEST_EXIT_ORIGIN_FIELD=$exit_field; export TEST_EXIT_ORIGIN_FIELD
+	for mode in missing tab key; do
+		printf '%s\n' "$mode" >"$tmp/exit-origin-change"
+		exit_refused '"state":"blocked"'
+		[ ! -f "$tmp/exit-origin-change" ]
+		for item in expected expected-type key; do cp "$tmp/exit-origin-before/fields/${exit_field##*/}/$item" "$exit_field/$item"; done
+	done
+	for item in key existed type expected-type; do printf '\n\n' >>"$exit_field/$item"; done
+	printf '%s\n\n' "$(cat "$exit_field/expected")" >"$exit_field/expected"
+	"$TX" exit-preview >"$tmp/exit-trailing-newlines"
+	cmp "$tmp/exit-ready" "$tmp/exit-trailing-newlines"
+	for item in key existed type expected-type; do cp "$tmp/exit-origin-before/fields/${exit_field##*/}/$item" "$exit_field/$item"; done
+	: >"$exit_field/expected"
+	uci set firewall.rp_init_dns.name=; uci commit firewall
+	"$TX" exit-preview >"$tmp/exit-empty"
+	cmp "$tmp/exit-ready" "$tmp/exit-empty"
+	printf 'first\nset\troutepolicy.main.enabled\t1\n' >"$exit_field/expected"
+	exit_refused invalid-origin
+	cp "$tmp/exit-origin-before/fields/${exit_field##*/}/expected" "$exit_field/expected"
+	printf 'scalar\000invalid' >"$exit_field/expected-type"
+	exit_refused invalid-origin
+	cp "$tmp/exit-origin-before/fields/${exit_field##*/}/expected-type" "$exit_field/expected-type"
+	printf 'unsupported.option.value' >"$exit_field/key"
+	exit_refused invalid-origin
+	cp "$tmp/exit-origin-before/fields/${exit_field##*/}/key" "$exit_field/key"
+	mv "$exit_field/expected" "$tmp/exit-field-expected"
+	ln -s "$tmp/exit-field-expected" "$exit_field/expected"
+	exit_refused invalid-origin
+	rm "$exit_field/expected"; mv "$tmp/exit-field-expected" "$exit_field/expected"
+	printf '2049\n' >"$origin/count"
+	exit_refused invalid-origin
+	cp "$tmp/exit-origin-before/count" "$origin/count"
+	uci set "firewall.rp_init_dns.name=$(cat "$exit_field/expected")"; uci commit firewall
+	uci set 'firewall.rp_init_dns.name=非ASCII'; uci commit firewall
+	exit_refused 'unreadable:firewall.rp_init_dns.name'
+	uci set 'firewall.rp_init_dns.name=external'; uci commit firewall
+	printf '1' >"$exit_field/existed"
+	printf 'external\nretained\n\n' >"$exit_field/old"
+	exit_refused 'field:firewall.rp_init_dns.name'
+	printf 'external\n\n' >"$exit_field/old"
+	"$TX" exit-preview >"$tmp/exit-original-value"
+	cmp "$tmp/exit-ready" "$tmp/exit-original-value"
+	for item in existed old; do cp "$tmp/exit-origin-before/fields/${exit_field##*/}/$item" "$exit_field/$item"; done
+	uci set "firewall.rp_init_dns.name=$(cat "$exit_field/expected")"; uci commit firewall
+	uci delete 'smartdns.@smartdns[0].conf_files'
+	uci add_list 'smartdns.@smartdns[0].conf_files=ambiguous|value'; uci commit smartdns
+	exit_refused 'unreadable:smartdns.@smartdns[0].conf_files'
+	cp "$tmp/exit-smartdns-before" "$RP_SMARTDNS_UCI"
+	uci set smartdns.rp_init_default_1.user_note=KEEP; uci commit smartdns
+	exit_refused 'unknown-child:smartdns.rp_init_default_1.user_note'
+	cp "$tmp/exit-smartdns-before" "$RP_SMARTDNS_UCI"
+	"$TX" exit-preview >"$tmp/exit-ready-again"
+	cmp "$tmp/exit-ready" "$tmp/exit-ready-again"
+	diff -r "$origin" "$tmp/exit-origin-before"
+	[ -z "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'routepolicy-exit-verify.*' -print)" ]
+	printf '%s\n' 'exit snapshot: typed values and origin validation, committed/pending conflicts, exact unknown children, private cleanup passed'
 	exit 0
 fi
 if [ "${1:-}" = --lifecycle ]; then

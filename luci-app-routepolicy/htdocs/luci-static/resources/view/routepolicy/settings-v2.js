@@ -31,44 +31,47 @@ return view.extend({
 		let s = m.section(form.NamedSection, 'main', 'main', _('策略控制面'));
 		s.addremove = false;
 
-		let o = s.option(form.Flag, 'enabled', _('启用 RoutePolicy'));
+		s.tab('general', _('常规设置'));
+		s.tab('advanced', _('高级设置'));
+
+		let o = s.taboption('general', form.Flag, 'enabled', _('启用 RoutePolicy'));
 		o.default = '0';
+		o.rmempty = false;
 		o.description = _('首次启用前，请确保已有 VMM 控制台或等效的带外回退路径。应用动作会再次要求确认。');
 
-		o = s.option(widgets.NetworkSelect, 'lan_interface', _('LAN 逻辑接口'));
+		o = s.taboption('general', widgets.NetworkSelect, 'lan_interface', _('LAN 逻辑接口'));
 		o.nocreate = true;
 		o.rmempty = false;
 		o.description = _('使用逻辑接口选择器；不会接受设备名或 shell 文本。');
 
-		o = s.option(widgets.NetworkSelect, 'default_interface', _('默认出口逻辑接口'));
+		o = s.taboption('general', widgets.NetworkSelect, 'default_interface', _('默认出口逻辑接口'));
 		o.nocreate = true;
 		o.rmempty = false;
 
-		o = s.option(widgets.NetworkSelect, 'policy_interface', _('策略出口逻辑接口'));
+		o = s.taboption('general', widgets.NetworkSelect, 'policy_interface', _('策略出口逻辑接口'));
 		o.nocreate = true;
 		o.rmempty = false;
 
-		o = s.option(form.Flag, 'strict_enforcement', _('严格阻断'));
+		o = s.taboption('general', form.Flag, 'strict_enforcement', _('严格阻断'));
 		o.default = '1';
 		o.description = _('策略接口离线时保留策略表的 blackhole 默认路由，避免流量回落到默认出口。');
 
-		o = s.option(form.Flag, 'dns_redirect', _('重定向 LAN DNS'));
+		o = s.taboption('general', form.Flag, 'dns_redirect', _('重定向 LAN DNS'));
 		o.default = '1';
 		o.description = _('仅把 LAN 的 TCP/UDP 53 受控重定向到本机 DNS。');
 
-		o = s.option(form.Flag, 'warm_restore', _('动态集合暖启动'));
+		o = s.taboption('general', form.Flag, 'warm_restore', _('动态集合暖启动'));
 		o.default = '1';
 		o.description = _('重启后的短暂保底；随后由 SmartDNS 的 TTL 写入重新接管。');
 
-		o = s.option(form.Flag, 'route_local_traffic', _('路由器本机 IPv4 分流'));
+		o = s.taboption('general', form.Flag, 'route_local_traffic', _('路由器本机 IPv4 分流'));
 		o.default = '0';
 		o.description = _('默认关闭。开启后，路由器上的下载器、插件和守护进程产生的 IPv4 流量也会按 RoutePolicy 分类。');
 
-		o = s.option(form.Flag, 'source_accounting', _('按源 IP 统计'));
+		o = s.taboption('general', form.Flag, 'source_accounting', _('按源 IP 统计'));
 		o.default = '0';
 		o.description = _('默认关闭。启用后会消耗额外内存和 CPU；只覆盖受管 IPv4 路径，硬件或 flow offload 可能造成与接口总量的正常差异。');
 
-		s.tab('advanced', _('高级设置'));
 		let a = s.taboption('advanced', form.Value, 'route_table', _('策略路由表号'));
 		a.tab = 'advanced';
 		a.default = '200';

@@ -11,25 +11,31 @@ class NetworkSelect extends CBIAbstractValue {}
 class NamedSection {}
 
 const renderedOptions = [];
+const sectionTabs = [];
 let currentMap = null;
 
-function makeOption(OptionClass, name) {
+function makeOption(OptionClass, name, tab) {
 	if (typeof OptionClass !== 'function' || !(OptionClass.prototype instanceof CBIAbstractValue))
 		throw new TypeError('Class must be a descendant of CBIAbstractValue');
 
 	const option = new OptionClass();
 	option.option = name;
+	option.tab = tab || null;
 	option.map = currentMap;
 	renderedOptions.push(option);
 	return option;
 }
 
+/* LuCI renders tabbed sections in registration order and omits unbound options. */
 const section = {
 	addremove: true,
-	option: makeOption,
-	tab: function() {},
+	option: function(OptionClass, name) { return makeOption(OptionClass, name); },
+	tab: function(name) {
+		if (sectionTabs.every(function(existing) { return existing.name !== name; }))
+			sectionTabs.push({ name: name });
+	},
 	taboption: function(tab, OptionClass, name) {
-		return makeOption(OptionClass, name);
+		return makeOption(OptionClass, name, tab);
 	}
 };
 
@@ -74,11 +80,16 @@ class Element {
 			if (this.selectedIndex === -1 || child.selected) {
 				this.children.forEach(function(option) { option.selected = false; });
 				child.selected = true;
-				this.selectedIndex = index;
-				this.value = child.value;
+			this.selectedIndex = index;
+			this.value = child.value;
 			}
 		}
 		return child;
+	}
+	replaceChildren() {
+		this.children = [];
+		for (let i = 0; i < arguments.length; i++)
+			this.appendChild(arguments[i]);
 	}
 }
 
@@ -162,6 +173,47 @@ assert.deepStrictEqual(
 	[ 'lan_interface', 'default_interface', 'policy_interface' ]
 );
 
+/* ---------- native LuCI tab grouping contract ---------- */
+
+const tabOrder = sectionTabs.map(function(tab) { return tab.name; });
+assert.ok(tabOrder.includes('advanced'), 'the advanced tab must survive the basic-settings regression fix');
+assert.strictEqual(tabOrder[0], 'general',
+	'the general tab must be registered first so the default visible tab holds the basic controls');
+
+/* renderUCISection placement rule: a tabbed section renders only options
+   bound to a registered tab, so this list is what actually reaches the DOM. */
+assert.deepStrictEqual(
+	renderedOptions.filter(function(option) { return tabOrder.indexOf(option.tab) >= 0; }).map(function(option) { return option.option; }),
+	[ 'enabled', 'lan_interface', 'default_interface', 'policy_interface',
+	  'strict_enforcement', 'dns_redirect', 'warm_restore', 'route_local_traffic', 'source_accounting',
+	  'route_table', 'rule_priority', 'mark', 'mark_mask', 'smartdns_enabled', 'smartdns_policy_group',
+	  'auto_update', 'update_hour', 'update_minute', 'update_via_policy_interface',
+	  'source_idle_timeout', 'source_max_entries' ],
+	'every settings control must actually reach the tabbed DOM');
+
+assert.deepStrictEqual(
+	renderedOptions.filter(function(option) { return option.tab === tabOrder[0]; }).map(function(option) { return option.option; }),
+	[ 'enabled', 'lan_interface', 'default_interface', 'policy_interface',
+	  'strict_enforcement', 'dns_redirect', 'warm_restore', 'route_local_traffic', 'source_accounting' ],
+	'the default visible tab must hold the basic controls including the enable switch');
+
+assert.deepStrictEqual(
+	renderedOptions.filter(function(option) { return option.tab === 'advanced'; }).map(function(option) { return option.option; }),
+	[ 'route_table', 'rule_priority', 'mark', 'mark_mask', 'smartdns_enabled', 'smartdns_policy_group',
+	  'auto_update', 'update_hour', 'update_minute', 'update_via_policy_interface',
+	  'source_idle_timeout', 'source_max_entries' ],
+	'all advanced controls must stay on the advanced tab');
+
+const enabledOption = renderedOptions.find(function(option) { return option.option === 'enabled'; });
+assert.strictEqual(enabledOption.default, '0', 'RoutePolicy must stay opt-in by default');
+assert.strictEqual(enabledOption.rmempty, false,
+	'an explicit disable must persist enabled=0 in UCI instead of being removed by the LuCI form Flag rmempty rule');
+for (const expected of [ [ 'strict_enforcement', '1' ], [ 'dns_redirect', '1' ], [ 'warm_restore', '1' ],
+		[ 'route_local_traffic', '0' ], [ 'source_accounting', '0' ] ]) {
+	const option = renderedOptions.find(function(candidate) { return candidate.option === expected[0]; });
+	assert.strictEqual(option.default, expected[1], expected[0] + ' must keep its existing default semantics');
+}
+
 const smartdns = loadView(path.join(
 	repo,
 	'luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/smartdns.js'
@@ -207,4 +259,140 @@ assert.strictEqual(sourceAccounting.default, '0', 'source accounting must remain
 assert.strictEqual(sourceTimeout.datatype, 'range(60,86400)', 'source accounting timeout must have the backend-compatible bound');
 assert.strictEqual(sourceMaximum.datatype, 'range(256,16384)', 'source accounting capacity must have the backend-compatible bound');
 
-console.log('LuCI view render contract passed.');
+/* ---------- lifecycle wizard ---------- */
+
+function loadLifecycleModule() {
+	function BaseClass() {}
+	BaseClass.extend = function(properties) {
+		function Subclass() {}
+		Subclass.prototype = Object.create(BaseClass.prototype);
+		Object.assign(Subclass.prototype, properties);
+		return Subclass;
+	};
+	const lifecycleFactory = loadViewWithDependencies(
+		path.join(repo, 'luci-app-routepolicy/htdocs/luci-static/resources/routepolicy/lifecycle.js'),
+		{ baseclass: BaseClass }
+	);
+	return new (lifecycleFactory())();
+}
+
+/* Re-run the directive loader with a custom dependency set for the wizard. */
+function loadViewWithDependencies(filename, dependencies) {
+	const source = fs.readFileSync(filename, 'utf8');
+	const aliases = [];
+	const instances = [];
+	const directive = /^'(use strict|require\s+(\S+)(?:\s+as\s+([a-zA-Z_]\S*))?)';\s*/;
+	let remaining = source;
+	while (true) {
+		const match = directive.exec(remaining);
+		if (!match) break;
+		remaining = remaining.substring(match[0].length);
+		if (!match[2]) continue;
+		if (!Object.prototype.hasOwnProperty.call(dependencies, match[2]))
+			throw new Error('Unsupported view dependency: ' + match[2]);
+		aliases.push(match[3] || match[2].replace(/[^a-zA-Z0-9_]/g, '_'));
+		instances.push(dependencies[match[2]]);
+	}
+	const factory = new Function('window', 'document', 'L', 'E', '_', ...aliases, source);
+	return function(L, window, document) {
+		return factory(window, document, L, makeElement, function(value) { return value; }, ...instances);
+	};
+}
+
+const wizardEntry = menu['admin/services/routepolicy/wizard'];
+assert.ok(wizardEntry, 'the menu must expose the lifecycle wizard entry');
+assert.strictEqual(wizardEntry.action.path, 'routepolicy/wizard');
+assert.strictEqual(wizardEntry.depends.acl[0], 'luci-app-routepolicy');
+
+const wizardLoadCalls = [];
+const wizardApi = {
+	safeText: function(value, fallback) { return value == null || value === '' ? (fallback || '—') : String(value); },
+	initStatus: function() { wizardLoadCalls.push('init_status'); return Promise.resolve({ ok: true, phase: 'absent' }); },
+	restoreStatus: function() { wizardLoadCalls.push('restore_status'); return Promise.resolve({ ok: true, candidate_pending: false, declaration_phase: 'absent', init_token: '' }); }
+};
+for (const forbidden of [ 'init_discover', 'init_preview', 'init_prepare', 'init_candidate', 'init_apply', 'init_cancel', 'init_finish', 'init_recover',
+	'config_export', 'config_import', 'restore_prepare', 'restore_recover', 'exit_preview', 'exit_prepare',
+	'exit_candidate', 'exit_apply', 'write_user_list' ]) {
+	const camel = forbidden.replace(/_([a-z])/g, function(_, c) { return c.toUpperCase(); });
+	wizardApi[camel] = function() {
+		wizardLoadCalls.push(forbidden);
+		return Promise.reject(new Error(forbidden + ' must not be callable during load or render'));
+	};
+}
+let wizardPosted = false;
+const wizardFactory = loadViewWithDependencies(
+	path.join(repo, 'luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/wizard.js'),
+	{
+		view: { extend: function(properties) { return properties; } },
+		uci: {
+			load: function() { wizardLoadCalls.push('uci.load'); return Promise.resolve(); },
+			get: function() { return null; },
+			sections: function() { return []; },
+			set: function() { throw new Error('wizard render must not write UCI'); }
+		},
+		ui: {
+			createHandlerFn: function(ctx, fn) { return fn.bind(ctx); },
+			addNotification: function() {}
+		},
+		request: {
+			post: function() { wizardPosted = true; return Promise.reject(new Error('render must not post')); }
+		},
+		'routepolicy/api': wizardApi,
+		'routepolicy/lifecycle': loadLifecycleModule()
+	}
+);
+const wizard = wizardFactory({}, { setTimeout: function() { return 1; }, clearTimeout: function() {} }, {});
+assert.strictEqual(wizard.handleSave, null, 'the wizard must not render a form Save footer');
+assert.strictEqual(wizard.handleSaveApply, null, 'the wizard must not render a form Save & Apply footer');
+assert.strictEqual(wizard.handleReset, null, 'the wizard must not render a form Reset footer');
+
+(async function() {
+	const loaded = await wizard.load();
+	const wizardRoot = wizard.render(loaded);
+	for (const call of wizardLoadCalls)
+		assert.ok(call === 'init_status' || call === 'restore_status' || call === 'uci.load',
+			'wizard load/render must stay read-only, got ' + call);
+	assert.strictEqual(wizardPosted, false, 'render must not POST the confirmation endpoint');
+	let wizardText = '';
+	const collect = function(node) {
+		if (node == null) return;
+		if (!(node instanceof Element)) { wizardText += String(node); return; }
+		wizardText += node.textContent;
+		node.children.forEach(collect);
+	};
+	collect(wizardRoot);
+	for (const expected of [ '初始化与恢复向导', '未初始化', '首次配置向导', '导入恢复', '退出', '重新检测状态', '默认启用开关' ])
+		assert.ok(wizardText.includes(expected), 'wizard overview must display ' + expected);
+
+	/* Hostile backend values render as literal plain text. */
+	const hostile = wizard.render([
+		{ ok: true, phase: 'pending', token: 'd'.repeat(32), management_address: '<img src=x onerror=alert(1)>',
+			remaining_seconds: 60, http_confirmation_ready: false, confirmation_transport: '<script>alert(2)</script>',
+			conflicts: '<script>alert(3)</script>' },
+		{ ok: true, candidate_pending: false, declaration_phase: 'absent', init_token: '' }
+	]);
+	let hostileText = '';
+	const hostileCollect = function(node) {
+		if (node == null) return;
+		if (!(node instanceof Element)) { hostileText += String(node); return; }
+		hostileText += node.textContent;
+		node.children.forEach(hostileCollect);
+	};
+	hostileCollect(hostile);
+	for (const expected of [ '<img src=x onerror=alert(1)>', '<script>alert(3)</script>' ])
+		assert.ok(hostileText.includes(expected), 'backend values must render as literal text: ' + expected);
+	const scanEventAttributes = function(node, found) {
+		found = found || [];
+		if (!(node instanceof Element)) return found;
+		for (const name of Object.keys(node.attributes))
+			if (/^on/i.test(name)) found.push(name);
+		node.children.forEach(function(child) { scanEventAttributes(child, found); });
+		return found;
+	};
+	assert.deepStrictEqual(scanEventAttributes(hostile), [], 'no inline event attribute may be derived from data');
+})().then(function() {
+	console.log('LuCI view render contract passed.');
+}, function(error) {
+	console.error(error.stack || error);
+	process.exit(1);
+});
