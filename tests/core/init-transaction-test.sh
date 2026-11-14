@@ -74,14 +74,18 @@ case "$op" in
 		[ ! -f "$TEST_TX_DIR/pending" ] || printf '%s\n' external-change
 		[ ! -f "$TEST_TX_DIR/pending-$key" ] || cat "$TEST_TX_DIR/pending-$key" ;;
 	get)
+		[ ! -f "$TEST_TX_DIR/uci-read-fail-${key%%.*}" ] || exit 1
 		if [ -n "$delta" ] && [ -f "$delta/$key" ]; then cat "$delta/$key"
 		elif [ -f "$db/$key" ]; then cat "$db/$key"; else exit 1; fi
 		printf '\n' ;;
 	export)
+		[ ! -f "$TEST_TX_DIR/uci-read-fail-$key" ] || exit 1
 		for file in "$db/$key."*; do
 			[ -f "$file" ] || continue
 			full=${file##*/}; rest=${full#*.}; section=${rest%%.*}
-			printf "config fixture '%s'\n" "$section"
+			type=fixture
+			[ ! -f "$db/$key.$section" ] || type=$(cat "$db/$key.$section")
+			printf "config '%s' '%s'\n" "$type" "$section"
 			for option in "$db/$key.$section."*; do
 				[ -f "$option" ] || continue
 				full=${option##*/}; kind=option
@@ -410,6 +414,7 @@ reset() {
 	rm -f "$tmp/"link-*
 	rm -f "$tmp/guard-delete"
 	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
+	rm -f "$tmp/"uci-read-fail-*
 	rm -f "$tmp/"auto-*
 	rm -f "$tmp/verify-clock" "$tmp/pending-clock"
 	rm -f "$tmp/async-hold" "$tmp/async-plans" "$tmp/topology-generations"
@@ -758,7 +763,10 @@ preview_baseline_tests() {
 	"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >"$tmp/preview-output"
 	# The tokenless preview must return the committed originals, not invented absence.
 	grep -Fq '"operation":"init-preview"' "$tmp/preview-output"
-	! grep -Fq '"token"' "$tmp/preview-output"
+	if grep -Fq '"token"' "$tmp/preview-output"; then
+		printf '%s\n' 'tokenless preview must not expose a transaction token' >&2
+		exit 1
+	fi
 	grep -Fq 'network.lan.ipaddr\tscalar\t192.0.2.1' "$tmp/preview-output"
 	grep -Fq 'dhcp.lan.ignore\tscalar\t0' "$tmp/preview-output"
 	grep -Fq 'routepolicy.main.lan_interface\tscalar\tlan' "$tmp/preview-output"
@@ -770,20 +778,36 @@ preview_baseline_tests() {
 	[ ! -e "$tmp/commits" ]
 	[ ! -e "$tmp/services" ]
 	restored
-	# An unreadable original value must fail the preview explicitly, never fake absence.
+	# Pre-existing committed sections and options keep their real original values.
+	printf rule >"$tmp/db/firewall.rp_init_dns"
+	printf open >"$tmp/db/firewall.rp_init_dns.target"
+	"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >"$tmp/preview-output"
+	grep -Fq 'firewall.rp_init_dns\tscalar\trule' "$tmp/preview-output"
+	grep -Fq 'firewall.rp_init_dns.target\tscalar\topen' "$tmp/preview-output"
+	grep -Fq 'firewall.rp_init_dns.name\t0\t-' "$tmp/preview-output"
+	rm "$tmp/db/firewall.rp_init_dns" "$tmp/db/firewall.rp_init_dns.target"
+	# A genuinely failing committed get/export must fail the preview explicitly.
+	touch "$tmp/uci-read-fail-firewall"
+	bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
+	grep -Fq '不能读取已提交的逐字段基线' "$tmp/failure"
+	if grep -Fq 'firewall.rp_init_dns\t0\t-' "$tmp/failure"; then
+		printf '%s\n' 'an unreadable committed field must never be reported as absent' >&2
+		exit 1
+	fi
+	rm "$tmp/uci-read-fail-firewall"
+	[ ! -d "$tmp/root/etc/routepolicy" ]
+	[ ! -e "$tmp/commits" ]
+	# A value that parses as invalid also fails explicitly instead of faking absence.
 	printf '192.0.2.1\nsecond-line\n' >"$tmp/db/network.lan.ipaddr"
 	bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
 	grep -Fq '不能读取已提交的逐字段基线' "$tmp/failure"
-	! grep -Fq 'network.lan.ipaddr\t0\t-' "$tmp/failure"
-	[ ! -d "$tmp/root/etc/routepolicy" ]
-	[ ! -e "$tmp/commits" ]
 	# External pending changes never blend into the previewed committed baseline.
 	printf 192.0.2.1 >"$tmp/db/network.lan.ipaddr"
 	touch "$tmp/pending"
 	bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
 	grep -Fq '存在外部 UCI pending changes' "$tmp/failure"
 	rm "$tmp/pending"
-printf '%s\n' 'preview baseline: passed (committed originals, absent fields, explicit read failure, no transaction writes)'
+printf '%s\n' 'preview baseline: passed (committed originals, absence proven from one export, explicit read failure, no transaction writes)'
 }
 
 wait_async_result() {

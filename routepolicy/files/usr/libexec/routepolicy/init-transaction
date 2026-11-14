@@ -774,6 +774,44 @@ snapshot() {
 		fi
 	done <"$1"
 }
+preview_section_type() {
+	# A section counts as absent only inside a committed export libuci already parsed.
+	awk -v section="$1" '
+		BEGIN { q = sprintf("%c", 39) }
+		$1 == "config" {
+			type = $2; gsub(q, "", type); name = $3; gsub(q, "", name)
+			ref = "@" type "[" count[type]++ "]"
+			if (section == name || section == ref) { print type; found = 1; exit }
+		}
+		END { exit found ? 0 : 3 }
+	'
+}
+preview_snapshot() {
+	# The preview read boundary: one committed export decides absence for every
+	# section and option, so an unreadable package can never become typed absence.
+	local plan=$1 export_dir=$2 key package rest data value status
+	while IFS="$TAB" read -r _preview_action key _preview_value; do
+		package=${key%%.*}; rest=${key#*.}
+		case "$key" in
+			*.*.*)
+				data=$(rp_uci_field_data "${rest%%.*}" "${rest#*.}" 1 <"$export_dir/$package") || return 1
+				;;
+			*.*)
+				status=0
+				data=$(preview_section_type "$rest" <"$export_dir/$package") || status=$?
+				case "$status" in
+					0) data="scalar$TAB$data" ;;
+					3) data="0$TAB-" ;;
+					*) return 1 ;;
+				esac
+				;;
+			*) return 1 ;;
+		esac
+		value=${data#*"$TAB"}
+		case "$value" in *[!\ -~]*) return 1 ;; esac
+		printf '%s\t%s\t%s\n' "$key" "${data%%"$TAB"*}" "$value"
+	done <"$plan"
+}
 preview_json() {
 	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":%s,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
 		"$operation" "$(rp_json_escape "$1")" "$RP_INIT_WINDOW_SECONDS"
@@ -1532,9 +1570,9 @@ case "$operation" in
 		printf '%s\n' "$link_preview" | link_plan_valid /dev/stdin || fail '新出口链路候选非法'
 		review_target "$1" "${10}" || fail '管理地址或出口故障策略不可确定'
 		# The diff table needs the committed originals now, not only after prepare.
-		# An ephemeral private read namespace reuses the prepare snapshot boundary:
-		# committed values only, explicit absence, hard failure on unreadable state.
-		# It never publishes a transaction, WAL, pending delta or any config write.
+		# An ephemeral private read namespace never publishes a transaction, WAL,
+		# pending delta or any config write. One committed export proves the state
+		# readable before preview_snapshot may claim typed absence.
 		preview_read_context=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-read.XXXXXX") || fail '不能创建预览只读命名空间'
 		trap 'rm -rf "$preview_read_context"' EXIT
 		trap 'exit 1' HUP INT TERM
@@ -1543,7 +1581,10 @@ case "$operation" in
 		printf '%s\n' "$candidate" >"$preview_read_context/candidate" || fail '不能暂存只读候选'
 		WAL=$preview_read_context
 		uci_layout || fail '不能读取已提交的逐字段基线'
-		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能读取已提交的逐字段基线'
+		preview_export_dir="$preview_read_context/exports"
+		mkdir "$preview_export_dir" || fail '不能创建预览导出上下文'
+		uci_export_snapshot "$preview_export_dir" || fail '不能读取已提交的逐字段基线'
+		preview_snapshot "$WAL/candidate" "$preview_export_dir" >"$WAL/baseline" || fail '不能读取已提交的逐字段基线'
 		preview_baseline=$(cat "$WAL/baseline") || fail '不能读取已提交的逐字段基线'
 		preview_json "$candidate" '' "$preview_baseline"
 		;;
