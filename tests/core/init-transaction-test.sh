@@ -752,6 +752,40 @@ confirmation_budget_tests() {
 printf '%s\n' 'confirmation budget: passed (180s, 20s reserve, unchanged pending retry, phase persistence, one confirmation admission)'
 }
 
+preview_baseline_tests() {
+	reset
+	"$TX" discover >/dev/null
+	"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >"$tmp/preview-output"
+	# The tokenless preview must return the committed originals, not invented absence.
+	grep -Fq '"operation":"init-preview"' "$tmp/preview-output"
+	! grep -Fq '"token"' "$tmp/preview-output"
+	grep -Fq 'network.lan.ipaddr\tscalar\t192.0.2.1' "$tmp/preview-output"
+	grep -Fq 'dhcp.lan.ignore\tscalar\t0' "$tmp/preview-output"
+	grep -Fq 'routepolicy.main.lan_interface\tscalar\tlan' "$tmp/preview-output"
+	# Keys the plan creates but committed state lacks are reported as typed absence.
+	grep -Fq 'firewall.rp_init_dns\t0\t-' "$tmp/preview-output"
+	grep -Fq 'firewall.rp_init_dns.name\t0\t-' "$tmp/preview-output"
+	# Read-only preview leaves no transaction, WAL, config commit or service write behind.
+	[ ! -d "$tmp/root/etc/routepolicy" ]
+	[ ! -e "$tmp/commits" ]
+	[ ! -e "$tmp/services" ]
+	restored
+	# An unreadable original value must fail the preview explicitly, never fake absence.
+	printf '192.0.2.1\nsecond-line\n' >"$tmp/db/network.lan.ipaddr"
+	bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
+	grep -Fq '不能读取已提交的逐字段基线' "$tmp/failure"
+	! grep -Fq 'network.lan.ipaddr\t0\t-' "$tmp/failure"
+	[ ! -d "$tmp/root/etc/routepolicy" ]
+	[ ! -e "$tmp/commits" ]
+	# External pending changes never blend into the previewed committed baseline.
+	printf 192.0.2.1 >"$tmp/db/network.lan.ipaddr"
+	touch "$tmp/pending"
+	bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
+	grep -Fq '存在外部 UCI pending changes' "$tmp/failure"
+	rm "$tmp/pending"
+printf '%s\n' 'preview baseline: passed (committed originals, absent fields, explicit read failure, no transaction writes)'
+}
+
 wait_async_result() {
 	polls=0
 	while [ ! -s "${WAL%/current}/job-result" ]; do
@@ -861,6 +895,7 @@ scoped_actions_tests() {
 }
 case "${1:-}" in
 	--confirmation-budget) confirmation_budget_tests; exit 0 ;;
+	--preview-baseline) preview_baseline_tests; exit 0 ;;
 	--web-lifecycle) web_lifecycle_tests; exit 0 ;;
 	--scoped-actions) scoped_actions_tests; exit 0 ;;
 	--guard-races) guard_race_tests; exit 0 ;;
@@ -977,10 +1012,7 @@ chmod 755 "$tmp/root/etc/routepolicy" "$tmp/root/etc/routepolicy/state"
 [ "$(stat -c %a "$tmp/root/etc/routepolicy")" = 755 ]
 [ "$(stat -c %a "$tmp/root/etc/routepolicy/state")" = 755 ]
 reset
-"$TX" discover >/dev/null
-"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >/dev/null
-[ ! -d "$tmp/root/etc/routepolicy" ]
-restored
+preview_baseline_tests
 touch "$tmp/bad-plan"
 bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
 rm "$tmp/bad-plan"

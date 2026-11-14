@@ -777,7 +777,9 @@ snapshot() {
 preview_json() {
 	printf '{"ok":true,"operation":"init-%s","candidate":"%s","confirmation_timeout":%s,"smartdns_coordination":["prepare","apply","verify","rollback"],"packet_evidence":"EVIDENCE_MISSING","ipv6_policy":{"forwarding":"reject-new-only","exceptions":["existing-conntrack","external-router-RA-bypass"]}' \
 		"$operation" "$(rp_json_escape "$1")" "$RP_INIT_WINDOW_SECONDS"
-	[ -z "${2:-}" ] || printf ',"token":"%s","baseline":"%s"' "$2" "$(rp_json_escape "$3")"
+	# The committed baseline is token-independent: preview returns the same originals without a token.
+	[ -z "${2:-}" ] || printf ',"token":"%s"' "$2"
+	printf ',"baseline":"%s"' "$(rp_json_escape "${3:-}")"
 	printf ',"management_address":"%s","egress_failure_policy":"%s"' "$management_target" "$egress_failure"
 	printf ',"maintenance_notice":"初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙、SmartDNS 或 RoutePolicy 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。"'
 	printf ',"link_preparation":"%s"' "$(rp_json_escape "${link_preview:-required\t0}")"
@@ -1529,7 +1531,21 @@ case "$operation" in
 		printf '%s\n' "$candidate" | plan_valid /dev/stdin || fail '候选格式非法'
 		printf '%s\n' "$link_preview" | link_plan_valid /dev/stdin || fail '新出口链路候选非法'
 		review_target "$1" "${10}" || fail '管理地址或出口故障策略不可确定'
-		preview_json "$candidate"
+		# The diff table needs the committed originals now, not only after prepare.
+		# An ephemeral private read namespace reuses the prepare snapshot boundary:
+		# committed values only, explicit absence, hard failure on unreadable state.
+		# It never publishes a transaction, WAL, pending delta or any config write.
+		preview_read_context=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-init-read.XXXXXX") || fail '不能创建预览只读命名空间'
+		trap 'rm -rf "$preview_read_context"' EXIT
+		trap 'exit 1' HUP INT TERM
+		preview_token=$(sed 's/-//g' /proc/sys/kernel/random/uuid) && valid_token "$preview_token" || fail '无法读取内核随机 token'
+		printf '%s\n' "$preview_token" >"$preview_read_context/token" || fail '不能写入预览只读身份'
+		printf '%s\n' "$candidate" >"$preview_read_context/candidate" || fail '不能暂存只读候选'
+		WAL=$preview_read_context
+		uci_layout || fail '不能读取已提交的逐字段基线'
+		snapshot "$WAL/candidate" >"$WAL/baseline" || fail '不能读取已提交的逐字段基线'
+		preview_baseline=$(cat "$WAL/baseline") || fail '不能读取已提交的逐字段基线'
+		preview_json "$candidate" '' "$preview_baseline"
 		;;
 	prepare)
 		args_valid "$@" || fail '初始化参数非法'
