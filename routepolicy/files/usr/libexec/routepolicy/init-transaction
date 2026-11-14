@@ -621,16 +621,20 @@ plan_valid() {
 	' "$1"
 }
 make_review_plan() {
-	local diagnostics reason=''
+	local diagnostics reason='' fixed_link_plan=0
 	diagnostics=$(mktemp "${TMPDIR:-/tmp}/routepolicy-init-plan.XXXXXX") || fail '无法创建预检诊断流'
+	# Without a new egress, preview can reuse plan's checks instead of parsing twice.
+	if [ "${operation:-}" = preview ] && [ "${4:-}" = - ]; then fixed_link_plan=1; fi
 	if ! candidate=$("$LIBEXEC/init-topology" plan "$@" 9>&- 2>"$diagnostics") ||
-		! link_preview=$("$LIBEXEC/init-topology" link-plan "$@" 9>&- 2>>"$diagnostics"); then
+		{ [ "$fixed_link_plan" = 0 ] && ! link_preview=$("$LIBEXEC/init-topology" link-plan "$@" 9>&- 2>>"$diagnostics"); }; then
 		reason=$(sed -n '/^routepolicy: /p' "$diagnostics" | tail -n 1 | head -c 1024)
 		reason=${reason:-拓扑或新出口链路预检失败}
 	fi
 	cat "$diagnostics" >&2
 	rm -f "$diagnostics"
 	[ -z "$reason" ] || fail "$reason"
+	# Only reached after plan success; this is exactly what the skipped helper emits.
+	[ "$fixed_link_plan" = 0 ] || link_preview="required${TAB}0"
 }
 link_value() { awk -F '\t' -v wanted="$1" '$1==wanted {print $2}' "$2"; }
 link_plan_valid() {

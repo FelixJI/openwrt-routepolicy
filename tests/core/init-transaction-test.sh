@@ -183,6 +183,7 @@ case "$1" in
 		if [ -f "$TEST_TX_DIR/verify-fail" ]; then printf '%s\n' 'fixture runtime evidence unavailable' >&2; exit 1; fi ;;
 	management-address) cat "$TEST_TX_DIR/db/network.lan.ipaddr" ;;
 	link-plan)
+		printf '%s\n' "${5:--}" >>"$TEST_TX_DIR/link-plan-calls"
 		if [ -f "$TEST_TX_DIR/window-change" ] && [ -f "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/baseline-now" ]; then
 			case "$(cat "$TEST_TX_DIR/window-change")" in
 				scalar)
@@ -807,7 +808,20 @@ preview_baseline_tests() {
 	bad "$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24
 	grep -Fq '存在外部 UCI pending changes' "$tmp/failure"
 	rm "$tmp/pending"
-printf '%s\n' 'preview baseline: passed (committed originals, absence proven from one export, explicit read failure, no transaction writes)'
+	# No-new-egress previews never invoke link-plan; the inlined fixed plan keeps
+	# the same link_preparation output as the helper's required\t0 answer.
+	[ ! -e "$tmp/link-plan-calls" ]
+	grep -Fq '"link_preparation":"required\t0"' "$tmp/preview-output"
+	# Prepare without a new egress and any preview with a new egress still run link-plan.
+	prepare
+	[ "$(cat "$tmp/link-plan-calls")" = - ]
+	rm -f "$tmp/link-plan-calls"
+	touch "$tmp/link-enabled"
+	"$TX" preview lan rp_init_default usbwan default eth9 static 198.51.100.2 24 198.51.100.1 192.0.2.2 24 >"$tmp/new-egress-preview"
+	[ "$(cat "$tmp/link-plan-calls")" = default ]
+	grep -Fq '"link_preparation":"required\t1\n' "$tmp/new-egress-preview"
+	rm -f "$tmp/link-plan-calls" "$tmp/link-enabled"
+printf '%s\n' 'preview baseline: passed (committed originals, absence proven from one export, explicit read failure, no transaction writes, no-new-egress link-plan skip)'
 }
 
 wait_async_result() {
