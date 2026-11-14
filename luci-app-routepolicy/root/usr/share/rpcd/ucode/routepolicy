@@ -59,44 +59,30 @@ const COMMANDS = {
     observe_sets: '/usr/sbin/routepolicyctl observe-sets --json',
     config_export: '/usr/sbin/routepolicyctl config-export --json',
     restore_status: '/usr/sbin/routepolicyctl restore-status --json',
+    init_discover: '/usr/sbin/routepolicyctl init-discover --json',
     init_status: '/usr/sbin/routepolicyctl init-status --json',
+    init_candidate: '/usr/sbin/routepolicyctl init-candidate --json',
     init_recover: '/usr/sbin/routepolicyctl init-recover --json',
     init_repair: '/usr/sbin/routepolicyctl init-repair --json',
     restore_recover: '/usr/sbin/routepolicyctl restore-recover --json',
     exit_preview: '/usr/sbin/routepolicyctl exit-preview --json',
     exit_prepare: '/usr/sbin/routepolicyctl exit-prepare --json',
+    exit_candidate: '/usr/sbin/routepolicyctl exit-candidate --json',
     package_preview: '/usr/sbin/routepolicyctl package-preview --json',
     disable_preview: '/usr/sbin/routepolicyctl disable-preview --json'
 };
 
 const LIFECYCLE_WRITES = {
-    config_import: { command: '/usr/sbin/routepolicyctl config-import --json', status: 'restore_status', limit: 2097152 },
-    restore_prepare: { command: '/usr/sbin/routepolicyctl restore-prepare --json', status: 'init_status', limit: 4096 },
-    init_apply: { command: '/usr/sbin/routepolicyctl init-apply-request --json', status: 'init_status', token: true, limit: 32 },
+    config_import: { command: '/usr/sbin/routepolicyctl web-config-import --json', limit: 2097152 },
+    restore_prepare: { command: '/usr/sbin/routepolicyctl web-restore-prepare --json', limit: 4096 },
+    init_preview: { command: '/usr/sbin/routepolicyctl web-init-preview --json', limit: 4096 },
+    init_prepare: { command: '/usr/sbin/routepolicyctl web-init-prepare --json', limit: 4096 },
+    init_apply: { command: '/usr/sbin/routepolicyctl web-init-apply --json', token: true, limit: 32 },
+    init_cancel: { command: '/usr/sbin/routepolicyctl web-init-cancel --json', token: true, limit: 32 },
+    init_finish: { command: '/usr/sbin/routepolicyctl web-init-finish --json', token: true, limit: 32 },
     init_confirm: { token: true, limit: 32 },
-    exit_apply: { command: '/usr/sbin/routepolicyctl exit-apply-request --json', status: 'init_status', token: true, limit: 32 }
+    exit_apply: { command: '/usr/sbin/routepolicyctl web-exit-apply --json', token: true, limit: 32 }
 };
-
-function lifecycle_write(operation, request) {
-    let spec = LIFECYCLE_WRITES[operation];
-    let req = request_args(request);
-    let content = spec.token ? req.token : req.content;
-    if (type(content) != 'string' || length(content) > spec.limit ||
-        (spec.token && !match(content, /^[0-9a-f]{32}$/)))
-        return result(false, '生命周期输入类型、长度或 token 非法');
-    if (operation == 'init_confirm')
-        return result(false, '请从目标管理地址的真实 LAN SSH 会话执行 init-confirm；HTTP 重连确认适配由后续向导提供', {
-            state: 'trusted_confirmation_required', confirmation_transport: 'trusted-ssh', http_confirmation_ready: false
-        });
-    let proc = popen(spec.command, 'w');
-    if (!proc)
-        return result(false, '无法启动生命周期事务');
-    let written = proc.write(content);
-    let exitcode = proc.close();
-    if (written != length(content) || exitcode != 0)
-        return result(false, '生命周期事务拒绝输入或尚未完成；请查看状态', { state: 'blocked', operation: operation });
-    return run(spec.status);
-}
 
 /*
  * OpenWrt 25.12 popen() is single-directional. Query input therefore never
@@ -210,6 +196,22 @@ function list_name(req) {
 
 function request_args(request) {
     return request && type(request.args) == 'object' ? request.args : {};
+}
+
+function lifecycle_write(operation, request) {
+    let spec = LIFECYCLE_WRITES[operation];
+    let req = request_args(request);
+    let content = spec.token ? req.token : req.content;
+    if (type(content) != 'string' || length(content) > spec.limit ||
+        (spec.token && !match(content, /^[0-9a-f]{32}$/)))
+        return result(false, '生命周期输入类型、长度或 token 非法');
+    if (operation == 'init_confirm')
+        return result(false, '请从目标管理 IPv4 地址打开 LuCI 向导，或通过可信 LAN SSH 会话确认', {
+            state: 'trusted_confirmation_required', confirmation_transport: 'trusted-ssh', http_confirmation_ready: false
+        });
+    let response = require('routepolicy.lifecycle').call_core(spec.command, content);
+    response.message ??= response.error || (response.ok ? '操作完成' : '生命周期操作失败');
+    return response;
 }
 
 function array_has(values, wanted) {
@@ -425,6 +427,11 @@ return {
     config_export: { args: {}, call: function(req) { return run('config_export'); } },
     restore_status: { args: {}, call: function(req) { return run('restore_status'); } },
     init_status: { args: {}, call: function(req) { return run('init_status'); } },
+    init_discover: { args: {}, call: function(req) { return run('init_discover'); } },
+    init_candidate: { args: {}, call: function(req) { return run('init_candidate'); } },
+    init_preview: { args: { content: 'String' }, call: function(req) { return lifecycle_write('init_preview', req); } },
+    init_prepare: { args: { content: 'String' }, call: function(req) { return lifecycle_write('init_prepare', req); } },
+    exit_candidate: { args: {}, call: function(req) { return run('exit_candidate'); } },
     init_recover: { args: {}, call: function(req) { return run('init_recover'); } },
     init_repair: { args: {}, call: function(req) { return run('init_repair'); } },
     restore_recover: { args: {}, call: function(req) { return run('restore_recover'); } },
@@ -435,6 +442,8 @@ return {
     config_import: { args: { content: 'String' }, call: function(req) { return lifecycle_write('config_import', req); } },
     restore_prepare: { args: { content: 'String' }, call: function(req) { return lifecycle_write('restore_prepare', req); } },
     init_apply: { args: { token: 'String' }, call: function(req) { return lifecycle_write('init_apply', req); } },
+    init_cancel: { args: { token: 'String' }, call: function(req) { return lifecycle_write('init_cancel', req); } },
+    init_finish: { args: { token: 'String' }, call: function(req) { return lifecycle_write('init_finish', req); } },
     init_confirm: { args: { token: 'String' }, call: function(req) { return lifecycle_write('init_confirm', req); } },
     exit_apply: { args: { token: 'String' }, call: function(req) { return lifecycle_write('exit_apply', req); } },
     observe_interfaces: { args: {}, call: function(req) { return run('observe_interfaces'); } },

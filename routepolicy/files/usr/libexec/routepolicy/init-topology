@@ -30,6 +30,7 @@ discover() {
 	printf '%s' "${data:-null}"
 	printf ',"netifd":'; data=$(ubus call network.interface dump 2>/dev/null) || { data='null'; runtime_ok=0; }
 	printf '%s' "${data:-null}"
+	printf ',"unclaimed_devices":'; discover_unclaimed "${data:-null}"
 	printf ',"dhcp_roles":['; first=1
 	if rp_have uci; then
 		for section in $(sections dhcp dhcp); do
@@ -58,6 +59,27 @@ discover() {
 	printf ',"warning":'; json_string 'New IPv6 forwarding connections through this router are rejected by the plan; existing conntrack sessions are not forcibly cut off. Selected interfaces become IPv4-only; IPv4 management is preserved. External RA and direct L2 IPv6 bypass require upstream/client configuration; no external path is claimed blocked.'
 	printf '},"ok":'; [ -z "$missing" ] && [ "$runtime_ok" = 1 ] && printf true || printf false
 	printf '}\n'
+}
+
+discover_unclaimed() {
+	local dump="$1" path new_device candidate first=1
+	printf '['
+	# netifd only knows devices it manages; enumerate the kernel's physical candidates.
+	for path in "$RP_ROOT/sys/class/net/"*; do
+		[ -e "$path" ] || continue
+		new_device=${path##*/}
+		if candidate=$(
+			exec 2>/dev/null
+			check_new_device && link_unclaimed "$dump" >/dev/null && new_link_state &&
+				printf '{"name":"%s","up":%s,"carrier":%s}' "$new_device" \
+					"$([ "$link_up" = 1 ] && printf true || printf false)" \
+					"$(case "$link_carrier" in 1) printf true ;; 0) printf false ;; *) printf null ;; esac)"
+		); then
+			[ "$first" = 1 ] || printf ','; first=0
+			printf '%s' "$candidate"
+		fi
+	done
+	printf ']'
 }
 
 host4() {
@@ -175,6 +197,15 @@ probe_address() {
 	rp_have arping || fail 'arping is required to check a new static/management address'
 	arping -D -c 2 -w 3 -I "$device" "$candidate" >/dev/null 2>&1 || fail "address conflict or inconclusive ARP probe: $candidate"
 }
+check_new_device() {
+	local path="$RP_ROOT/sys/class/net/$new_device" index
+	rp_is_device "$new_device" || fail 'invalid new device'
+	case "$new_device" in *[!A-Za-z0-9_-]*|lo) fail 'only ordinary independent network cards are supported' ;; esac
+	[ -d "$path/device" ] && [ ! -e "$path/master" ] && [ ! -L "$path/master" ] &&
+		[ ! -d "$path/bridge" ] && [ ! -d "$path/wireless" ] || fail 'device is not an identified standalone physical card'
+	index=$(cat "$path/ifindex") && [ -n "$index" ] && [ "$index" = "$(cat "$path/iflink")" ] ||
+		fail 'stacked devices are not supported for creation'
+}
 new_link_state() {
 	local flags
 	link_index=$(cat "$RP_ROOT/sys/class/net/$new_device/ifindex") || fail 'link identity: missing ifindex'
@@ -218,16 +249,16 @@ link_dad() {
 	printf 'dad\tclear\n'
 }
 link_unclaimed() {
-	local refs dump addresses routes
-	[ "$new_role" != - ] || fail 'link-unclaimed requires a new egress'
+	local refs dump="${1:-}" interfaces addresses routes
 	refs=$(uci -q show network) || fail 'link-unclaimed: UCI evidence unavailable'
 	if printf '%s\n' "$refs" | awk -F= -v dev="$new_device" '
 		$1~/\.(device|ifname|ports|slaves|name)$/ {
 			v=substr($0,index($0,"=")+1); gsub(/\047/,"",v); n=split(v,a,/[[:space:]]+/)
 			for(i=1;i<=n;i++) if(a[i]==dev||index(a[i],dev ".")==1||index(a[i],dev ":")==1)found=1
 		} END{exit !found}'; then fail 'link-unclaimed: device is referenced by network configuration'; fi
-	dump=$(ubus call network.interface dump) || fail 'link-unclaimed: netifd evidence unavailable'
-	field "$dump" '@.interface' >/dev/null || fail 'link-unclaimed: malformed netifd evidence'
+	[ -n "$dump" ] || dump=$(ubus call network.interface dump) || fail 'link-unclaimed: netifd evidence unavailable'
+	interfaces=$(field "$dump" '@.interface') || fail 'link-unclaimed: malformed netifd evidence'
+	case "$interfaces" in '['*) ;; *) fail 'link-unclaimed: malformed netifd evidence' ;; esac
 	refs=$(field "$dump" '@.interface[*].l3_device' || true; field "$dump" '@.interface[*].device' || true)
 	if printf '%s\n' "$refs" | awk -v dev="$new_device" '$0==dev||index($0,dev ".")==1{found=1}END{exit !found}'; then fail 'link-unclaimed: device is still claimed by netifd'; fi
 	addresses=$(ip -4 -o addr show dev "$new_device") || fail 'link-unclaimed: IPv4 evidence unavailable'
@@ -302,10 +333,7 @@ parse() {
 		default|policy)
 			[ "$new_role" = default ] && new_if=$default_if || new_if=$policy
 			[ "$new_if" = "rp_init_$new_role" ] || fail 'new logical interface must use the reserved role name'
-			rp_is_device "$new_device" || fail 'invalid new device'
-			case "$new_device" in *[!A-Za-z0-9_-]*|lo) fail 'only ordinary independent network cards are supported' ;; esac
-			[ -d "$RP_ROOT/sys/class/net/$new_device/device" ] && [ ! -e "$RP_ROOT/sys/class/net/$new_device/master" ] && [ ! -d "$RP_ROOT/sys/class/net/$new_device/bridge" ] && [ ! -d "$RP_ROOT/sys/class/net/$new_device/wireless" ] || fail 'device is not an identified standalone physical card'
-			[ "$(cat "$RP_ROOT/sys/class/net/$new_device/ifindex")" = "$(cat "$RP_ROOT/sys/class/net/$new_device/iflink")" ] || fail 'stacked devices are not supported for creation'
+			check_new_device
 			if [ "$pre_apply" = 1 ]; then
 				[ -z "$(get "network.$new_if")" ] || fail 'new logical interface already exists'
 			fi
@@ -377,8 +405,8 @@ parse() {
 			if [ "$address" != - ] && overlap "$address/$prefix" "$access_cidr"; then fail 'separated egress overlaps the access subnet'; fi
 		fi
 		if [ "$address" = - ]; then egress_cidr=-; else egress_cidr=$(rp_network_cidr "$address" "$prefix"); fi
-		if [ "$role" = default ]; then default_device=$device default_zone=$zone default_zone_section=$zone_section default_cidr=$egress_cidr default_gateway=$gateway
-		else policy_device=$device policy_zone=$zone policy_zone_section=$zone_section policy_cidr=$egress_cidr; fi
+		if [ "$role" = default ]; then default_device=$device default_zone=$zone default_zone_section=$zone_section default_cidr=$egress_cidr default_gateway=$gateway default_address=$address
+		else policy_device=$device policy_zone=$zone policy_zone_section=$zone_section policy_cidr=$egress_cidr policy_gateway=$gateway policy_address=$address; fi
 	done
 	[ "$default_device" != "$policy_device" ] || fail 'default and policy egress cannot share an L3 device'
 	[ "$default_zone" != "$policy_zone" ] || fail 'default and policy egress need distinct firewall zones'
@@ -403,8 +431,29 @@ parse() {
 	if [ "$new_role" != - ] && [ "$pre_apply" = 1 ] && [ "$operation" != link-unclaimed ]; then link_unclaimed >/dev/null; fi
 }
 
+applied_policy_table() {
+	local boot table
+	[ "$pre_apply" = 0 ] && [ "$(rp_uci_get main enabled 0)" = 1 ] &&
+		[ "$(rp_uci_get main policy_interface usbwan)" = "$policy" ] &&
+		[ "$(rp_state_get schema)" = "$RP_SCHEMA_VERSION" ] || return 1
+	boot=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id" 2>/dev/null) && [ -n "$boot" ] || return 1
+	table=$(rp_uci_get main route_table 200)
+	rp_init_routing_id_between "$table" 1 252 &&
+		[ "$(rp_state_get boot_id)" = "$boot" ] &&
+		[ "$(rp_state_get source_bootstrap)" = 0 ] &&
+		[ "$(rp_state_get route_table)" = "$table" ] &&
+		[ "$(rp_state_get policy_interface)" = "$policy" ] &&
+		[ "$(rp_state_get policy_device)" = "$policy_device" ] &&
+		[ "$(rp_state_get policy_cidr)" = "$policy_cidr" ] || return 1
+	# In-flight verification uses the transaction token. A completed takeover can
+	# have a newer applied receipt after an ordinary apply or a reboot.
+	[ -z "${ROUTEPOLICY_INIT_GENERATION:-}" ] ||
+		[ "$(rp_state_get init_generation)" = "$ROUTEPOLICY_INIT_GENERATION" ] || return 1
+	printf '%s\n' "$table"
+}
+
 address_overlap_guard() {
-	local candidates='' candidate section configured address prefix addresses dev cidr routes destination protocol scope
+	local candidates='' candidate section configured address prefix addresses dev cidr routes destination protocol scope owned_table
 	if [ "$new_role" != - ]; then
 		if [ "$new_proto" = static ]; then candidates="$new_ip/$new_prefix"
 		elif [ "$pre_apply" = 0 ]; then
@@ -434,6 +483,31 @@ address_overlap_guard() {
 $(printf '%s\n' "$addresses" | awk 'NF{d=$2;sub(/@.*/,"",d);print d "\t" $4}')
 EOF
 	routes=$(ip -4 route show table all) || fail 'address overlap: effective routes unavailable'
+	owned_table=$(applied_policy_table) || owned_table=''
+	routes=$(printf '%s\n' "$routes" | awk -v owned_table="$owned_table" -v owned_cidr="$policy_cidr" \
+	-v owned_dev="$policy_device" -v owned_src="$policy_address" '
+		# Match only the connected unicast route written by apply. Unknown,
+		# duplicate, or extra attributes still go through the overlap guard.
+		function applied_connected(   i,k,a) {
+			if (owned_table=="" || $1!=owned_cidr) return 0
+			for (i=2;i<NF;i+=2) {
+				k=$i
+				if (k in a || k!~/^(dev|table|scope|src|metric|proto)$/) return 0
+				a[k]=$(i+1)
+			}
+			return i>NF && a["dev"]==owned_dev && a["table"]==owned_table && a["scope"]=="link" &&
+				a["src"]==owned_src && a["metric"]=="10" && (!("proto" in a) || a["proto"]=="boot")
+		}
+		NF{
+			if (applied_connected()) next
+			target=$1;start=2;if(target=="local"||target=="broadcast"||target=="multicast")next
+			if(target=="blackhole"||target=="unreachable"||target=="prohibit"||target=="throw"){target=$2;start=3}
+			if(target=="default"||target=="0.0.0.0/0")next
+			dev="-";proto="-";scope="-";direct=1
+			for(i=start;i<=NF;i++){if($i=="dev")dev=$(i+1);if($i=="proto")proto=$(i+1);if($i=="scope")scope=$(i+1);if($i=="via" || ($i=="table" && $(i+1)!="main"))direct=0}
+			if(!direct)scope="-"
+			print target "\t" dev "\t" proto "\t" scope
+		}') || fail 'address overlap: cannot parse effective routes'
 	while IFS="$(printf '\t')" read -r destination dev protocol scope; do
 		[ -n "$destination" ] || continue
 		case "$destination" in */*) ;; *) destination="$destination/32" ;; esac
@@ -447,16 +521,7 @@ EOF
 		fi
 		for candidate in $candidates; do ! overlap "$candidate" "$destination" || fail "address overlap: candidate $candidate intersects an existing non-default route $destination"; done
 	done <<EOF
-$(printf '%s\n' "$routes" | awk '
-		NF{
-			target=$1;start=2;if(target=="local"||target=="broadcast"||target=="multicast")next
-			if(target=="blackhole"||target=="unreachable"||target=="prohibit"||target=="throw"){target=$2;start=3}
-			if(target=="default"||target=="0.0.0.0/0")next
-			dev="-";proto="-";scope="-";direct=1
-			for(i=start;i<=NF;i++){if($i=="dev")dev=$(i+1);if($i=="proto")proto=$(i+1);if($i=="scope")scope=$(i+1);if($i=="via" || ($i=="table" && $(i+1)!="main"))direct=0}
-			if(!direct)scope="-"
-			print target "\t" dev "\t" proto "\t" scope
-		}')
+$routes
 EOF
 }
 
@@ -975,7 +1040,11 @@ verify() {
 			if($1=="udp")udp=1
 		}
 		END{exit !(tcp&&udp)}' || fail 'TCP LISTEN and UDP DNS listeners must both bind access IPv4 or 0.0.0.0'
-	printf '{"ok":true,"operation":"verify","management_address":"%s","ipv6_policy":"reject-new-forwarding-connections; preserve-existing-conntrack-and-management","ipv6_external_bypass":"requires-upstream-client-configuration","packet_evidence":"EVIDENCE_MISSING"}\n' "$access_ip"
+	printf '{"ok":true,"operation":"verify","management_address":"%s","default_egress":"verified","interfaces":{' "$access_ip"
+	printf '"access":{"name":"%s","device":"%s","address":"%s"},' "$access" "$access_device" "$access_ip"
+	printf '"default":{"name":"%s","device":"%s","address":"%s","gateway":"%s"},' "$default_if" "$default_device" "$default_address" "$default_gateway"
+	printf '"policy":{"name":"%s","device":"%s","address":"%s","gateway":"%s"}},' "$policy" "$policy_device" "$policy_address" "$policy_gateway"
+	printf '"ipv6_policy":"reject-new-forwarding-connections; preserve-existing-conntrack-and-management","ipv6_external_bypass":"requires-upstream-client-configuration","packet_evidence":"EVIDENCE_MISSING"}\n'
 }
 
 . "$LIBEXEC/init-dns"
@@ -983,6 +1052,7 @@ operation=${1:-}; [ "$#" -gt 0 ] && shift
 case "$operation" in
 	discover) [ "$#" -eq 0 ] || fail 'discover takes no arguments'; discover ;;
 	plan)
+		rp_source_sections >/dev/null || exit 1
 		parse "$@"; conflicts; default_route_guard plan
 		nft_snapshot=$(nft -n list table inet fw4) || fail 'IPv6 control flow: running fw4 table unavailable'
 		nft_snapshot=$(normalize_zone_sets "$nft_snapshot")
@@ -994,7 +1064,7 @@ case "$operation" in
 	verify) parse "$@"; verify ;;
 	link-plan) parse "$@"; link_plan ;;
 	link-dad) parse "$@"; link_dad ;;
-	link-unclaimed) parse "$@"; link_unclaimed ;;
+	link-unclaimed) parse "$@"; [ "$new_role" != - ] || fail 'link-unclaimed requires a new egress'; link_unclaimed ;;
 	management-address)
 		parse "$@"
 		actual_ip=$(runtime "$access" '@["ipv4-address"][0].address')

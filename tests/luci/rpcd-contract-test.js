@@ -12,13 +12,14 @@ const legacyPath = path.join(root, 'luci-app-routepolicy', 'root', 'usr', 'libex
 const expectedMethods = [
 	'apply', 'diagnose', 'import_legacy', 'read_local_hosts', 'read_user_list', 'reload', 'rollback',
 	'config_export', 'config_import', 'restore_status', 'restore_prepare', 'restore_recover', 'init_status', 'init_apply', 'init_confirm', 'init_recover', 'init_repair',
-	'exit_preview', 'exit_prepare', 'exit_apply', 'package_preview', 'disable_preview',
+	'init_discover', 'init_preview', 'init_prepare', 'init_candidate', 'init_cancel', 'init_finish',
+	'exit_preview', 'exit_prepare', 'exit_candidate', 'exit_apply', 'package_preview', 'disable_preview',
 	'observe_interfaces', 'observe_query', 'observe_sets',
 	'smartdns_apply', 'smartdns_discard_candidate', 'smartdns_save', 'smartdns_status', 'smartdns_validate',
 	'status', 'update', 'validate', 'write_local_hosts', 'write_user_list'
 ];
 const fixedCommands = new Set([
-	...['config-export', 'config-import', 'restore-status', 'restore-prepare', 'restore-recover', 'init-status', 'init-recover', 'init-repair', 'exit-preview', 'exit-prepare', 'package-preview', 'disable-preview', 'init-apply-request', 'exit-apply-request'].map(name => `/usr/sbin/routepolicyctl ${name} --json`),
+	...['config-export', 'web-config-import', 'restore-status', 'web-restore-prepare', 'restore-recover', 'init-status', 'init-discover', 'init-candidate', 'web-init-preview', 'web-init-prepare', 'init-recover', 'init-repair', 'exit-preview', 'exit-prepare', 'exit-candidate', 'package-preview', 'disable-preview', 'web-init-apply', 'web-init-cancel', 'web-init-finish', 'web-exit-apply'].map(name => `/usr/sbin/routepolicyctl ${name} --json`),
 	'/usr/sbin/routepolicyctl status --json',
 	'/usr/sbin/routepolicyctl validate --json',
 	'/etc/init.d/routepolicy restart',
@@ -126,7 +127,7 @@ function popen(command, mode) {
 }
 
 const signature = new Function(
-	'popen', 'type', 'length', 'split', 'trim', 'substr', 'match', 'lc', 'json', 'push', 'join', 'index',
+	'popen', 'type', 'length', 'split', 'trim', 'substr', 'match', 'lc', 'json', 'push', 'join', 'index', 'require',
 	source
 )(
 	popen,
@@ -140,7 +141,18 @@ const signature = new Function(
 	JSON.parse,
 	(array, value) => array.push(value),
 	(separator, array) => array.join(separator),
-	(value, needle) => value.indexOf(needle)
+	(value, needle) => value.indexOf(needle),
+	moduleName => {
+		assert.strictEqual(moduleName, 'routepolicy.lifecycle');
+		return {
+			call_core(command, content) {
+				const proc = popen(command, 'w');
+				const written = proc.write(content);
+				const rc = proc.close();
+				return { ok: written === content.length && rc === 0 };
+			}
+		};
+	}
 );
 
 assert.ok(signature && typeof signature === 'object', 'ucode plugin must return a signature dictionary');
@@ -156,7 +168,7 @@ for (const name of expectedMethods) {
 for (const name of [
 	'status', 'validate', 'update', 'rollback', 'smartdns_status', 'smartdns_validate',
 	'smartdns_apply', 'smartdns_discard_candidate', 'read_local_hosts', 'import_legacy',
-	'observe_interfaces', 'observe_sets'
+	'observe_interfaces', 'observe_sets', 'init_discover', 'init_candidate', 'exit_candidate'
 ]) {
 	assert.strictEqual(routepolicy[name].call({ args: {} }).ok, true, name + ' must execute through fixed string popen');
 }
@@ -301,7 +313,7 @@ assert.strictEqual(
 	'RPC lifecycle response must preserve the concrete init-script result'
 );
 assert.strictEqual(routepolicy.reload.call({ args: {} }).ok, true, 'reload must use the same fixed lifecycle command');
-for (const name of ['init_apply', 'exit_apply']) {
+for (const name of ['init_apply', 'init_cancel', 'init_finish', 'exit_apply']) {
 	const before = calls.length;
 	assert.strictEqual(routepolicy[name].call({ args: { token: 'a; reboot' } }).ok, false);
 	assert.strictEqual(calls.length, before, 'invalid lifecycle token must not start a process');
@@ -315,7 +327,7 @@ assert.strictEqual(httpConfirm.http_confirmation_ready, false);
 assert.strictEqual(calls.length, beforeHttpConfirm, 'untrusted HTTP fields cannot construct an SSH confirmation');
 const dangerousBody = 'routepolicy-config\t1\nsensitive\t1\nsource\tfeed.name\t$(reboot)\n';
 assert.strictEqual(routepolicy.config_import.call({ args: { content: dangerousBody } }).ok, true);
-assert.ok(calls.some(call => call.command === '/usr/sbin/routepolicyctl config-import --json' && call.content === dangerousBody),
+assert.ok(calls.some(call => call.command === '/usr/sbin/routepolicyctl web-config-import --json' && call.content === dangerousBody),
 	'dynamic declaration content must travel only through stdin');
 assert.strictEqual(routepolicy.config_import.call({ args: { content: 'partial-write' } }).ok, false);
 assert.strictEqual(routepolicy.config_import.call({ args: { content: 'x'.repeat(2097153) } }).ok, false);

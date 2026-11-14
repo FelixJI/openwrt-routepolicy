@@ -3,6 +3,7 @@
 'require form';
 'require uci';
 'require ui';
+'require routepolicy/api as api';
 
 function validURL(section_id, value) {
 	if (!value || value.length > 2048)
@@ -20,15 +21,19 @@ return view.extend({
 	load: function() { return uci.load('routepolicy'); },
 
 	render: function() {
-		let m = new form.Map('routepolicy', _('清单来源'), _('“保存”只加入 LuCI 变更队列；“保存并应用”会提交来源定义。下载与替换清单仍需在运行状态页执行“更新全部来源”。'));
+		let m = new form.Map('routepolicy', _('清单来源'), _('保存会为以前创建的匿名来源补齐持久名称，并加入 LuCI 变更队列。“保存并应用”会提交来源定义。下载与替换清单仍需在运行状态页执行“更新全部来源”。'));
 		let s = m.section(form.GridSection, 'source', _('远程来源'));
 		s.anonymous = true;
+		s.handleAdd = function(ev) {
+			return form.GridSection.prototype.handleAdd.call(this, ev, api.newSourceName(uci));
+		};
 		s.addremove = true;
 		s.sortable = true;
 		s.nodescriptions = true;
 
 		let o = s.option(form.Flag, 'enabled', _('启用'));
-		o.default = '1';
+		o.default = '0';
+		o.rmempty = false;
 		o = s.option(form.Value, 'name', _('名称'));
 		o.rmempty = false;
 		o.datatype = 'maxlength(80)';
@@ -57,11 +62,40 @@ return view.extend({
 		this.map = m;
 		return m.render();
 	},
-	handleSave: function(ev) { return this.map.save(); },
+	handleSave: function(ev) {
+		if (this.savingSources)
+			return this.savingSources;
+		const map = this.map;
+		map.root.inert = true;
+		this.savingSources = map.save().then(async function() {
+			try {
+				if (await api.nameAnonymousSources(uci))
+					await map.render();
+			}
+			catch (error) {
+				// Save already staged the edits. Clear a failed read so the next Save can load again.
+				await uci.load('routepolicy').then(
+					() => map.render(),
+					() => uci.unload('routepolicy')
+				).catch(function() {});
+				ui.addNotification(null, E('p', {}, _('来源名称转换失败：') + api.safeText(error && error.message)), 'error');
+				throw error;
+			}
+		}).finally(() => {
+			map.root.inert = false;
+			this.savingSources = null;
+		});
+		return this.savingSources;
+	},
 	handleSaveApply: function(ev, mode) {
+		if (this.savingSources)
+			return;
 		return this.handleSave(ev).then(function() {
 			return ui.changes.apply(mode == '0');
 		});
 	},
-	handleReset: function(ev) { return this.map.reset(); }
+	handleReset: function(ev) {
+		if (!this.savingSources)
+			return this.map.reset();
+	}
 });

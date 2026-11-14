@@ -7,6 +7,94 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 export ROUTEPOLICY_ROOT="$tmp/root" ROUTEPOLICY_LIBEXEC="${TEST_LIFECYCLE_LIBEXEC:-$ROOT/routepolicy/files/usr/libexec/routepolicy}" ROUTEPOLICY_OUTPUT=json
 mkdir -p "$tmp/bin" "$tmp/root/etc/config" "$tmp/root/etc/routepolicy/user.d" "$tmp/root/proc/sys/kernel/random"
 printf '00000000-0000-4000-8000-000000000001\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+if [ "${1:-}" = --native-sources ]; then
+	: "${TEST_UCI_SDK_ROOT:?set TEST_UCI_SDK_ROOT to the OpenWrt 25.12 rootfs}"
+	export TEST_UCI_SDK_ROOT
+	LIBEXEC=$ROUTEPOLICY_LIBEXEC
+	# shellcheck source=../../routepolicy/files/usr/libexec/routepolicy/common
+	. "$LIBEXEC/common"
+	mkdir "$tmp/delta"
+	export TEST_SOURCE_DELTA="$tmp/delta" TEST_SOURCE_DOWNLOADS="$tmp/downloads"
+	cat >"$tmp/bin/uci" <<'SH'
+#!/bin/sh
+sdk=$TEST_UCI_SDK_ROOT
+exec "$sdk/lib/ld-musl-x86_64.so.1" --library-path "$sdk/lib:$sdk/usr/lib" "$sdk/sbin/uci" \
+	-c "$ROUTEPOLICY_ROOT/etc/config" -t "$TEST_SOURCE_DELTA" "$@"
+SH
+	cat >"$tmp/bin/curl" <<'SH'
+#!/bin/sh
+while [ "$#" -gt 1 ]; do
+	case "$1" in --output) output=$2; shift ;; esac
+	shift
+done
+printf '%s\n' "$1" >>"$TEST_SOURCE_DOWNLOADS"
+printf '%s\n' freshly-fetched.example >"$output"
+SH
+	chmod +x "$tmp/bin/uci" "$tmp/bin/curl"
+	export PATH="$tmp/bin:$ROOT/tests/core/stubs:$PATH"
+	cp "$ROOT/routepolicy/files/etc/config/routepolicy" "$RP_UCI_CONFIG"
+	cat >>"$RP_UCI_CONFIG" <<'UCI'
+config source 'named_disabled'
+	option enabled '0'
+	option name 'Keep named source'
+config source
+	option enabled '1'
+	option name 'Enabled anonymous source'
+	option url 'https://feed.invalid/one'
+	option format 'plain-domain'
+	option target 'domain-policy'
+	option update_via_policy_interface '0'
+	option future 'unknown scalar retained'
+	list extras 'first'
+	list extras 'second'
+config source
+	option enabled '0'
+	option name 'Disabled anonymous source'
+UCI
+	: >"$tmp/root/etc/config/smartdns"
+	active=$(uci -q -X show routepolicy | sed -n "s/^routepolicy\.\([a-z0-9]*\)\.enabled='1'$/\1/p")
+	[ -n "$active" ] && [ "$(uci -q get "routepolicy.$active.url")" = 'https://feed.invalid/one' ]
+	mkdir -p "$RP_MANAGED_CURRENT"
+	printf '%s\n' stale.example >"$RP_MANAGED_CURRENT/$active.domain-policy.list"
+	reject_anonymous() {
+		if "$@" >"$tmp/rejected.out" 2>"$tmp/rejected.err"; then
+			printf 'anonymous source unexpectedly accepted by %s\n' "$*" >&2; exit 1
+		fi
+		grep -Fq '请在清单来源页面保存并应用' "$tmp/rejected.out" "$tmp/rejected.err"
+	}
+	cp "$RP_UCI_CONFIG" "$tmp/before"
+	reject_anonymous rp_sources_ready
+	reject_anonymous sh "$LIBEXEC/validate"
+	reject_anonymous sh "$LIBEXEC/init-topology" plan lan wan usbwan
+	reject_anonymous sh "$LIBEXEC/lifecycle" config-export
+	reject_anonymous sh "$LIBEXEC/update"
+	reject_anonymous sh "$LIBEXEC/diagnose"
+	[ ! -e "$TEST_SOURCE_DOWNLOADS" ]; cmp "$tmp/before" "$RP_UCI_CONFIG"
+	uci rename "routepolicy.$active=source_one"
+	uci commit routepolicy
+	# A disabled anonymous source must also be preserved by an explicit save before export.
+	reject_anonymous sh "$LIBEXEC/lifecycle" config-export
+	uci rename 'routepolicy.@source[2]=source_two'
+	uci commit routepolicy
+	[ "$(uci get routepolicy.source_one.future)" = 'unknown scalar retained' ]
+	[ "$(uci get routepolicy.source_one.extras)" = 'first second' ]
+	[ "$(rp_source_sections)" = "$(printf '%s\n' named_disabled source_one source_two)" ]
+	if rp_sources_ready; then printf '%s\n' 'new named source adopted an old anonymous-ID snapshot' >&2; exit 1; fi
+	sh "$LIBEXEC/update" >"$tmp/update"
+	grep -Fxq 'https://feed.invalid/one' "$TEST_SOURCE_DOWNLOADS"
+	[ "$(wc -l <"$TEST_SOURCE_DOWNLOADS")" -eq 1 ]
+	grep -Fxq freshly-fetched.example "$RP_MANAGED_CURRENT/source_one.domain-policy.list"
+	[ ! -e "$RP_MANAGED_CURRENT/$active.domain-policy.list" ]
+	rp_sources_ready
+	ROUTEPOLICY_OUTPUT=text sh "$LIBEXEC/lifecycle" config-export >"$tmp/native-export"
+	sh "$LIBEXEC/lifecycle" config-import <"$tmp/native-export" >"$tmp/native-import"
+	staged="$RP_RUN_DIR/restore/config"
+	[ "$(uci -c "$staged" get routepolicy.source_one.url)" = 'https://feed.invalid/one' ]
+	[ "$(uci -c "$staged" get routepolicy.source_two.enabled)" = 0 ]
+	[ "$(uci -c "$staged" get routepolicy.named_disabled.name)" = 'Keep named source' ]
+	printf '%s\n' 'native source lifecycle: anonymous refused, named update and portable round-trip passed'
+	exit 0
+fi
 cat >"$tmp/bin/uci" <<'PY'
 #!/usr/bin/env python3
 import json, os, pathlib, sys

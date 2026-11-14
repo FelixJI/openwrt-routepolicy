@@ -5,6 +5,12 @@
     "action": { "type": "firstchild" },
     "depends": { "acl": [ "luci-app-routepolicy" ] }
   },
+  "admin/services/routepolicy/wizard": {
+    "title": "初始化与恢复向导",
+    "order": 5,
+    "action": { "type": "view", "path": "routepolicy/wizard" },
+    "depends": { "acl": [ "luci-app-routepolicy" ] }
+  },
   "admin/services/routepolicy/status": {
     "title": "运行状态",
     "order": 10,

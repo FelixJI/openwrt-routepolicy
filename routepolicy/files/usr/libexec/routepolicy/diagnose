@@ -100,15 +100,17 @@ if [ "$(rp_uci_get main route_local_traffic 0)" = 0 ]; then
 	else add_check local-routing fail '本机分流已关闭，但 OUTPUT adapter 缺少立即返回规则'; fi
 elif nft list chain inet routepolicy output 2>/dev/null | grep -q 'jump classify'; then add_check local-routing pass '路由器本机 IPv4 流量进入共享分类链';
 else add_check local-routing fail '本机分流已开启，但 OUTPUT adapter 未进入共享分类链'; fi
-sources=0
-for source in $(rp_source_sections); do
-	[ "$(rp_uci_get "$source" enabled 0)" = 1 ] || continue
-	url=$(rp_uci_get "$source" url '')
-	# Never emit query parameters or credentials in diagnostics.
-	redacted=$(redact_url "$url"); : "$redacted"
-	sources=$((sources + 1))
-done
-[ "$sources" -gt 0 ] && add_check update-sources pass "$sources 个启用来源通过静态校验（URL 已脱敏）" || add_check update-sources warn '没有启用的更新来源'
+if source_sections=$(rp_source_sections 2>&1); then
+	sources=0
+	for source in $source_sections; do
+		[ "$(rp_uci_get "$source" enabled 0)" = 1 ] || continue
+		url=$(rp_uci_get "$source" url '')
+		# Never emit query parameters or credentials in diagnostics.
+		redacted=$(redact_url "$url"); : "$redacted"
+		sources=$((sources + 1))
+	done
+	[ "$sources" -gt 0 ] && add_check update-sources pass "$sources 个启用来源通过静态校验（URL 已脱敏）" || add_check update-sources warn '没有启用的更新来源'
+else add_check update-sources fail "$source_sections"; fi
 
 if [ "${ROUTEPOLICY_OUTPUT:-text}" = json ]; then
 	[ "$failed" -eq 0 ] && ok=true || ok=false

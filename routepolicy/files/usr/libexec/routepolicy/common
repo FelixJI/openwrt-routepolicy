@@ -268,9 +268,16 @@ rp_json_escape() {
 		awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'
 }
 
+# shellcheck disable=SC3043
 rp_source_sections() {
-	uci -q show routepolicy 2>/dev/null |
-		sed -n 's/^routepolicy\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=source$/\1/p'
+	local listing
+	listing=$(uci -q show routepolicy 2>/dev/null) || { rp_err '无法读取 RoutePolicy 清单来源配置'; return 1; }
+	# Anonymous cfg identifiers can change owners when UCI sections are reordered.
+	if printf '%s\n' "$listing" | LC_ALL=C grep -Eq '^routepolicy\.@source\[[0-9]+\]=source$'; then
+		rp_err '存在匿名清单来源；请在清单来源页面保存并应用以转换为具名来源，再重试'
+		return 1
+	fi
+	printf '%s\n' "$listing" | sed -n 's/^routepolicy\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=source$/\1/p'
 }
 
 rp_interface_json() {
@@ -446,9 +453,10 @@ rp_validate_main() {
 
 # shellcheck disable=SC3043
 rp_sources_ready() {
-	local ready_source ready_target ready_format ready_file ready_minimum
+	local ready_source ready_target ready_format ready_file ready_minimum ready_sections
 	[ ! -L "$RP_ETC/managed.d" ] && [ ! -L "$RP_MANAGED_CURRENT" ] || { rp_err '静态快照目录不能是符号链接；备份不会隐式跟随链接'; return 1; }
-	for ready_source in $(rp_source_sections); do
+	ready_sections=$(rp_source_sections) || return 1
+	for ready_source in $ready_sections; do
 		[ "$(rp_uci_get "$ready_source" enabled 0)" = 1 ] || continue
 		rp_is_name "$ready_source" 32 || return 1
 		ready_target=$(rp_uci_get "$ready_source" target '')
@@ -559,9 +567,12 @@ rp_managed_restore() {
 	if [ -n "$swap_name" ] && [ -e "$swap" ]; then rm -rf "$swap" || true; fi
 }
 
+# shellcheck disable=SC3043
 rp_validate_sources() {
+	local source_sections
+	source_sections=$(rp_source_sections) || return 1
 	source_errors=0
-	for section in $(rp_source_sections); do
+	for section in $source_sections; do
 		rp_is_name "$section" 32 || { rp_err "非法 source 节名: $section"; source_errors=$((source_errors + 1)); continue; }
 		enabled=$(rp_uci_get "$section" enabled 0)
 		rp_is_bool "$enabled" || { rp_err "$section.enabled 必须为 0 或 1"; source_errors=$((source_errors + 1)); }
@@ -899,15 +910,25 @@ rp_writer_enter() {
 			[ ! -L "$RP_STATE_DIR/init-transaction/declarations/phase" ] && [ ! -L "$RP_STATE_DIR/init-transaction/declarations/init-token" ] || return 1
 		rp_declaration_phase=$(cat "$RP_STATE_DIR/init-transaction/declarations/phase" 2>/dev/null) || rp_declaration_phase=preparing
 	else rp_declaration_phase=absent; fi
+	# An interrupted restore can publish prepared before binding its token.
+	# Only the token-scoped cancellation handler may enter for zero-write expiry.
+	rp_cancel_admitted=0
+	case "$rp_declaration_phase" in
+		preparing|prepared|installing|installed|recovering)
+			if [ "$rp_writer_role" = init ] && [ "${operation:-}" = cancel-prepared ]; then rp_cancel_admitted=1; fi ;;
+	esac
 	case "$rp_declaration_phase" in
 		absent|committed|rolled_back) ;;
 		installed)
 			if [ "${operation:-}" = restore-prepare ] || [ "${operation:-}" = restore-recover ]; then :
+			elif [ "$rp_cancel_admitted" = 1 ]; then :
 			elif [ "${ROUTEPOLICY_DECLARATION_OWNER:-0}" = 1 ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned; then :
 			elif [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && [ -f "$RP_STATE_DIR/init-transaction/declarations/init-token" ] &&
+				[ "$(wc -c <"$RP_STATE_DIR/init-transaction/declarations/init-token")" = 33 ] &&
 				[ "$(cat "$RP_STATE_DIR/init-transaction/declarations/init-token")" = "$(cat "$RP_STATE_DIR/init-transaction/current/token" 2>/dev/null)" ]; then :
 			else rp_err '导入声明等待网络确认或 restore-recover；禁止其他 writer'; return 1; fi ;;
-		*) [ "${operation:-}" = restore-recover ] || { rp_err '声明安装中断；先执行 restore-recover'; return 1; } ;;
+		*) [ "${operation:-}" = restore-recover ] || [ "$rp_cancel_admitted" = 1 ] ||
+			{ rp_err '声明安装中断；先执行 restore-recover'; return 1; } ;;
 	esac
 	if [ "$rp_writer_role" != init ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" != init ]; then
 		if [ -e "$RP_STATE_DIR/init-transaction/active" ] || [ -L "$RP_STATE_DIR/init-transaction/active" ]; then rp_init_active_record >/dev/null || return 1; fi

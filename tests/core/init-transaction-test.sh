@@ -90,6 +90,11 @@ case "$op" in
 			done
 		done | awk '!seen[$0]++' ;;
 	show)
+		if [ "$key" = routepolicy ]; then
+			printf '%s\n' 'routepolicy.main=main'
+			[ ! -f "$TEST_TX_DIR/anonymous-source" ] || printf '%s\n' 'routepolicy.@source[0]=source'
+			exit 0
+		fi
 		[ -f "$db/$key" ] || exit 1
 		printf "%s='%s'\n" "$key" "$(cat "$db/$key")"
 		case "$key" in *.*.*) ;; *)
@@ -135,8 +140,19 @@ cat >"$tmp/lib/init-topology" <<'EOF'
 #!/bin/sh
 set -eu
 case "$1" in
+	verify|management-address)
+		if [ -f "$TEST_TX_DIR/topology-generations" ]; then
+			phase=$(cat "$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current/phase")
+			printf '%s:%s:%s\n' "$1" "$phase" "${ROUTEPOLICY_INIT_GENERATION:-}" >>"$TEST_TX_DIR/topology-generations"
+		fi ;;
+esac
+case "$1" in
 	discover) printf '{"ok":true,"schema":1}\n' ;;
 	plan)
+		if [ -f "$TEST_TX_DIR/async-hold" ]; then
+			printf 'start\n' >>"$TEST_TX_DIR/async-plans"
+			while [ -f "$TEST_TX_DIR/async-hold" ]; do sleep 0.05; done
+		fi
 		[ ! -f "$TEST_TX_DIR/bad-plan" ] || { printf 'set\tfirewall.defaults.forward\tunsafe\n'; exit 0; }
 		printf 'set\troutepolicy.main.lan_interface\t%s\n' "$2"
 		printf 'set\troutepolicy.main.default_interface\t%s\n' "$3"
@@ -230,6 +246,10 @@ if [ "$1:$2:${3:-}" = call:network.interface:dump ]; then
 fi
 case "$2" in network.interface.*)
 	policy=${2#network.interface.}
+	if [ "$policy" = lan ]; then
+		printf '{"l3_device":"br-lan","ipv4-address":[{"address":"%s","mask":24}]}\n' "$(cat "$TEST_TX_DIR/runtime-management")"
+		exit 0
+	fi
 	device="$policy-dev"; [ "$policy" != rp_init_policy ] || device=eth9
 	printf '{"l3_device":"%s","route":[{"target":"0.0.0.0","nexthop":"198.51.100.1"}]}\n' "$device"
 	exit 0 ;;
@@ -240,7 +260,8 @@ printf '%s\n' '{"routepolicy-initguard":{"instances":{"guard":{"running":true}}}
 EOF
 cat >"$tmp/bin/jsonfilter" <<'EOF'
 #!/bin/sh
-data=$(cat); expression=$2; result=
+if [ "$1" = -i ]; then data=$(cat "$2"); shift 2; else data=$(cat); fi
+expression=$2; result=
 case "$expression" in
 	*routepolicy-initguard*) result=true ;;
 	@.interface) result=$(printf '%s\n' "$data" | sed -n 's/^{"interface":\(\[.*\]\)}$/\1/p') ;;
@@ -250,6 +271,7 @@ case "$expression" in
 	*ipv4-address*address) result=$(printf '%s\n' "$data" | sed -n 's/.*"address":"\([^"]*\)".*/\1/p') ;;
 	*ipv4-address*mask) result=$(printf '%s\n' "$data" | sed -n 's/.*"address":"[^"]*","mask":\([0-9]*\).*/\1/p') ;;
 	@.route*) result=$(printf '%s\n' "$data" | sed -n 's/.*"nexthop":"\([^"]*\)".*/\1/p') ;;
+	@.error) result=$(printf '%s\n' "$data" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p') ;;
 	@.errors*) case "$data" in *NO_DEVICE*) result='{"code":"NO_DEVICE"}' ;; esac ;;
 esac
 [ -n "$result" ] || exit 1
@@ -370,7 +392,9 @@ printf '%s %s\n' "$name" "$1" >>"$TEST_TX_DIR/services"
 [ ! -f "$TEST_TX_DIR/service-fail" ] || [ "$name" != firewall ] || exit 1
 [ ! -f "$TEST_TX_DIR/service-fail-odhcpd" ] || [ "$name" != odhcpd ] || exit 1
 case "$name" in
-	network) cat "$TEST_TX_DIR/db/network.lan.ipaddr" >"$TEST_TX_DIR/runtime-management" ;;
+	network)
+		[ ! -f "$TEST_TX_DIR/anonymous-on-reload" ] || : >"$TEST_TX_DIR/anonymous-source"
+		cat "$TEST_TX_DIR/db/network.lan.ipaddr" >"$TEST_TX_DIR/runtime-management" ;;
 	dnsmasq) cat "$TEST_TX_DIR/db/dhcp.lan.ignore" >"$TEST_TX_DIR/runtime-ignore" ;;
 esac
 [ "$name" != dnsmasq ] || [ ! -f "$TEST_TX_DIR/dhcp-short-window" ] || printf '1179.00 0.00\n' >"$ROUTEPOLICY_ROOT/proc/uptime"
@@ -388,6 +412,8 @@ reset() {
 	rm -f "$tmp/"pending-* "$tmp/window-change" "$tmp/extra-dhcp" "$tmp/extra-zone" "$tmp/wal-fault"
 	rm -f "$tmp/"auto-*
 	rm -f "$tmp/verify-clock" "$tmp/pending-clock"
+	rm -f "$tmp/async-hold" "$tmp/async-plans" "$tmp/topology-generations"
+	rm -f "$tmp/anonymous-source" "$tmp/anonymous-on-reload"
 	rm -f "$tmp/"dhcp-* "$tmp/"policy-* "$tmp/runtime-policy"
 	mkdir -p "$tmp/root/etc/config"
 	for config_package in network dhcp firewall routepolicy smartdns; do printf '# isolated fixture\n' >"$tmp/root/etc/config/$config_package"; done
@@ -725,8 +751,118 @@ confirmation_budget_tests() {
 	[ "$(cat "$WAL/failed-stage")" = confirmation-window ]
 printf '%s\n' 'confirmation budget: passed (180s, 20s reserve, unchanged pending retry, phase persistence, one confirmation admission)'
 }
+
+wait_async_result() {
+	polls=0
+	while [ ! -s "${WAL%/current}/job-result" ]; do
+		polls=$((polls + 1))
+		[ "$polls" -lt 300 ] || { "$TX" status; return 1; }
+		sleep 0.05
+	done
+}
+web_lifecycle_tests() {
+	reset; prepare
+	: >"$tmp/topology-generations"
+	"$TX" candidate >"$tmp/exact-candidate"
+	grep -Fq "\"token\":\"$token\"" "$tmp/exact-candidate"
+	grep -Fq '"management_address":"192.0.2.2"' "$tmp/exact-candidate"
+	grep -Fq 'network.lan.ipaddr\tscalar\t192.0.2.1' "$tmp/exact-candidate"
+	touch "$tmp/async-hold"
+	timeout 8 "$TX" start-apply "$token" >"$tmp/accepted"
+	grep -Fq '"state":"running"' "$tmp/accepted"
+	"$TX" start-apply "$token" | grep -Fq '"state":"running"'
+	bad "$TX" start-apply aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	bad "$TX" prepare lan wan usbwan - - - - - - 192.0.2.2 24
+	polls=0
+	while [ ! -s "$tmp/async-plans" ]; do
+		polls=$((polls + 1)); [ "$polls" -lt 150 ]; sleep 0.05
+	done
+	rm "$tmp/async-hold"
+	wait_async_result; phase_is pending
+	[ "$(wc -l <"$tmp/async-plans")" = 1 ]
+	"$TX" status | grep -Fq '"http_confirmation_ready":true,"remaining_seconds":180'
+	printf '1095.01 0.00\n' >"$tmp/root/proc/uptime"
+	"$TX" start-apply "$token" | grep -Fq '"remaining_seconds":85'
+	[ "$(cat "$WAL/deadline")" = 1700000180 ]
+	bad "$TX" confirm-http "$token" 192.0.2.1; phase_is pending
+	bad "$TX" confirm-http aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 192.0.2.2; phase_is pending
+	"$TX" confirm-http "$token" 192.0.2.2 >/dev/null; phase_is confirmed
+	bad "$TX" confirm-http "$token" 192.0.2.1; phase_is confirmed
+	grep -Fxq "verify:applying:$token" "$tmp/topology-generations"
+	grep -Fxq "verify:pending:$token" "$tmp/topology-generations"
+	grep -Fxq "management-address:pending:$token" "$tmp/topology-generations"
+	grep -Fxq 'management-address:confirmed:' "$tmp/topology-generations"
+
+	reset; prepare
+	printf 192.0.2.99 >"$tmp/db/network.lan.ipaddr"
+	"$TX" start-apply "$token" >/dev/null
+	wait_async_result; phase_is prepared
+	"$TX" status | grep -Fq '"state":"failed","error":"配置基线已变化'
+	printf 192.0.2.1 >"$tmp/db/network.lan.ipaddr"
+	"$TX" start-apply "$token" | grep -Fq '"state":"failed"'
+	[ ! -e "$tmp/commits" ]
+	"$TX" recover >/dev/null; phase_is expired
+
+	reset; prepare; : >"$tmp/anonymous-source"
+	"$TX" start-apply "$token" >/dev/null
+	wait_async_result; phase_is prepared
+	"$TX" status | grep -Fq '请在清单来源页面保存并应用'
+	[ ! -e "$tmp/commits" ]
+
+	reset; prepare; : >"$tmp/anonymous-on-reload"
+	bad "$TX" apply "$token"; phase_is rolled_back; restored
+	grep -Fxq source-configuration "$WAL/failed-stage"
+	grep -Fq '请在清单来源页面保存并应用' "$tmp/failure"
+	printf '%s\n' 'web lifecycle: exact baseline, detached lock, duplicate rejection, monotonic timer, HTTP address binding, persisted stale candidate passed'
+}
+scoped_actions_tests() {
+	reset; prepare
+	old_token=$token
+	bad "$TX" cancel-prepared aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	bad "$TX" finish-confirmed "$token"
+	mkdir "$WAL/fields/1"; touch "$WAL/fields/1/attempted"
+	bad "$TX" cancel-prepared "$token"; phase_is prepared
+	rm -r "$WAL/fields/1"
+	ln -s "$tmp" "$WAL/fields/foreign"
+	bad "$TX" cancel-prepared "$token"; phase_is prepared
+	rm "$WAL/fields/foreign"
+	"$TX" cancel-prepared "$token" | grep -Fq '"prepared_expired_reason":"cancelled-unapplied"'
+	"$TX" cancel-prepared "$token" | grep -Fq '"phase":"expired"'
+	bad "$TX" apply "$token"
+	[ ! -e "$tmp/commits" ]
+
+	prepare
+	bad "$TX" cancel-prepared "$old_token"; phase_is prepared
+	"$TX" apply "$token" >/dev/null; phase_is pending
+	deadline=$(cat "$WAL/deadline")
+	bad "$TX" cancel-prepared "$token"
+	bad "$TX" finish-confirmed "$token"; phase_is pending
+	[ "$(cat "$WAL/deadline")" = "$deadline" ]
+	[ "$(cat "$tmp/runtime-management")" = 192.0.2.2 ]
+	"$TX" confirm-http "$token" 192.0.2.2 >/dev/null; phase_is confirmed
+	printf 'fixture finish failure\n' >"$WAL/confirm-error"
+	bad "$TX" finish-confirmed "$old_token"
+	[ -f "$WAL/confirm-error" ]; phase_is confirmed
+	cp "$tmp/root/proc/sys/kernel/random/boot_id" "$tmp/boot.before"
+	printf 'next-boot\n' >"$tmp/root/proc/sys/kernel/random/boot_id"
+	bad "$TX" finish-confirmed "$token"
+	[ -f "$WAL/confirm-error" ]
+	cp "$tmp/boot.before" "$tmp/root/proc/sys/kernel/random/boot_id"
+	"$TX" finish-confirmed "$token" >/dev/null
+	"$TX" finish-confirmed "$token" >/dev/null
+	[ ! -e "$WAL/confirm-error" ]; phase_is confirmed
+
+	old_token=$token; prepare
+	bad "$TX" finish-confirmed "$old_token"; phase_is prepared
+	"$TX" apply "$token" >/dev/null; phase_is pending
+	bad "$TX" finish-confirmed "$old_token"; phase_is pending
+	"$TX" confirm-http "$token" 192.0.2.2 >/dev/null; phase_is confirmed
+	printf '%s\n' 'scoped lifecycle actions: zero-write cancellation, stale token/phase, cross-boot rejection, same-token finish and subsequent apply passed'
+}
 case "${1:-}" in
 	--confirmation-budget) confirmation_budget_tests; exit 0 ;;
+	--web-lifecycle) web_lifecycle_tests; exit 0 ;;
+	--scoped-actions) scoped_actions_tests; exit 0 ;;
 	--guard-races) guard_race_tests; exit 0 ;;
 	--confirm-boot) confirm_boot_tests; exit 0 ;;
 	--clock-backward) backward_clock_test; exit 0 ;;
@@ -1088,6 +1224,8 @@ guard_race_tests
 confirm_boot_tests
 monotonic_clock_tests
 confirmation_budget_tests
+web_lifecycle_tests
+scoped_actions_tests
 policy_runtime_tests
 dhcp_readiness_tests
 

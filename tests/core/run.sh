@@ -16,6 +16,9 @@ sh "$HERE/init-verification-test.sh"
 "$HERE/init-transaction-test.sh"
 "$HERE/init-dns-test.sh"
 sh "$HERE/init-dns-test.sh" --exit-archive
+sh "$HERE/init-dns-test.sh" --web-exit
+sh "$HERE/init-dns-test.sh" --restore-cancel
+sh "$HERE/init-dns-test.sh" --restore-confirmed
 sh "$HERE/init-dns-test.sh" --exit-managed
 sh "$HERE/init-dns-test.sh" --exit-disabled
 sh "$HERE/firmware-backup-test.sh"
