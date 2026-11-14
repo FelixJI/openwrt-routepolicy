@@ -1301,7 +1301,7 @@ dhcp_readiness_tests
 
 # Admin-DOWN static egress: review stays read-only; DAD precedes every UCI commit.
 reset; touch "$tmp/link-enabled"
-"$TX" preview lan wan usbwan - - - - - - 192.0.2.2 24 >"$tmp/link-preview"
+"$TX" preview lan wan rp_init_policy policy eth9 static 198.51.100.2 24 198.51.100.1 192.0.2.2 24 >"$tmp/link-preview"
 grep -Fq pending-link-up "$tmp/link-preview"
 [ "$(cat "$tmp/root/sys/class/net/eth9/flags")" = 0x0 ]
 prepare
