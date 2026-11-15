@@ -381,6 +381,196 @@ exit_check() (
 	fi
 	[ "$missing" = 0 ]
 )
+archive_retire_tree() {
+	local record=$1 token=$2 listing
+	[ -d "$record" ] && [ ! -L "$record" ] || return 1
+	# Validate every remaining path, also after an interrupted deletion. Only
+	# uci_layout's exact package aliases may be links; rm must never follow one.
+	listing=$(find "$record" -mindepth 1 -exec sh -c '
+		base=$1; token=$2; root=$3; shift 3
+		for path do
+			rel=${path#"$base"/}; kind=f
+			case "$rel" in
+				fields|origin|origin/fields|config|delta|read-delta|dns-active-old) kind=d ;;
+				fields/*|origin/fields/*)
+					row=${rel#*fields/}; tail=${row#*/}; row=${row%%/*}
+					case "$row" in ""|0*|*[!0-9]*) printf "unknown\n"; continue ;; esac
+					[ "${#row}" -le 4 ] && [ "$row" -le 2048 ] || { printf "unknown\n"; continue; }
+					case "$rel" in fields/"$row"|origin/fields/"$row") kind=d ;;
+						*) case "$tail" in key|existed|old|type|expected|expected-type|attempted) ;; *) printf "unknown\n"; continue ;; esac ;;
+					esac ;;
+				config/rp_"$token"_*)
+					package=${rel#config/rp_"$token"_}
+					case "$package" in network|dhcp|firewall|routepolicy|smartdns) ;; *) printf "unknown\n"; continue ;; esac
+					[ -L "$path" ] && target=$(readlink -n "$path" && printf .) && [ "$target" = "$root/etc/config/$package." ] || printf "unknown\n"
+					continue ;;
+				resolver-record.*|origin/resolver-origin.*)
+					# mktemp producers can leave a partial regular file before rename.
+					# Admit only their exact six-character generated suffix, not a glob tree.
+					case "$rel" in resolver-record.*) suffix=${rel#resolver-record.} ;; *) suffix=${rel#origin/resolver-origin.} ;; esac
+					case "$suffix" in ??????) case "$suffix" in *[!a-zA-Z0-9]*) printf "unknown\n"; continue ;; esac ;; *) printf "unknown\n"; continue ;; esac ;;
+				dns-active-old/generation|dns-active-old/domain-policy.list|dns-active-old/domain-default.list) ;;
+				origin/schema|origin/count|origin/incomplete|origin/smartdns-enabled|origin/smartdns-running|origin/dnsmasq-enabled|origin/dnsmasq-running|origin/routepolicy-enabled|origin/policy-active|origin/dns-file-old|origin/dns-file-absent|origin/dns90-old|origin/dns90-absent|origin/smartdns-listeners|origin/dnsmasq-listeners|origin/dns-file-new|origin/dns90-new|origin/dns-resolver) ;;
+				candidate|parameters|token|boot-id|count|baseline|phase|policy-active|policy-attempted|smartdns-enabled|smartdns-running|dnsmasq-enabled|dnsmasq-running|routepolicy-enabled|smartdns-listeners|dnsmasq-listeners|dns-file-old|dns-file-absent|dns90-old|dns90-absent|dns-boot-pending|dns-boot-ready|dns-boot-ready.new|dns-boot-quarantined|failed-stage|stage|policy-result|policy-error|dns-resolver|dns-resolver-file-attempted|dns-resolver-link-attempted|dns-resolver-file-attempted.new|dns-resolver-link-attempted.new|dns-evidence|dns-evidence.new|dns-query-result) ;;
+				*) printf "unknown\n"; continue ;;
+			esac
+			[ ! -L "$path" ] && { { [ "$kind" = d ] && [ -d "$path" ]; } || { [ "$kind" = f ] && [ -f "$path" ]; }; } || printf "unknown\n"
+		done' routepolicy-retire "$record" "$token" "$RP_ROOT" '{}' +) || return 1
+	[ -z "$listing" ]
+}
+archive_retire_token() {
+	[ -f "$1" ] && [ ! -L "$1" ] && retire_token=$(cat "$1") && valid_token "$retire_token" &&
+		printf '%s\n' "$retire_token" | cmp -s "$1" -
+}
+archive_retire_fields() {
+	local record=$1 n i item listing
+	[ -f "$record/count" ] && [ ! -L "$record/count" ] || return 1
+	n=$(cat "$record/count") && rp_uint_between "$n" 1 2048 || return 1
+	[ -d "$record/fields" ] && [ ! -L "$record/fields" ] || return 1
+	listing=$(find "$record/fields" ! -type d ! -type f) && [ -z "$listing" ] || return 1
+	listing=$(find "$record/fields" -mindepth 1 -type d) && [ "$(printf '%s\n' "$listing" | wc -l)" -eq "$n" ] || return 1
+	listing=$(find "$record/fields" -type f) && [ "$(printf '%s\n' "$listing" | wc -l)" -eq "$((n * 7))" ] || return 1
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		i=$((i+1))
+		for item in key existed old type expected expected-type attempted; do
+			[ -f "$record/fields/$i/$item" ] && cat "$record/fields/$i/$item" >/dev/null || return 1
+		done
+	done
+}
+archive_retire_owned() {
+	local record=$1 token=$2 retire_token
+	archive_retire_tree "$record" "$token" && archive_retire_token "$record/token" && [ "$retire_token" = "$token" ] || return 1
+	printf 'confirmed\n' | cmp -s "$record/phase" - || return 1
+	archive_retire_fields "$record" || return 1
+	# A separate legacy source may predate the accumulated origin ledger.
+	[ ! -d "$record/origin" ] || { archive_retire_fields "$record/origin" && origin_validate "$record/origin"; }
+}
+archive_retire_expected() {
+	local before=$1 after=$2 key before_type before_value after_type after_value stripped
+	key=$(cat "$after/key") && after_type=$(cat "$after/expected-type") && after_value=$(cat "$after/expected") || return 1
+	# These are the only two rebases performed by exit_check for a stopped policy.
+	# Check each surviving component independently: rm may already have deleted
+	# its sibling or key. The retained WAL supplies the previously matched key.
+	if [ -e "$before/expected-type" ] && ! cmp -s "$before/expected-type" "$after/expected-type"; then
+		before_type=$(cat "$before/expected-type") || return 1
+		case "$key:$before_type:$after_type:$after_value" in
+			routepolicy.main.enabled:scalar:scalar:0|smartdns.*.conf_files:list:list:*|smartdns.*.conf_files:list:0:-) ;;
+			*) return 1 ;;
+		esac
+		# exit_check rewrites the type only together with a changed value.
+		if [ -e "$before/expected" ] && cmp -s "$before/expected" "$after/expected"; then return 1; fi
+	fi
+	if [ -e "$before/expected" ] && ! cmp -s "$before/expected" "$after/expected"; then
+		before_value=$(cat "$before/expected") || return 1
+		case "$key" in
+			routepolicy.main.enabled) [ "$before_value:$after_type:$after_value" = 1:scalar:0 ] || return 1 ;;
+			smartdns.*.conf_files)
+				stripped=$(exit_stopped_conf_files "$before_value") || return 1
+				[ "$after_type:$after_value" = "list:$stripped" ] || { [ -z "$stripped" ] && [ "$after_type:$after_value" = 0:- ]; } || return 1 ;;
+			*) return 1 ;;
+		esac
+	fi
+}
+archive_retire_origin() {
+	local origin="$1/origin" partial=${2:-0} n entry i item rows=''
+	# Full records were shape-checked before rename. On resume only deleted
+	# components may be absent; every remaining original must still match WAL.
+	[ "$partial" = 1 ] || { [ -d "$origin" ] && [ -f "$origin/count" ]; } || return 1
+	n=$(cat "$WAL/count") && rp_uint_between "$n" 1 2048 || return 1
+	for item in schema count incomplete smartdns-enabled smartdns-running dnsmasq-enabled dnsmasq-running routepolicy-enabled policy-active smartdns-listeners dnsmasq-listeners dns-file-old dns-file-absent dns90-old dns90-absent dns-resolver; do
+		if [ -e "$origin/$item" ]; then
+			[ -f "$WAL/$item" ] && [ ! -L "$WAL/$item" ] && cmp -s "$origin/$item" "$WAL/$item" || return 1
+		elif [ "$item:$partial" = dns-resolver:0 ]; then
+			[ ! -e "$WAL/$item" ] && [ ! -L "$WAL/$item" ] || return 1
+		fi
+	done
+	if [ -d "$origin/fields" ]; then
+		rows=$(find "$origin/fields" -mindepth 1 -maxdepth 1 -type d -exec sh -c 'for path do printf "%s\n" "${path##*/}"; done' routepolicy-retire-rows '{}' +) || return 1
+	fi
+	for i in $rows; do
+		rp_uint_between "$i" 1 "$n" || return 1
+		entry="$origin/fields/$i"
+		for item in key existed old type attempted; do
+			[ ! -e "$entry/$item" ] || cmp -s "$entry/$item" "$WAL/fields/$i/$item" || return 1
+		done
+		archive_retire_expected "$entry" "$WAL/fields/$i" || return 1
+	done
+}
+archive_retire_one() {
+	local token=$1 record retired old retire_token
+	valid_token "$token" && [ -d "$TX/confirmed" ] && [ ! -L "$TX/confirmed" ] || return 1
+	record="$TX/confirmed/$token"; old="$TX/confirmed-$token"; retired="$TX/retired-$token"
+	if [ -e "$old" ] || [ -L "$old" ]; then
+		[ ! -e "$record" ] && [ ! -L "$record" ] || return 1
+		record=$old
+	fi
+	if [ -e "$retired" ] || [ -L "$retired" ]; then
+		[ ! -e "$record" ] && [ ! -L "$record" ] || return 1
+		archive_retire_tree "$retired" "$token" || return 1
+		if [ -e "$retired/token" ]; then archive_retire_token "$retired/token" && [ "$retire_token" = "$token" ] || return 1; fi
+		if [ -e "$retired/phase" ]; then printf 'confirmed\n' | cmp -s "$retired/phase" - || return 1; fi
+		[ "${2:-}" != active ] || archive_retire_origin "$retired" 1 || return 1
+	else
+		[ -e "$record" ] || [ -L "$record" ] || return 0
+		archive_retire_owned "$record" "$token" || return 1
+		[ "${2:-}" != active ] || archive_retire_origin "$record" || return 1
+		# A flat retirement name reuses the inode, even with no free inode left.
+		mv "$record" "$retired" || return 1
+	fi
+	# A previous rename may not have reached storage if its sync failed. Retry
+	# this durability gate on every entry, before deleting even one more inode.
+	sync || return 1
+	rm -rf "$retired" && sync
+}
+exit_archive_retire() {
+	local active_token source_token=- review_token retire_token item bound=0 retirement_phase
+	for item in retire-active retire-source; do
+		if [ -e "$WAL/$item" ] || [ -L "$WAL/$item" ]; then bound=1; fi
+	done
+	if [ ! -e "$WAL/phase" ] && [ ! -L "$WAL/phase" ]; then [ "$bound" = 0 ]; return; fi
+	[ -f "$WAL/phase" ] && [ ! -L "$WAL/phase" ] && retirement_phase=$(cat "$WAL/phase") || return 1
+	if [ "$retirement_phase" != exited ]; then [ "$bound" = 0 ]; return; fi
+	if [ "$bound" = 0 ]; then
+		# Released exits can authorize only the active named by the same completed
+		# exit review. Missing legacy evidence is not permission to scan orphans.
+		[ -e "$TX/exit-review" ] || [ -L "$TX/exit-review" ] || return 0
+		[ -d "$TX/exit-review" ] && [ ! -L "$TX/exit-review" ] || return 1
+		for item in "$WAL/token" "$TX/exit-review/token" "$TX/exit-review/active"; do
+			[ -e "$item" ] || [ -L "$item" ] || return 0
+		done
+		# Present evidence that cannot be read is not evidence of no binding.
+		archive_retire_token "$WAL/token" || return 1
+		review_token=$retire_token
+		archive_retire_token "$TX/exit-review/token" || return 1
+		[ "$retire_token" = "$review_token" ] || return 0
+		archive_retire_token "$TX/exit-review/active" || return 1
+		active_token=$retire_token
+	else
+		archive_retire_token "$WAL/retire-active" || return 1
+		active_token=$retire_token
+		[ -f "$WAL/retire-source" ] && [ ! -L "$WAL/retire-source" ] || return 1
+		if ! printf '%s\n' - | cmp -s "$WAL/retire-source" -; then
+			archive_retire_token "$WAL/retire-source" || return 1
+			source_token=$retire_token
+		fi
+	fi
+	# Once a binding is proven, damage or cleanup failure must keep prepare from
+	# replacing the exited WAL and losing that sole retirement authorization.
+	for item in phase kind exit-complete; do [ -f "$WAL/$item" ] && [ ! -L "$WAL/$item" ] || return 1; done
+	printf 'exited\n' | cmp -s "$WAL/phase" - || return 1
+	archive_retire_token "$WAL/token" || return 1
+	printf 'exit\n' | cmp -s "$WAL/kind" - || return 1
+	printf '1\n' | cmp -s "$WAL/exit-complete" - || return 1
+	[ -f "$WAL/schema" ] && [ ! -L "$WAL/schema" ] && printf '1\n' | cmp -s "$WAL/schema" - || return 1
+	archive_retire_fields "$WAL" || return 1
+	for item in active source; do [ ! -e "$TX/$item" ] && [ ! -L "$TX/$item" ] || return 1; done
+	archive_retire_one "$active_token" active || return 1
+	[ "$source_token" = - ] || [ "$source_token" = "$active_token" ] || archive_retire_one "$source_token" || return 1
+	# An earlier rm may have completed without its final sync. Even when both
+	# exact directories are absent, settle that removal before prepare allocates.
+	sync
+}
 exit_finish() {
 	[ "$(cat "$WAL/kind" 2>/dev/null)" = exit ] || return 0
 	[ "$(read_phase)" = rolled_back ] || return 1
@@ -390,7 +580,9 @@ exit_finish() {
 	for exit_service in routepolicy-prerecover routepolicy-initguard; do
 		[ ! -x "$RP_ROOT/etc/init.d/$exit_service" ] || init_dns_call "$exit_service" disable || return 1
 	done
-	phase exited
+	phase exited || return 1
+	# Only after the terminal phase is durable may the bound archives disappear.
+	exit_archive_retire
 }
 exit_storage_fail() {
 	fail "$1；请检查存储空间、可创建文件数量（inode）或 I/O。尚未恢复网络配置。"
@@ -436,7 +628,7 @@ exit_review_matches() (
 	for name in candidate baseline services; do cmp -s "$work/$name" "$TX/exit-review/$name" || return 1; done
 )
 exit_apply() {
-	local record=$1 supplied=$2 item stage original
+	local record=$1 supplied=$2 item stage original exit_active exit_source exit_record retire_token
 	[ "${#supplied}" = 32 ] && [ "$(cat "$TX/exit-token" 2>/dev/null)" = "$supplied" ] || return 1
 	uci_layout && exit_check "$record" || return 1
 	if job_matches exit "$supplied" && job_running; then
@@ -452,7 +644,7 @@ exit_apply() {
 			for path do
 				relative=${path#"$base"/}
 				case "$relative" in
-					token|kind|candidate|parameters|boot-id|phase|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted|dns-file-new|dns90-new|dns90-new-absent) [ -f "$path" ] || printf "unknown\n" ;;
+					token|kind|candidate|parameters|boot-id|phase|retire-active|retire-source|dns-attempted|dns-service-attempted|dns90-attempted|policy-attempted|dns-resolver-file-attempted|dns-resolver-link-attempted|dns-file-new|dns90-new|dns90-new-absent) [ -f "$path" ] || printf "unknown\n" ;;
 					delta) [ -d "$path" ] || printf "unknown\n" ;;
 					*) if [ -d "$path" ]; then [ -d "$origin/$relative" ] || printf "unknown\n"; else [ -f "$path" ] && [ -f "$origin/$relative" ] || printf "unknown\n"; fi ;;
 				esac
@@ -471,6 +663,16 @@ exit_apply() {
 	else exit_check "$record" "$stage" || return 1; fi
 	cp "$record/candidate" "$stage/candidate" || exit_storage_fail '无法复制私有阶段的退出候选，已保留原确认记录和私有阶段'
 	cp "$record/parameters" "$stage/parameters" || exit_storage_fail '无法复制私有阶段的退出参数，已保留原确认记录和私有阶段'
+	# Bind both validated pointers before promotion. An explicit '-' distinguishes
+	# an absent source from a missing/corrupt binding after a completed exit.
+	exit_record=$(rp_init_active_record) && [ "$exit_record" = "$record" ] && archive_retire_token "$record/token" || return 1
+	exit_active=$retire_token; exit_source=-
+	if [ -e "$TX/source" ] || [ -L "$TX/source" ]; then
+		exit_record=$(rp_init_source_record) && archive_retire_token "$exit_record/token" || return 1
+		exit_source=$retire_token
+	fi
+	printf '%s\n' "$exit_active" >"$stage/retire-active" && printf '%s\n' "$exit_source" >"$stage/retire-source" ||
+		exit_storage_fail '无法绑定退出退休的确认归档，已保留原确认记录和私有阶段'
 	printf '%s\n' "$supplied" >"$stage/token" && printf 'exit\n' >"$stage/kind" &&
 		cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$stage/boot-id" && printf 'rolling_back\n' >"$stage/phase" ||
 		exit_storage_fail '无法写入私有退出阶段恢复记录，已保留原确认记录和私有阶段'
@@ -973,8 +1175,10 @@ job_error_detail() {
 job_status() {
 	job_current || return 0
 	local state=failed error='' result_token='' result_state=''
+	# exited commits network restoration before archive cleanup. Only the worker's
+	# result proves that the asynchronous exit completed its storage tail as well.
 	case "$job_kind:$(read_phase):$(cat "$WAL/token" 2>/dev/null)" in
-		init:pending:"$job_token"|init:confirming:"$job_token"|init:confirmed:"$job_token"|exit:exited:"$job_token") state='done' ;;
+		init:pending:"$job_token"|init:confirming:"$job_token"|init:confirmed:"$job_token") state='done' ;;
 		*)
 			if [ -f "$TX/job-result" ] && [ ! -L "$TX/job-result" ]; then read -r result_token result_state <"$TX/job-result"; fi
 			if [ "$result_token" = "$job_token" ]; then
@@ -988,6 +1192,9 @@ job_status() {
 				error=${error:-'后台事务结果未能发布；请查看恢复状态'}
 			fi ;;
 	esac
+	if [ "$state:$job_kind:$(read_phase)" = failed:exit:exited ]; then
+		error="网络已退出；确认归档收尾或后台结果发布尚未完成，已保留退出记录；下次初始化准备将重试归档收尾${error:+：$error}"
+	fi
 	[ "$state" != failed ] || error=${error:-'后台事务已中断或失败；请查看恢复状态'}
 	printf ',"job":{"kind":"%s","token":"%s","state":"%s","error":"%s"}' "$job_kind" "$job_token" "$state" "$(rp_json_escape "$error")"
 }
@@ -1693,6 +1900,9 @@ case "$operation" in
 		case "$(read_phase)" in absent|prepared|expired|confirmed|rolled_back|exited) ;; *) fail '存在未完成事务；请先恢复' ;; esac
 		[ "$(cat "$TX/declarations/phase" 2>/dev/null)" != installed ] || [ "${ROUTEPOLICY_DECLARATION_OWNER:-0}" = 1 ] || fail '导入声明仍等待网络确认或恢复'
 		no_pending || fail '存在外部 UCI pending changes'
+		# Retry a proven retirement while the exited WAL still holds its evidence;
+		# this frees the archive inodes before any new large field journal exists.
+		exit_archive_retire || fail '不能安全退休已退出的确认归档；已保留记录与证据，未开始新事务'
 		make_review_plan "$@"
 		review_target "$1" "${10}" || fail '管理地址或出口故障策略不可确定'
 		# Build a complete replacement before discarding the previous reviewable candidate.
