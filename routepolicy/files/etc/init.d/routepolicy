@@ -13,6 +13,7 @@ ROUTEPOLICY_APPLY=${ROUTEPOLICY_APPLY:-/usr/libexec/routepolicy/apply}
 ROUTEPOLICY_WATCH=${ROUTEPOLICY_WATCH:-/usr/libexec/routepolicy/watch}
 ROUTEPOLICY_INIT_TRANSACTION=${ROUTEPOLICY_INIT_TRANSACTION:-/usr/libexec/routepolicy/init-transaction}
 boot_policy_result=
+boot_policy_enabled=
 
 # rc.common sources this file before procd.sh acquires the service lock.
 # Recovery may call native enable, so it must finish before taking that lock.
@@ -28,6 +29,10 @@ case "${action:-}" in
 			if [ -x "$ROUTEPOLICY_INIT_TRANSACTION" ]; then
 				if [ "$action" = boot ] && [ "$#" -eq 0 ]; then
 					boot_policy_result=$(ROUTEPOLICY_OUTPUT=text "$ROUTEPOLICY_INIT_TRANSACTION" recover-startup boot) || exit $?
+					if [ "$boot_policy_result" = boot-policy-coordinated ]; then
+						boot_policy_enabled=$("$ROUTEPOLICY_INIT_TRANSACTION" boot-policy-enabled) || exit $?
+						case "$boot_policy_enabled" in 0|1) ;; *) exit 1 ;; esac
+					fi
 				else
 					"$ROUTEPOLICY_INIT_TRANSACTION" recover-startup >/dev/null || exit $?
 				fi
@@ -41,9 +46,15 @@ start_service() {
 		# Only the live confirmation writer may register watch without applying again.
 		"$ROUTEPOLICY_INIT_TRANSACTION" watch-ready >/dev/null || return 1
 	fi
-	config_load routepolicy
-	enabled=0
-	config_get_bool enabled main enabled 0
+	if [ "$boot_policy_result" = boot-policy-coordinated ]; then
+		# Only the cold boot handoff ignores staged enabled changes. It must
+		# retain the committed watcher while that writer waits for recovery.
+		enabled=$boot_policy_enabled
+	else
+		config_load routepolicy
+		enabled=0
+		config_get_bool enabled main enabled 0
+	fi
 	if [ "$enabled" -ne 1 ]; then
 		printf '%s\n' 'RoutePolicy 未启用；已跳过应用并保持停用'
 		return 0

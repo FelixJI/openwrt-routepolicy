@@ -1941,6 +1941,18 @@ case "$operation" in
 		status_json
 		;;
 	status) [ "$#" -eq 0 ] || fail 'status 不接受参数'; status_json ;;
+	boot-policy-enabled)
+		[ "$#" = 0 ] || fail 'boot-policy-enabled 不接受参数'
+		# S95 calls this before procd takes its lock. Reuse preview's private
+		# aliases: changing only -t would still include the global UCI delta.
+		WAL=$(mktemp -d "${TMPDIR:-/tmp}/routepolicy-boot-read.XXXXXX") || fail '不能创建启动只读命名空间'
+		trap 'rm -rf "$WAL"' EXIT
+		trap 'exit 1' HUP INT TERM
+		boot_read_token=$(sed 's/-//g' /proc/sys/kernel/random/uuid) && valid_token "$boot_read_token" || fail '无法读取启动只读身份'
+		printf '%s\n' "$boot_read_token" >"$WAL/token" && uci_layout || fail '不能读取已提交的启动配置'
+		boot_enabled=$(uci_committed get routepolicy.main.enabled) || fail '不能读取已提交的 enabled'
+		case "$boot_enabled" in 0|1) printf '%s\n' "$boot_enabled" ;; *) fail '已提交的 enabled 必须为 0 或 1' ;; esac
+		;;
 	watch-ready)
 		[ "$#" = 0 ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] && rp_writer_owned &&
 			[ "$(read_phase)" = confirmed ] && transaction_same_boot && ! rp_dns_boot_pending && uci_layout && [ "$(uci_committed get routepolicy.main.enabled)" = 1 ] && init_dns_managed &&

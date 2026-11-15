@@ -1049,6 +1049,10 @@ SH
 #!/bin/sh
 rc=0
 if [ "$1" = recover-startup ]; then printf '%s\n' "$PPID" >"$TEST_DNS_TMP/boot-rc-pid"; fi
+if [ "$1" = boot-policy-enabled ]; then
+    pid=$(cat "$TEST_DNS_TMP/boot-rc-pid") || exit 96
+    [ ! -e "/proc/$pid/fd/1000" ] || exit 97
+fi
 if [ "$1:${2:-}" != recover-startup:boot ]; then
 	"$TEST_BOOT_TX" "$@" || rc=$?
 	printf '%s %s\n' "$1" "$rc" >>"$TEST_DNS_TMP/boot-tx-trace"
@@ -1141,18 +1145,52 @@ SH
 	cp "$ready" "$tmp/package-boot-ready"
 	rm "$ready"
 	mkdir -p "$RP_SMARTDNS_PACKAGE_STATE/current"
-	uci set routepolicy.main.cold_boot_probe=staged
-	run_boot_entry "$boot_link" boot
-	check_watcher
-	[ "$(cat "$tmp/boot-recovery-result")" = boot-policy-coordinated ] &&
-		[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] && [ ! -s "$tmp/boot-coordinator-apply" ]
-	[ -d "$RP_SMARTDNS_PACKAGE_STATE/current" ] &&
-		[ ! -e "$active/dns-boot-pending" ] && [ ! -e "$ready" ] &&
-		[ "$(uci -q get routepolicy.main.cold_boot_probe)" = staged ]
-	uci revert routepolicy.main.cold_boot_probe
+	mkdir "$tmp/boot-read-tmp"
+	for committed_enabled in 1 0; do
+		uci set "routepolicy.main.enabled=$committed_enabled"; uci commit routepolicy
+		staged_enabled=$((1-committed_enabled))
+		uci set "routepolicy.main.enabled=$staged_enabled"
+		cp "$tmp/external/routepolicy" "$tmp/boot-delta-before"
+		cp -R "$RP_ROOT/etc/config" "$tmp/boot-config-before"
+		TMPDIR="$tmp/boot-read-tmp" run_boot_entry "$boot_link" boot
+		if [ "$committed_enabled" = 1 ]; then check_watcher
+		elif jsonfilter -i "$tmp/boot-procd" -e '@.instances.*.command[0]' | grep -Fxq "$tmp/watch"; then exit 1; fi
+		[ "$(cat "$tmp/boot-recovery-result")" = boot-policy-coordinated ] &&
+			[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] && [ ! -s "$tmp/boot-coordinator-apply" ]
+		grep -Fxq 'boot-policy-enabled 0' "$tmp/boot-tx-trace"
+		[ -d "$RP_SMARTDNS_PACKAGE_STATE/current" ] &&
+			[ ! -e "$active/dns-boot-pending" ] && [ ! -e "$ready" ]
+		cmp "$tmp/external/routepolicy" "$tmp/boot-delta-before"
+		diff -r "$RP_ROOT/etc/config" "$tmp/boot-config-before"
+		[ -z "$(find "$tmp/boot-read-tmp" -mindepth 1 -print)" ]
+		# The ordinary start/restart path still fails its package admission;
+		# it must not invoke the new read-only cold handoff or register watch.
+		for action in start restart; do
+			if run_boot_entry "$TEST_DNS_REAL_INIT" "$action"; then exit 1; fi
+			[ ! -s "$tmp/boot-procd" ] && [ ! -s "$tmp/boot-apply" ]
+			if grep -q '^boot-policy-enabled ' "$tmp/boot-tx-trace"; then exit 1; fi
+			cmp "$tmp/external/routepolicy" "$tmp/boot-delta-before"
+		done
+		rm -rf "$tmp/boot-config-before"
+		uci revert routepolicy.main.enabled
+	done
+	# Malformed or unreadable committed state fails before procd, and every
+	# ephemeral alias namespace is removed on failure as well as success.
+	for invalid_enabled in invalid missing; do
+		if [ "$invalid_enabled" = missing ]; then uci delete routepolicy.main.enabled
+		else uci set routepolicy.main.enabled=invalid; fi
+		uci commit routepolicy
+		if TMPDIR="$tmp/boot-read-tmp" run_boot_entry "$boot_link" boot; then exit 1; fi
+		[ ! -s "$tmp/boot-procd" ] && [ ! -s "$tmp/boot-apply" ]
+		grep -Fxq 'boot-policy-enabled 1' "$tmp/boot-tx-trace"
+		[ -z "$(find "$tmp/boot-read-tmp" -mindepth 1 -print)" ]
+	done
+	if TMPDIR="$tmp/boot-read-tmp" "$TX" boot-policy-enabled extra >/dev/null 2>&1; then exit 1; fi
+	[ -z "$(find "$tmp/boot-read-tmp" -mindepth 1 -print)" ]
+	uci set routepolicy.main.enabled=1; uci commit routepolicy
 	rmdir "$RP_SMARTDNS_PACKAGE_STATE/current"
 	mv "$tmp/package-boot-ready" "$ready"
-	printf '%s\n' 'cold boot: package WAL without DNS pending registered one waiting watcher without apply or consuming staged configuration'
+	printf '%s\n' 'cold boot: committed enabled controls waiting watcher despite either staged value; no apply/config/delta writes, failed reads reject, ordinary start/restart unchanged'
 	run_contended_boot() {
 		for marker in before-held recovery-wait lock-window lock-held lock-release procd-lock; do rm -f "$tmp/boot-$marker"; done
 		(
