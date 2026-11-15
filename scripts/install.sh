@@ -193,6 +193,8 @@ case "$luci_meta_arch" in noarch|x86_64) ;; *) die "$luci_apk 元数据架构为
 
 # 在补依赖之前检查保留的配置和双包版本，固件重装也可能只剩配置。
 if [ -e "$prefix/etc/config/routepolicy" ]; then
+	pending_config=$(uci -q changes routepolicy) || die '无法核对 RoutePolicy 暂存配置；未安装任何内容'
+	[ -z "$pending_config" ] || die '存在未提交的 RoutePolicy 配置，请先在原管理入口确认或放弃；未安装任何内容'
 	uci -q export routepolicy >/dev/null || die '现有 RoutePolicy 配置无法读取；未安装任何内容'
 	config_schema=$(uci -q get routepolicy.main.config_schema) || config_schema=0
 	case "$config_schema" in 0|1) ;; *) die '配置 schema 高于本介质支持范围；未安装任何内容' ;; esac

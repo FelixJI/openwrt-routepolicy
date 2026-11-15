@@ -257,6 +257,7 @@ rp_config_admit() { :; }
 load_args() { :; }
 uci_layout() { :; }
 no_pending() { :; }
+rp_uci_get() { [ "$*" = 'main enabled 0' ] && printf '1\n'; }
 init_dns_managed() { rp_writer_owned && [ "$ROUTEPOLICY_WRITER_KIND" = init ]; }
 init_dns_managed_admit() { init_dns_managed; }
 init_resolver_required() { :; }
@@ -288,18 +289,26 @@ init_dns_coordinate() {
         *) return 1 ;;
     esac
 }
-rp_native_run() {
-    [ "$*" = '3 ubus call service delete {"name":"routepolicy-initguard","instance":"guard"}' ] || return 1
-    printf 'guard-stop\n' >>"$TEST_DNS_TMP/cold-trace"
+init_dns_service_state() {
+    [ "$1" = routepolicy ] || return 1
+    [ ! -e "$TEST_DNS_TMP/cold-watch-query-fail" ] || return 1
+    if [ -f "$TEST_DNS_TMP/cold-watch-running" ]; then printf 1; else printf 0; fi
 }
 status_json() { :; }
 sync() { :; }
+# Test-only entry for the real stop decision, before appending the dispatcher.
+if [ "${1:-}" = test-guard-stop ]; then guard_stop_if_inactive; exit $?; fi
 EOF
 	awk 'found || /^operation=/ {found=1; print}' "$REAL_LIB/init-transaction" >>"$tmp/cold-entry"
 	cat >"$tmp/cold-lib/apply" <<'EOF'
 #!/bin/sh
 set -eu
 . "$ROUTEPOLICY_LIBEXEC/common"
+if [ -z "${ROUTEPOLICY_WRITER_OWNER:-}" ]; then
+    rp_writer_enter apply
+    printf 'watch-apply\n' >>"$TEST_DNS_TMP/cold-trace"
+    exit 0
+fi
 rp_writer_owned
 [ "$ROUTEPOLICY_WRITER_KIND:$ROUTEPOLICY_DNS_DEFER" = init:1 ]
 [ ! -e "$TEST_DNS_TMP/cold-policy-fail" ] || exit 1
@@ -314,6 +323,43 @@ set -eu
 rm -rf "$ROUTEPOLICY_ROOT/etc/routepolicy/state/smartdns-package/current"
 printf 'package-clear\n' >>"$TEST_DNS_TMP/cold-trace"
 EOF
+	mkdir -p "$tmp/cold-bin" "$RP_ROOT/etc/init.d"
+	cat >"$tmp/cold-bin/ubus" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$*" = 'call service delete {"name":"routepolicy-initguard","instance":"guard"}' ]
+printf 'guard-stop\n' >>"$TEST_DNS_TMP/cold-trace"
+EOF
+	cat >"$RP_ROOT/etc/init.d/routepolicy" <<'EOF'
+#!/bin/sh
+set -eu
+# Keep the actual init preamble/start_service and model rc.common's lock order.
+[ "$*" = start ]
+[ -z "${ROUTEPOLICY_WRITER_OWNER:-}" ] && [ -z "${ROUTEPOLICY_WRITER_KIND:-}" ]
+(exec 9>"$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/lock"; flock -n 9)
+action=start
+shift
+ROUTEPOLICY_INIT_TRANSACTION="$TEST_DNS_TMP/cold-entry"
+ROUTEPOLICY_CTL="$ROUTEPOLICY_LIBEXEC/apply"
+config_load() { :; }
+config_get_bool() { enabled=1; }
+procd_open_instance() { :; }
+procd_set_param() { :; }
+procd_close_instance() {
+    printf 'watch-register\n' >>"$TEST_DNS_TMP/cold-trace"
+    if [ -e "$TEST_DNS_TMP/cold-watch-fail-once" ]; then
+        rm "$TEST_DNS_TMP/cold-watch-fail-once"
+        return 1
+    fi
+    : >"$TEST_DNS_TMP/cold-watch-running"
+}
+. "$TEST_DNS_REAL_INIT"
+exec 8>"$TEST_DNS_TMP/cold-procd-lock"
+flock -n 8
+start_service
+EOF
+	chmod +x "$tmp/cold-bin/ubus" "$RP_ROOT/etc/init.d/routepolicy"
+	PATH="$tmp/cold-bin:$PATH"; export PATH
 	chmod +x "$tmp/cold-entry" "$tmp/cold-lib/apply" "$tmp/cold-lib/smartdns-package"
 	cold_entry() { ROUTEPOLICY_LIBEXEC="$tmp/cold-lib" "$tmp/cold-entry" "$@"; }
 	cold_reset() {
@@ -323,6 +369,7 @@ EOF
 		cp "$WAL/boot-id" "$retire_record/boot-id"
 		printf '22222222-2222-2222-2222-222222222222\n' >"$RP_ROOT/proc/sys/kernel/random/boot_id"
 		rm -f "$tmp/cold-policy-ready" "$tmp/cold-resolver-ready" "$tmp/cold-policy-fail" "$tmp/cold-conflict"
+		rm -f "$tmp/cold-watch-running" "$tmp/cold-watch-fail-once" "$tmp/cold-watch-query-fail"
 		: >"$tmp/cold-trace"
 	}
 	cold_assert_order() {
@@ -337,11 +384,37 @@ EOF
 	[ ! -e "$retire_record/dns-boot-pending" ] && [ ! -e "$retire_record/dns-boot-ready" ]
 	# Until package recovery clears current, normal init admission remains closed.
 	if cold_entry boot-dns >"$tmp/cold-error" 2>&1; then exit 1; fi
+	if cold_entry recover-startup boot >"$tmp/cold-error" 2>&1; then exit 1; fi
 	[ ! -s "$tmp/cold-trace" ]
 	rm "$tmp/cold-conflict"
 	cold_entry guard
 	cold_assert_order
 	[ ! -e "$RP_SMARTDNS_PACKAGE_STATE/current" ]
+	[ -f "$tmp/cold-watch-running" ]
+	[ "$(grep -Ec '^(dns-verify|watch-apply|watch-register)$' "$tmp/cold-trace")" = 3 ]
+	[ "$(grep -E '^(dns-verify|watch-apply|watch-register)$' "$tmp/cold-trace")" = "$(printf 'dns-verify\nwatch-apply\nwatch-register')" ]
+	# Model interruption after durable DNS ready but before service registration.
+	cold_reset
+	cold_entry boot-dns
+	[ ! -e "$tmp/cold-watch-running" ]
+	cold_entry guard-needed
+	if cold_entry boot-pending; then exit 1; fi
+	if cold_entry test-guard-stop; then exit 1; fi
+	if grep -Fxq guard-stop "$tmp/cold-trace"; then exit 1; fi
+	# An unreadable procd response must retain the handoff, not stop the guard.
+	: >"$tmp/cold-watch-query-fail"
+	cold_entry guard-needed
+	if cold_entry test-guard-stop; then exit 1; fi
+	rm "$tmp/cold-watch-query-fail"
+	: >"$tmp/cold-watch-fail-once"
+	cold_entry guard
+	[ -f "$tmp/cold-watch-running" ]
+	[ "$(grep -c '^watch-register$' "$tmp/cold-trace")" = 2 ]
+	cold_assert_order
+	: >"$tmp/cold-trace"
+	cold_entry guard
+	if grep -Eq '^watch-(apply|register)$' "$tmp/cold-trace"; then exit 1; fi
+	if cold_entry guard-needed; then exit 1; fi
 	# Model a killed guard after package cleanup but before publishing DNS pending.
 	cold_reset
 	cold_entry guard-needed
@@ -370,7 +443,7 @@ EOF
 	cold_entry boot-dns
 	[ ! -s "$tmp/cold-trace" ]
 	rm -rf "$TX"
-	printf '%s\n' 'cold package reentry: passed (early failure, real gate, lost wakeup, S94/S95, policy before DNS, resolver ordering and same-boot no-op)'
+	printf '%s\n' 'cold package reentry: passed (early failure, real gate, lost wakeup, S94/S95, policy before DNS, resolver ordering, watch retry/lock order and same-boot no-op)'
 )
 [ ! -e "$tmp/root/tmp" ]
 case "${1:-}" in --confirmed-fields|--cold-reentry) exit 0 ;; esac

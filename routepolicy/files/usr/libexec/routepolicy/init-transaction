@@ -1284,6 +1284,7 @@ guard_stop_if_inactive() (
 	esac
 	! rp_dns_boot_pending || exit 1
 	! active_boot_recovery_due || exit 1
+	! boot_watch_recovery_due || exit 1
 	! rp_writer_event_pending || exit 1
 	rp_native_run 3 ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1
 )
@@ -1547,6 +1548,11 @@ boot_recovery_ready() {
 		[ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
 	done
 	no_pending && [ "$(rp_uci_get main enabled 0)" = 1 ]
+}
+boot_watch_recovery_due() {
+	# S95 can fail before registration; derive the handoff even after DNS is ready.
+	boot_recovery_ready || return 1
+	[ "$(init_dns_service_state routepolicy)" != 1 ]
 }
 early_dns_boot_ready() {
 	local record token boot_now
@@ -1951,6 +1957,7 @@ case "$operation" in
 		rp_smartdns_package_pending && exit 0
 		rp_dns_boot_pending && exit 0
 		active_boot_recovery_due && exit 0
+		boot_watch_recovery_due && exit 0
 		rp_writer_event_pending && exit 0
 		if job_current && [ "$job_kind" = exit ] && job_running; then exit 0; fi
 		case "$(read_phase)" in
@@ -2031,6 +2038,12 @@ case "$operation" in
 			if rp_dns_boot_pending || active_boot_recovery_due; then
 				"$0" boot-dns >/dev/null 2>&1 || { sleep 10; continue; }
 				if rp_dns_boot_pending || active_boot_recovery_due; then sleep 10; continue; fi
+			fi
+			if boot_watch_recovery_due; then
+				# The boot-dns child has released init's lock. Normal start performs
+				# recovery before taking procd's lock; never restart this guard.
+				rp_native_service routepolicy start >/dev/null 2>&1 || { sleep 10; continue; }
+				if boot_watch_recovery_due; then sleep 10; continue; fi
 			fi
 			if rp_writer_event_pending; then "$LIBEXEC/apply" reconcile-event >"$RP_RUN_DIR/event-reconcile.log" 2>&1 || true; fi
 			case "$(read_phase)" in

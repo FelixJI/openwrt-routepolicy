@@ -116,6 +116,9 @@ STUB
 cat >"$bin_dir/uci" <<'STUB'
 #!/bin/sh
 case " $* " in
+*' changes routepolicy '*)
+	printf '%s' "${TEST_CONFIG_PENDING:-}"
+	exit "${TEST_CONFIG_CHANGES_STATUS:-0}" ;;
 *' get routepolicy.main.config_schema '*)
 	[ -n "${TEST_CONFIG_SCHEMA:-}" ] || exit 1
 	printf '%s\n' "$TEST_CONFIG_SCHEMA"; exit 0 ;;
@@ -443,6 +446,19 @@ rc=0
 run_env_case TEST_CONFIG_SCHEMA=2 sh "$work/media/install.sh" --allow-local-unsigned || rc=$?
 [ "$rc" != 0 ] && [ ! -s "$work/apk.log" ] || fail '固件重装只剩高 schema 配置时必须零 APK 写入拒绝'
 grep -Fq 'schema' "$work/stderr.txt" || fail 'schema 拒绝原因缺失'
+for pending_case in masked-schema query-failed; do
+	build_media
+	mkdir -p "$work/root/etc/config"
+	printf "config main main\n option config_schema '2'\n" >"$work/root/etc/config/routepolicy"
+	rc=0
+	if [ "$pending_case" = masked-schema ]; then
+		run_env_case TEST_CONFIG_SCHEMA=1 TEST_CONFIG_PENDING="routepolicy.main.config_schema='1'" sh "$work/media/install.sh" --allow-local-unsigned || rc=$?
+	else
+		run_env_case TEST_CONFIG_CHANGES_STATUS=1 sh "$work/media/install.sh" --allow-local-unsigned || rc=$?
+	fi
+	[ "$rc" != 0 ] && [ ! -s "$work/apk.log" ] || fail '已有暂存或无法核对暂存时必须零 APK 写入拒绝'
+	grep -Fq '未安装任何内容' "$work/stderr.txt" || fail '暂存拒绝原因缺失'
+done
 for old_version in 0.3.3-r1 0.3.3-r2; do
 	build_media
 	run_env_case TEST_UPGRADE_MODE=1 TEST_OLD_VERSION="$old_version" sh "$work/media/install.sh" --allow-local-unsigned || fail 'r1 升 r2 和同版本重装应保持支持'

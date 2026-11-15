@@ -113,7 +113,7 @@ ubus call routepolicy status '{}'
 
 该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，任一附件缺失或 `SHA256SUMS` 校验失败都会在安装前停止；`install.sh` 阶段一失败时同样不会触碰已安装包。`install.sh` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器。基础设置页使用新的静态资源 generation，避免继续命中旧版 `form.NetworkSelect` 页面；已打开的旧标签页仍需重新载入一次菜单。
 
-每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
+升级失败时保留配置和完整介质，先用 `apk info -v routepolicy luci-app-routepolicy`、`logread | tail -n 100` 核对现场。排除缺包、存储或配置冲突后，使用同版本或更新的兼容完整介质重新执行 `sh install.sh --allow-local-unsigned`，再核对上述 RPC 检查及实际分流。安装器拒绝降级与未提交的 RoutePolicy 配置，不自动回退。确需退回旧环境时，只使用升级前已验证的完整系统备份或虚拟机快照，同时恢复相匹配的程序和配置；单独强装旧 APK 不受支持。
 
 规则重建保留两个 SmartDNS 动态业务 set 的内核对象及剩余 TTL，已有 DNS 缓存对应的地址不会因规则替换而丢失。源 IP 归因统计允许在完整重建时归零。遇到不兼容的旧集合结构会明确报错，保留现场供处理。升级不会自动开启本机分流或按源 IP 统计。
 

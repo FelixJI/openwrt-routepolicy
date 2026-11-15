@@ -50,7 +50,9 @@ RoutePolicy 离线安装介质（仅 OpenWrt 25.12 x86_64）
 3. 单入口安装（--allow-local-unsigned 是对安装本仓库未签名本地 APK 的显式确认）：
   sh install.sh --allow-local-unsigned
 
-install.sh 拒绝不支持的 OpenWrt 版本/架构，拒绝缺失、损坏、重复或版本混杂的介质；依赖经 apk adbdump 从本地 APK 元数据解析、apk info --exists 区分缺失与已满足（虚拟依赖解析到 provider，已满足依赖的既有版本与来源一律保留）后，先用官方软件源以默认签名安装缺失依赖，再以 --network=no --repositories-file /dev/null 的离线求解 --simulate 预检（发现会改变本介质双包以外的包时直接拒绝）并安装本地双包，装后按 manifest 精确核对双包落地。脚本不下载并执行远程脚本、不修改网络配置、不批量升级。apk 失败可能留下部分安装：脚本不会虚构原子恢复，请保留介质并核对 apk info 与 logread 后再处理。使用第三方软件源或 vendor world 与官方源不一致的设备，依赖阶段可能被 apk 原生拒绝；本入口不使用 --force-broken-world，请先恢复与官方源一致的环境。
+install.sh 在首次包写入前拒绝未提交的 RoutePolicy 配置、不兼容 schema 和任一应用包降级；另拒绝不支持的 OpenWrt 版本/架构、缺失、损坏、重复或版本混杂的介质。依赖经 apk adbdump 从本地 APK 元数据解析、apk info --exists 区分缺失与已满足（虚拟依赖解析到 provider，已满足依赖的既有版本与来源一律保留）后，先用官方软件源以默认签名安装缺失依赖，再以 --network=no --repositories-file /dev/null 的离线求解 --simulate 预检（发现会改变本介质双包以外的包时直接拒绝）并安装本地双包，装后按 manifest 精确核对双包落地。脚本不下载并执行远程脚本、不修改网络配置、不批量升级。使用第三方软件源或 vendor world 与官方源不一致的设备，依赖阶段可能被 apk 原生拒绝；本入口不使用 --force-broken-world，请先恢复与官方源一致的环境。
+
+apk 失败可能留下部分安装，脚本不自动回退或虚构原子恢复。请保留配置与介质，用 apk info -v routepolicy luci-app-routepolicy 和 logread | tail -n 100 核对现场。排除失败原因后，使用同版本或更新的兼容完整介质重新执行 sh install.sh --allow-local-unsigned，再完成下方 RPC 检查和实际分流检查。确需退回旧环境时，只恢复升级前已验证的完整系统备份或虚拟机快照，程序与配置必须匹配；单独强装旧 APK 不受支持。没有这类备份时保留现场并修复当前兼容版本。
 
 等价的手工检查（供审阅；routepolicyctl validate 仅已启用实例）：
   routepolicyctl validate
