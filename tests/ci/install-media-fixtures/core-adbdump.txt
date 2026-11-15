@@ -1,0 +1,32 @@
+# Extracted info section from the OpenWrt 25.12.0 SDK candidate APK.
+#%SCHEMA: 676B6370
+# ADB block, size: 5896, compat: 0, ver: 0
+info:
+  name: routepolicy
+  version: 0.3.3-r2
+  hashes: 4d88d6c08e0039b5ad213a72eab87de7ca7cfda8
+  description: |
+    RoutePolicy maintains an isolated nftables table, masked connection marks, a fail-closed policy routing table, and validated SmartDNS list integration.
+  arch: x86_64
+  license: MIT
+  origin: feeds/base/routepolicy
+  maintainer: RoutePolicy contributors
+  url: https://github.com/FelixJI/openwrt-routepolicy
+  installed-size: 552318
+  depends: # 14 items
+    - bind-dig
+    - ca-bundle
+    - coreutils-timeout
+    - curl
+    - flock
+    - ip-full
+    - iputils-arping
+    - jsonfilter
+    - libc
+    - nftables
+    - smartdns
+    - ubus
+    - uci
+    - ucode
+  provides: # 1 items
+    - routepolicy-any

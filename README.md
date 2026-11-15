@@ -6,7 +6,7 @@
 
 当前发布物**只面向 OpenWrt 25.12 x86_64**。请勿在其它 OpenWrt 版本、架构或衍生发行版上安装；这些组合未经过构建或运行验证。
 
-RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。LuCI 包安装流程会清理 LuCI 服务端缓存并同步重启 rpcd 以注册固定 RPC 对象；rpcd 重启失败会使包脚本报错，不会静默留下无法调用的页面。该动作不需要重启路由器，RoutePolicy 服务仍保持禁用。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
+新装设备的 RoutePolicy 路由功能默认 `enabled=0`，升级安装保留设备上的现有设置。安装和升级不会自动重启 network/firewall，也不改变 LAN 地址、桥接、DHCP 或客户端设置。LuCI 包安装流程会清理 LuCI 服务端缓存并同步重启 rpcd 以注册固定 RPC 对象；rpcd 重启失败会使包脚本报错，不会静默留下无法调用的页面。该动作不需要重启路由器；新装设备的 RoutePolicy 服务保持禁用。SmartDNS 页面只有在管理员明确保存并应用后才修改 SmartDNS 标准 UCI；打开页面不会写入默认值。
 
 ## 本机分流与可观测性
 
@@ -24,21 +24,16 @@ RoutePolicy 路由功能默认 `enabled=0`。安装和升级不会自动重启 n
 
 ## 安装
 
-1. 在 [Releases](../../releases) 下载与目标版本对应的 `routepolicy-*.apk`、`luci-app-routepolicy-*.apk`、`*-packages.adb` 索引文件、`INSTALL.txt` 和 `SHA256SUMS`。
-2. 通过 OpenWrt 控制台上传 APK；保留可用的本地/VMM 回退入口。
-3. 在设备上先安装、但不要立即启用：
+1. 在 [Releases](../../releases) 下载与目标版本对应的**全部附件**到同一目录：两个 APK、`install.sh`、`SHA256SUMS` 等。
+2. 将该目录完整上传到目标设备；保留可用的本地/VMM 回退入口。
+3. 在该目录中先核对整套介质，再用单入口安装、但不要立即启用：
 
    ```sh
-   apk add --allow-untrusted ./routepolicy-*.apk
-   apk add --allow-untrusted ./luci-app-routepolicy-*.apk
-   routepolicyctl validate
-   ubus list | grep -qx routepolicy
-   ubus call routepolicy status '{}'
+   sha256sum -c SHA256SUMS
+   sh install.sh --allow-local-unsigned
    ```
 
-   最后一条应返回包含 `"ok": true` 的状态对象。LuCI 包脚本已同步重启 rpcd；若对象检查仍失败，不要重复安装或启用 RoutePolicy，请先运行 `logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100` 保存插件加载错误。
-
-   下载全部 Release 附件后，可先执行 `sha256sum -c SHA256SUMS`；校验失败时停止安装并重新下载。
+   `install.sh` 会先核对介质与系统（仅 OpenWrt 25.12 x86_64，拒绝缺失、损坏、重复或版本混杂），再以官方源签名安装缺失依赖（已满足依赖的既有版本与来源一律保留）、离线安装本地双包；`--allow-local-unsigned` 是对安装本仓库未签名 Release APK 的显式确认。脚本不下载并执行远程脚本、不修改网络配置、不批量升级。成功后脚本执行 `ubus list | grep -qx routepolicy` 与 `ubus call routepolicy status '{}'`（应包含 `"ok": true`）、按 manifest 精确核对双包落地，并提示 LuCI 地址；`routepolicyctl validate` 仅在已启用实例上执行，未初始化设备会得到待向导配置提示。LuCI 包脚本已同步重启 rpcd；若对象检查仍失败，不要重复安装或启用 RoutePolicy，请先运行 `logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100` 保存插件加载错误。apk 失败可能留下部分安装，请按 `INSTALL.txt` 核对现场。使用第三方软件源或 vendor world 与官方源不一致的设备，依赖阶段可能被 apk 原生拒绝；本入口不使用 --force-broken-world，请先恢复与官方源一致的环境。
 
 4. 新装设备在 LuCI“服务 → 路由策略”中打开配置与恢复向导，选择接口、DNS 和规则，核对预览后明确应用。已有用户仍可使用原有页面，不必重新初始化。
 
@@ -89,7 +84,7 @@ routepolicyctl init-prepare lan wan policy - - - - - - - -
 
 LuCI 的“服务 → 路由策略 → 运行状态”会显示当前安装的 luci-app-routepolicy 与 SmartDNS 完整 APK 版本，并提供同一份更新脚本和显式启用命令，供管理员复制到 SSH 执行；页面不会自动执行这些命令。
 
-升级前先备份配置，并保留上一个 Release 的 APK。下面的命令会从 GitHub `latest` Release 自动识别两个最新版 APK，分别保存为固定文件名并一次性更新，无需手工填写版本号：
+升级前先备份配置，并保留上一个 Release 的完整安装介质。下面的命令会从 GitHub `latest` Release 下载全部附件组成完整介质，先核对 `SHA256SUMS`，再经 `install.sh` 单入口更新，无需手工填写版本号：
 
 ```sh
 set -eu
@@ -99,37 +94,26 @@ sysupgrade -b /tmp/before-routepolicy.tar.gz
 REPO=FelixJI/openwrt-routepolicy
 ASSET_URLS="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" \
   | jsonfilter -e '@.assets[*].browser_download_url')"
-CORE_URL="$(printf '%s\n' "$ASSET_URLS" \
-  | grep '/routepolicy-[0-9][^/]*\.apk$' | head -n 1)"
-LUCI_URL="$(printf '%s\n' "$ASSET_URLS" \
-  | grep '/luci-app-routepolicy-[0-9][^/]*\.apk$' | head -n 1)"
-
-[ -n "$CORE_URL" ] && [ -n "$LUCI_URL" ] || {
-  echo '未在 latest Release 中找到完整的 RoutePolicy APK'
-  exit 1
-}
-
-LATEST_DOWNLOAD="https://github.com/${REPO}/releases/latest/download"
-CORE_ASSET="${CORE_URL##*/}"
-LUCI_ASSET="${LUCI_URL##*/}"
 
 cd /tmp
-wget -O routepolicy-latest.apk "${LATEST_DOWNLOAD}/${CORE_ASSET}"
-wget -O luci-app-routepolicy-latest.apk "${LATEST_DOWNLOAD}/${LUCI_ASSET}"
-# 旧 r1 回执未绑定 boot；先使用旧程序显式撤下旧运行态。
-/etc/init.d/routepolicy stop
-apk add --allow-untrusted \
-  ./routepolicy-latest.apk \
-  ./luci-app-routepolicy-latest.apk
-routepolicyctl validate
-routepolicyctl diagnose
+rm -rf routepolicy-media
+mkdir routepolicy-media
+cd routepolicy-media
+printf '%s\n' "$ASSET_URLS" | while IFS= read -r asset_url; do
+  wget -O "${asset_url##*/}" "$asset_url"
+done
+sha256sum -c SHA256SUMS
+
+# 仅当从 0.3.3-r1 升级：旧 r1 回执未绑定 boot，需先执行 /etc/init.d/routepolicy stop。
+# 其他版本不要预先停止服务；下载、校验或依赖安装失败时，旧运行态应保持原样继续运行。
+sh install.sh --allow-local-unsigned
 ubus list | grep -qx routepolicy
 ubus call routepolicy status '{}'
 ```
 
-该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，并在任一 APK 未找到或下载失败时停止。这里使用 `apk add` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器。基础设置页使用新的静态资源 generation，避免继续命中旧版 `form.NetworkSelect` 页面；已打开的旧标签页仍需重新载入一次菜单。
+该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，任一附件缺失或 `SHA256SUMS` 校验失败都会在安装前停止；`install.sh` 阶段一失败时同样不会触碰已安装包。`install.sh` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器。基础设置页使用新的静态资源 generation，避免继续命中旧版 `form.NetworkSelect` 页面；已打开的旧标签页仍需重新载入一次菜单。
 
-每个 Release 会说明配置迁移和兼容性变化。升级失败时不要删除旧配置；先停用服务并根据 Release 说明恢复上一版本。
+升级失败时保留配置和完整介质，先用 `apk info -v routepolicy luci-app-routepolicy`、`logread | tail -n 100` 核对现场。排除缺包、存储或配置冲突后，使用同版本或更新的兼容完整介质重新执行 `sh install.sh --allow-local-unsigned`，再核对上述 RPC 检查及实际分流。安装器拒绝降级与未提交的 RoutePolicy 配置，不自动回退。确需退回旧环境时，只使用升级前已验证的完整系统备份或虚拟机快照，同时恢复相匹配的程序和配置；单独强装旧 APK 不受支持。
 
 规则重建保留两个 SmartDNS 动态业务 set 的内核对象及剩余 TTL，已有 DNS 缓存对应的地址不会因规则替换而丢失。源 IP 归因统计允许在完整重建时归零。遇到不兼容的旧集合结构会明确报错，保留现场供处理。升级不会自动开启本机分流或按源 IP 统计。
 
@@ -197,6 +181,19 @@ routepolicyctl restore-status --json
 恢复 RPC 与向导使用同一候选、应用和状态合同，确认传输为 `confirmation_transport=trusted-luci-or-ssh`。浏览器通过专用 LuCI POST 入口确认，要求已登录、具备 RoutePolicy 写权限、防伪标记有效，并由服务器核实实际连接地址就是候选管理地址；不信任浏览器自报地址、Host 或转发头。通用 `init_confirm` RPC 仍拒绝确认，不能用它伪造可信连接。原有 LAN SSH 的 `init-confirm` 方式继续可用。
 
 ## SmartDNS 管理
+
+SmartDNS 软件包可由管理员手动热切换，无需重刷固件。先备好目标 APK 和当前版本的可执行恢复介质；发行版旧介质目录须包含原签名 `packages.adb` 与对应的 `smartdns-<版本>.apk`。在完整 RoutePolicy 依赖环境下，先检查，再明确执行：
+
+```sh
+routepolicyctl smartdns-package-check fork /tmp/smartdns-candidate.apk /root/smartdns-old-media
+routepolicyctl smartdns-package-switch fork /tmp/smartdns-candidate.apk /root/smartdns-old-media
+# 需要回退时，使用上一笔已保存的介质：
+routepolicyctl smartdns-package-rollback
+```
+
+当前 `fork` 固定支持 [已通过 CI 的修改版测试构建](https://github.com/FelixJI/smartdns/actions/runs/43664354495) `1.2026.11.15-r2`，不是已发布版本。`official` 的固定 Release48.4 资产仍因文件归属不合格而拒绝；未来官方修复版须另行核验后加入支持，不能用同名文件替代。具体制品身份、有效期及验证范围见 [隔离验收记录](tests/integration/smartdns-package-openwrt-25.12.md)。切换和恢复保持配置、DNS 接管与自启动边界；其他包变化或外部冲突会停止操作并保留恢复记录。
+
+切换会在 APK 的安装约束中固定所选 SmartDNS；回退到发行版包时固定其恢复版本（例如 `smartdns=46.1-r1`），避免后续自动换成未经核验的版本。其他软件包的安装约束保持不变。
 
 LuCI 入口为“服务 → 路由策略 → SmartDNS”。它不依赖官方 `luci-app-smartdns`，但可以与其共存；若 SSH、官方页面或其他工具在本页面打开后修改了 SmartDNS UCI，版本/基线比较会拒绝覆盖并要求刷新。RoutePolicy 停用时仍可独立管理 DNS。旁路由初始化会统一协调 DNS 和分流设置，期间其他 SmartDNS 写入入口须等待事务完成。
 

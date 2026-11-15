@@ -1033,7 +1033,7 @@ verify() {
 	field "$services" '@' >/dev/null || fail 'service runtime evidence is invalid JSON'
 	# LAN protocol disablement is verified above; global odhcpd may legitimately be stopped.
 	[ "$(field "$services" '@.dropbear.instances.*.running' | sort -u)" = true ] || fail 'service not running or evidence missing: dropbear'
-	listener=$(netstat -lnptu) || fail 'DNS listener evidence unavailable'
+	listener=$(netstat -lntu) || fail 'DNS listener evidence unavailable'
 	printf '%s\n' "$listener" | awk -v ip="$access_ip:53" '
 		$4==ip||$4=="0.0.0.0:53" {
 			if($1=="tcp"&&$6=="LISTEN")tcp=1

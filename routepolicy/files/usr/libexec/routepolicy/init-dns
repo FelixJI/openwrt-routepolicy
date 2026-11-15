@@ -416,10 +416,19 @@ init_dns_managed() {
 }
 # An unapplied candidate is never authority for native service side effects.
 init_dns_applied_record() {
-	local key=$1 value=$2 index entry
-	[ -f "$WAL/candidate" ] && [ ! -L "$WAL/candidate" ] && [ -d "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+	local key=$1 value=$2 index entry field_record=$WAL
+	if [ -e "$WAL/fields-retired" ] || [ -L "$WAL/fields-retired" ]; then
+		[ "$WAL" = "$RP_STATE_DIR/init-transaction/current" ] && [ "$(cat "$WAL/phase")" = confirmed ] &&
+			[ -d "$WAL/fields-retired" ] && [ ! -L "$WAL/fields-retired" ] && [ ! -e "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+		field_record=$(rp_init_active_record) || return 1
+		for index in token candidate count; do
+			[ -f "$WAL/$index" ] && [ ! -L "$WAL/$index" ] && [ -f "$field_record/$index" ] && [ ! -L "$field_record/$index" ] &&
+				cmp -s "$WAL/$index" "$field_record/$index" || return 1
+		done
+	fi
+	[ -f "$WAL/candidate" ] && [ ! -L "$WAL/candidate" ] && [ -d "$field_record/fields" ] && [ ! -L "$field_record/fields" ] || return 1
 	index=$(awk -F '\t' -v key="$key" -v value="$value" '$1=="set"&&$2==key&&$3==value{n++;row=NR}END{if(n!=1)exit 1;print row}' "$WAL/candidate") || return 1
-	entry="$WAL/fields/$index"
+	entry="$field_record/fields/$index"
 	[ -d "$entry" ] && [ ! -L "$entry" ] || return 1
 	for index in key expected attempted; do [ -f "$entry/$index" ] && [ ! -L "$entry/$index" ] || return 1; done
 	[ "$(cat "$entry/key")" = "$key" ] && [ "$(cat "$entry/expected")" = "$value" ] || return 1
@@ -531,7 +540,7 @@ init_dns_service_state() {
 	output=$(ubus call service list "{\"name\":\"$service\"}") || return 1
 	case "$output" in \{*\}) ;; *) return 1 ;; esac
 	printf '%s\n' "$output" | jsonfilter -e '@' >/dev/null || return 1
-	if printf '%s\n' "$output" | jsonfilter -e "@.$service.instances.*.running" | grep -Eq '^(true|1)$'; then printf 1; else printf 0; fi
+	if printf '%s\n' "$output" | jsonfilter -e "@[\"$service\"].instances.*.running" | grep -Eq '^(true|1)$'; then printf 1; else printf 0; fi
 }
 init_dns_enabled() {
 	local result=0

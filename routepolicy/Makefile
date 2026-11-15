@@ -13,7 +13,7 @@ define Package/routepolicy
   CATEGORY:=Network
   TITLE:=Policy routing with nftables and SmartDNS
   URL:=https://github.com/FelixJI/openwrt-routepolicy
-  DEPENDS:=+nftables +ip-full +curl +ca-bundle +jsonfilter +ubus +uci +smartdns +bind-dig +flock +coreutils-timeout +iputils-arping
+  DEPENDS:=+nftables +ip-full +curl +ca-bundle +jsonfilter +ubus +uci +ucode +smartdns +bind-dig +flock +coreutils-timeout +iputils-arping
 endef
 
 define Package/routepolicy/description
@@ -63,6 +63,7 @@ define Package/routepolicy/install
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/rollback $(1)/usr/libexec/routepolicy/rollback
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/scheduler $(1)/usr/libexec/routepolicy/scheduler
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/smartdns-control $(1)/usr/libexec/routepolicy/smartdns-control
+	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/smartdns-package $(1)/usr/libexec/routepolicy/smartdns-package
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/status $(1)/usr/libexec/routepolicy/status
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/update $(1)/usr/libexec/routepolicy/update
 	$(INSTALL_BIN) ./files/usr/libexec/routepolicy/user-list $(1)/usr/libexec/routepolicy/user-list

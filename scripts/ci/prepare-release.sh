@@ -6,6 +6,14 @@ SDK_DIR=${1:?需要 SDK 目录}
 OUT_DIR=${2:?需要输出目录}
 mkdir -p "$OUT_DIR"
 
+# 离线安装介质单入口：与 APK、清单一同发布，并统一纳入既有 SHA256SUMS。
+installer="$(dirname "$0")/../install.sh"
+[ -f "$installer" ] || {
+    printf '缺少 scripts/install.sh 离线安装入口。\n' >&2
+    exit 1
+}
+cp "$installer" "$OUT_DIR/install.sh"
+
 find "$SDK_DIR/bin/packages/x86_64" -type f \( -name 'routepolicy-*.apk' -o -name 'luci-app-routepolicy-*.apk' \) -exec cp {} "$OUT_DIR" \;
 
 # OpenWrt 25.12 的 apk 索引名为 packages.adb；各 feed 会生成同名文件，
@@ -33,20 +41,26 @@ index_count=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*-packages.adb' | wc -l
 }
 
 cat > "$OUT_DIR/INSTALL.txt" <<'EOF'
-RoutePolicy 安装说明（仅 OpenWrt 25.12 x86_64）
+RoutePolicy 离线安装介质（仅 OpenWrt 25.12 x86_64）
 
-从本 Release 下载 routepolicy-*.apk 和 luci-app-routepolicy-*.apk，上传到目标设备后：
-  apk add --allow-untrusted ./routepolicy-*.apk
-  apk add --allow-untrusted ./luci-app-routepolicy-*.apk
+1. 下载本 Release 全部附件（routepolicy-*.apk、luci-app-routepolicy-*.apk、install.sh、SHA256SUMS、INSTALL.txt 等）到同一目录，完整上传到目标设备。
+2. 在该目录先核对整套介质完整性：
+  sha256sum -c SHA256SUMS
+   任一文件校验失败时，停止安装并重新下载完整介质。
+3. 单入口安装（--allow-local-unsigned 是对安装本仓库未签名本地 APK 的显式确认）：
+  sh install.sh --allow-local-unsigned
+
+install.sh 在首次包写入前拒绝未提交的 RoutePolicy 配置、不兼容 schema 和任一应用包降级；另拒绝不支持的 OpenWrt 版本/架构、缺失、损坏、重复或版本混杂的介质。依赖经 apk adbdump 从本地 APK 元数据解析、apk info --exists 区分缺失与已满足（虚拟依赖解析到 provider，已满足依赖的既有版本与来源一律保留）后，先用官方软件源以默认签名安装缺失依赖，再以 --network=no --repositories-file /dev/null 的离线求解 --simulate 预检（发现会改变本介质双包以外的包时直接拒绝）并安装本地双包，装后按 manifest 精确核对双包落地。脚本不下载并执行远程脚本、不修改网络配置、不批量升级。使用第三方软件源或 vendor world 与官方源不一致的设备，依赖阶段可能被 apk 原生拒绝；本入口不使用 --force-broken-world，请先恢复与官方源一致的环境。
+
+apk 失败可能留下部分安装，脚本不自动回退或虚构原子恢复。请保留配置与介质，用 apk info -v routepolicy luci-app-routepolicy 和 logread | tail -n 100 核对现场。排除失败原因后，使用同版本或更新的兼容完整介质重新执行 sh install.sh --allow-local-unsigned，再完成下方 RPC 检查和实际分流检查。确需退回旧环境时，只恢复升级前已验证的完整系统备份或虚拟机快照，程序与配置必须匹配；单独强装旧 APK 不受支持。没有这类备份时保留现场并修复当前兼容版本。
+
+等价的手工检查（供审阅；routepolicyctl validate 仅已启用实例）：
   routepolicyctl validate
   ubus list | grep -qx routepolicy
   ubus call routepolicy status '{}'
 
-最后一条应返回包含 "ok": true 的状态对象。LuCI 包安装流程会清理 LuCI 服务端缓存并同步重启 rpcd；重启失败会使包脚本报错，不需要重启路由器。若对象检查仍失败，请先运行 logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100 保存插件加载错误，不要启用 RoutePolicy。安装后 RoutePolicy 保持默认禁用状态，先在 LuCI/UCI 核对接口与 SmartDNS 配置。不要在未验证的版本或架构上安装。
+最后一条应返回包含 "ok": true 的状态对象。LuCI 包安装流程会清理 LuCI 服务端缓存并同步重启 rpcd；重启失败会使包脚本报错，不需要重启路由器。若对象检查仍失败，请先运行 logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100 保存插件加载错误，不要启用 RoutePolicy。安装后 RoutePolicy 保持默认禁用状态；升级已启用实例时 install.sh 不会宣称默认禁用或未接管。不要在未验证的版本或架构上安装。
 *-packages.adb 是本次构建产生的 apk 仓库索引，*-index.json 供人工审计；发布 APK 未签名，直接安装时仅应使用本仓库 Release 中的文件。
-下载全部 Release 附件后，先运行：
-  sha256sum -c SHA256SUMS
-若任一文件校验失败，请停止安装并重新下载。
 EOF
 
 {

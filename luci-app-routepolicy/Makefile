@@ -7,7 +7,7 @@ PKG_LICENSE:=MIT
 
 LUCI_TITLE:=LuCI support for RoutePolicy
 LUCI_DESCRIPTION:=Safe operational interface for RoutePolicy policy routing
-LUCI_DEPENDS:=+routepolicy +luci-base +rpcd-mod-ucode
+LUCI_DEPENDS:=+routepolicy +luci-base +rpcd-mod-ucode +uhttpd +uhttpd-mod-ubus
 LUCI_PKGARCH:=all
 
 define Package/$(PKG_NAME)/postinst

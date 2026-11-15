@@ -10,6 +10,7 @@ RP_USER_DIR="$RP_ETC/user.d"
 RP_MANAGED_CURRENT="$RP_ETC/managed.d/current"
 RP_MANAGED_PREVIOUS="$RP_ETC/managed.d/previous"
 RP_STATE_DIR="$RP_ETC/state"
+RP_SMARTDNS_PACKAGE_STATE="$RP_STATE_DIR/smartdns-package"
 RP_RUN_DIR="$RP_ROOT/tmp/routepolicy"
 RP_ACTIVE_DIR="$RP_RUN_DIR/active"
 RP_NFT_FILE="$RP_RUN_DIR/rules.nft"
@@ -813,6 +814,10 @@ rp_dns_boot_pending() {
 	active_pending=$(rp_init_active_record) || return 1
 	[ -f "$active_pending/dns-boot-pending" ]
 }
+
+rp_smartdns_package_pending() {
+	[ -L "$RP_SMARTDNS_PACKAGE_STATE" ] || [ -e "$RP_SMARTDNS_PACKAGE_STATE/current" ] || [ -L "$RP_SMARTDNS_PACKAGE_STATE/current" ]
+}
 # Only these exact standard permission strings are supported; other modes are conflicts.
 # shellcheck disable=SC3043
 rp_path_mode() {
@@ -885,7 +890,11 @@ rp_writer_drain_legacy() {
 }
 rp_writer_enter() {
 	rp_writer_role=$1
-	rp_config_admit || return 1
+	rp_package_quarantine=0
+	case "$rp_writer_role:${operation:-}:${2:-}" in
+		smartdns-package:package-recover:quarantine|smartdns-package:package-recover-early:quarantine) rp_package_quarantine=1 ;;
+	esac
+	[ "$rp_package_quarantine" = 1 ] || rp_config_admit || return 1
 	if [ -n "${ROUTEPOLICY_WRITER_OWNER:-}" ]; then
 		rp_writer_owned || { rp_err 'writer owner 已失效或未继承真实写锁'; return 1; }
 		[ "$rp_writer_role" != init ] || [ "${ROUTEPOLICY_WRITER_KIND:-}" = init ] || return 1
@@ -897,13 +906,22 @@ rp_writer_enter() {
 		[ ! -L "$RP_STATE_DIR/init-transaction/lock" ] || return 1
 		exec 9>"$RP_STATE_DIR/init-transaction/lock"
 		chmod 600 "$RP_STATE_DIR/init-transaction/lock" || return 1
-		if [ "${operation:-}" = recover-startup ] || [ "${operation:-}" = recover-early ]; then
+		if [ "${operation:-}" = recover-startup ] || [ "${operation:-}" = recover-early ] || [ "${operation:-}" = package-recover-early ]; then
 			flock -w 180 9 || return 1
 		else flock -n 9 || { rp_err '另一个配置或运行态写入正在进行'; return 1; }; fi
 		ROUTEPOLICY_WRITER_OWNER="$$:$(rp_process_start "$$")"
 		ROUTEPOLICY_WRITER_KIND=$rp_writer_role
 		export ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND
 		rp_writer_drain_legacy || { rp_err '已有 apply/update/SmartDNS writer 尚未退出或旧锁归属未知'; return 1; }
+	fi
+	# Interrupted-package quarantine is limited to boot links and procd. Actual
+	# package/configuration recovery must reenter the normal gate afterward.
+	[ "$rp_package_quarantine" != 1 ] || return 0
+	if rp_smartdns_package_pending; then
+		case "$rp_writer_role:${operation:-}" in
+			smartdns-package:package-recover|smartdns-package:package-recover-early|init:shutdown-dns) ;;
+			*) rp_err 'SmartDNS 软件包事务尚未结束，请先运行 routepolicyctl smartdns-package-recover'; return 1 ;;
+		esac
 	fi
 	if [ -e "$RP_STATE_DIR/init-transaction/declarations" ] || [ -L "$RP_STATE_DIR/init-transaction/declarations" ]; then
 		[ -d "$RP_STATE_DIR/init-transaction/declarations" ] && [ ! -L "$RP_STATE_DIR/init-transaction/declarations" ] &&

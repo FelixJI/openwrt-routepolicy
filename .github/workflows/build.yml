@@ -29,11 +29,14 @@ jobs:
       # 官方 actions 使用稳定主版本；其余步骤均为 runner 内置命令，减少供应链面。
       - uses: actions/checkout@v5
       - name: Install offline check tools
-        run: sudo apt-get update && sudo apt-get install --yes nftables shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes nftables shellcheck qemu-utils
       - name: Check shell, ucode and JavaScript
         run: sh tests/ci/static-checks.sh
       - name: Run package contract tests
         run: sh tests/ci/package-contract-tests.sh
+      - name: Check isolated lab file and recovery boundaries
+        timeout-minutes: 2
+        run: python3 -B tests/integration/lab-selfcheck.py
       - name: Run converter and core unit tests
         run: |
           sh tests/converters/run.sh
@@ -78,6 +81,7 @@ jobs:
           make package/ucode/host/compile V=s
           staging_dir/hostpkg/bin/ucode -c ../luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
           staging_dir/hostpkg/bin/ucode ../tests/luci/ucode-popen-contract.uc
+          PATH="$PWD/staging_dir/hostpkg/bin:$PATH" sh ../tests/core/smartdns-package-test.sh
           make package/routepolicy/compile package/luci-app-routepolicy/compile V=s -j"$(nproc)"
           make package/index V=s
       - name: Collect release files

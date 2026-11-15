@@ -68,6 +68,685 @@ rm -f "$tmp/root/etc/smartdns/smartdns.cache" "$tmp/root/etc/smartdns/custom.cac
 printf '%s\n' 'init DNS native cache/cron preflight: passed'
 if [ "${1:-}" = --native-side-effects ]; then exit 0; fi
 
+# Run the real retirement and admission functions without native UCI or services.
+(
+	# Dispatcher-created private directories must not alter the later native fixture.
+	export ROUTEPOLICY_ROOT="$tmp/control-root"
+	awk '/^operation=/{exit} {print}' "$REAL_LIB/init-transaction" >"$tmp/transaction-functions"
+	# shellcheck disable=SC1091
+	. "$tmp/transaction-functions"
+	sync() { :; }
+	retire_reset() {
+		rm -rf "$TX"
+		retire_token=11111111111111111111111111111111
+		retire_record="$TX/confirmed/$retire_token"
+		mkdir -p "$WAL/fields/1" "$WAL/fields/2" "$retire_record"
+		printf '%s\n' "$retire_token" >"$WAL/token"
+		printf 'confirmed\n' >"$WAL/phase"
+		printf '2\n' >"$WAL/count"
+		printf 'set\tsmartdns.main.port\t53\nset\tnetwork.lan.ipaddr\t192.0.2.2\n' >"$WAL/candidate"
+		for row in 1 2; do
+			entry="$WAL/fields/$row"
+			if [ "$row" = 1 ]; then key=smartdns.main.port; value=53; old=6053
+			else key=network.lan.ipaddr; value=192.0.2.2; old=192.0.2.1; fi
+			printf '%s\n' "$key" >"$entry/key"; printf '%s' "$value" >"$entry/expected"
+			printf '%s' "$old" >"$entry/old"; printf 1 >"$entry/existed"
+			printf scalar >"$entry/type"; printf scalar >"$entry/expected-type"; : >"$entry/attempted"
+		done
+		cp -R "$WAL/." "$retire_record/"
+		mkdir "$retire_record/origin"
+		cp -R "$WAL/fields" "$WAL/count" "$retire_record/origin/"
+		printf '1\n' >"$retire_record/origin/schema"
+		printf '%s\n' "$retire_token" >"$TX/active"; cp "$TX/active" "$TX/source"
+	}
+	retire_bad() { if confirmed_fields_retire; then printf 'retired unsafe journal: %s\n' "$1" >&2; exit 1; fi; }
+	retire_reset
+	cp -R "$retire_record" "$tmp/retire-authority"
+	confirmed_fields_retire
+	[ ! -e "$WAL/fields" ] && [ -d "$WAL/fields-retired" ] && [ -z "$(find "$WAL/fields-retired" -mindepth 1)" ]
+	init_dns_applied_record smartdns.main.port 53
+	confirmed_fields_retire
+	diff -r "$retire_record" "$tmp/retire-authority"
+	retire_reset
+	printf 'confirming\n' >"$WAL/phase"; rm "$TX/active" "$TX/source"
+	active_publish
+	[ "$(read_phase)" = confirmed ] && [ ! -e "$WAL/fields" ] && [ -d "$WAL/fields-retired" ]
+	init_dns_applied_record smartdns.main.port 53
+	for broken in value missing extra symlink token candidate count phase origin; do
+		retire_reset
+		case "$broken" in
+			value) printf 54 >"$WAL/fields/1/expected" ;;
+			missing) rm "$WAL/fields/1/old" ;;
+			extra) : >"$WAL/fields/foreign" ;;
+			symlink) rm "$WAL/fields/1/old"; ln -s "$retire_record/fields/1/old" "$WAL/fields/1/old" ;;
+			token) printf '22222222222222222222222222222222\n' >"$WAL/token" ;;
+			candidate) printf 'set\tsmartdns.main.port\t54\n' >"$WAL/candidate" ;;
+			count) printf '1\n' >"$WAL/count" ;;
+			phase) printf 'pending\n' >"$WAL/phase" ;;
+			origin) rm "$retire_record/origin/fields/1/old" ;;
+		esac
+		retire_bad "$broken"
+		[ -d "$WAL/fields" ] && [ ! -e "$WAL/fields-retired" ]
+	done
+	# A sync failure after rename leaves the durable retry identity and original files.
+	retire_reset
+	sync() { return 1; }
+	retire_bad rename-sync
+	[ -d "$WAL/fields-retired/1" ] && [ ! -e "$WAL/fields" ]
+	init_dns_applied_record smartdns.main.port 53
+	sync() { :; }
+	printf changed >"$WAL/fields-retired/1/old"
+	retire_bad changed-leftover
+	[ "$(cat "$WAL/fields-retired/1/old")" = changed ]
+	cp "$retire_record/fields/1/old" "$WAL/fields-retired/1/old"
+	rm "$WAL/fields-retired/1/old"
+	rm -rf "$WAL/fields-retired/2"
+	confirmed_fields_retire
+	[ -z "$(find "$WAL/fields-retired" -mindepth 1)" ]
+	# A retirement marker never authorizes another phase, generation or candidate.
+	for broken in phase token candidate count both marker-link foreign-leftover; do
+		retire_reset
+		confirmed_fields_retire
+		case "$broken" in
+			phase) printf 'prepared\n' >"$WAL/phase" ;;
+			token) printf '22222222222222222222222222222222\n' >"$WAL/token" ;;
+			candidate) printf 'set\tsmartdns.main.port\t54\n' >"$WAL/candidate" ;;
+			count) printf '1\n' >"$WAL/count" ;;
+			both) mkdir "$WAL/fields" ;;
+			marker-link) rmdir "$WAL/fields-retired"; ln -s "$tmp" "$WAL/fields-retired" ;;
+			foreign-leftover) printf foreign >"$WAL/fields-retired/user.keep" ;;
+		esac
+		retire_bad "$broken"
+		if [ "$broken" = phase ]; then
+			# shellcheck disable=SC2034
+			operation=recover
+			if prepared_finish_locked; then printf 'expired retired prepared journal\n' >&2; exit 1; fi
+			[ "$(read_phase)" = prepared ]
+		fi
+		if [ "$broken" != foreign-leftover ]; then
+			if init_dns_applied_record smartdns.main.port 53; then printf 'admitted unsafe retired journal: %s\n' "$broken" >&2; exit 1; fi
+		else [ "$(cat "$WAL/fields-retired/user.keep")" = foreign ]; fi
+	done
+	retire_reset
+	rm -rf "$retire_record/origin"
+	confirmed_fields_retire
+	[ -d "$WAL/fields" ] && [ ! -e "$WAL/fields-retired" ]
+	init_dns_applied_record smartdns.main.port 53
+	# Every traversal failure must propagate, even after producing a plausible listing.
+	find() (
+		calls=$(cat "$tmp/retire-find-count"); calls=$((calls+1))
+		printf '%s\n' "$calls" >"$tmp/retire-find-count"
+		if [ "$calls" = "$find_fail" ]; then
+			[ "$find_error_output" != partial ] || command find "$@"
+			return 87
+		fi
+		command find "$@"
+	)
+	for find_layout in fresh empty-retired partial-retired; do
+		retire_reset
+		case "$find_layout" in
+			empty-retired) rm -rf "$WAL/fields"; mkdir "$WAL/fields-retired" ;;
+			partial-retired) mv "$WAL/fields" "$WAL/fields-retired"; rm "$WAL/fields-retired/1/old" ;;
+		esac
+		printf '0\n' >"$tmp/retire-find-count"; find_fail=0; find_error_output=empty
+		confirmed_fields_retire
+		find_total=$(cat "$tmp/retire-find-count")
+		for find_error_output in empty partial; do
+			find_fail=1
+			while [ "$find_fail" -le "$find_total" ]; do
+				retire_reset
+				case "$find_layout" in
+					empty-retired) rm -rf "$WAL/fields"; mkdir "$WAL/fields-retired" ;;
+					partial-retired) mv "$WAL/fields" "$WAL/fields-retired"; rm "$WAL/fields-retired/1/old" ;;
+				esac
+				printf '0\n' >"$tmp/retire-find-count"
+				retire_bad "$find_layout/$find_error_output/find-$find_fail"
+				[ "$(cat "$tmp/retire-find-count")" = "$find_fail" ]
+				diff -r "$retire_record" "$tmp/retire-authority"
+				find_fail=$((find_fail+1))
+			done
+		done
+	done
+	unset -f find
+	# Exercise lock's actual early-boot ordering with a bounded service stand-in.
+	(
+		writer_lock() { :; }
+		init_dns_managed() { return 0; }
+		early_dns_boot_ready() { return 1; }
+		init_dns_coordinate() {
+			[ "$1" = quarantine-boot ] || return 1
+			if [ "$retire_boot_case" = full ]; then
+				[ -d "$WAL/fields-retired" ] && [ ! -e "$WAL/fields" ] && [ -z "$(find "$WAL/fields-retired" -mindepth 1)" ] || return 1
+			fi
+			printf 'isolated\n' >"$tmp/retire-quarantine"
+		}
+		# shellcheck disable=SC2034
+		operation=recover-early
+		retire_boot_case=full
+		retire_reset
+		lock
+		grep -Fxq isolated "$tmp/retire-quarantine"
+		[ -d "$WAL/fields-retired" ] && [ ! -e "$WAL/fields" ]
+		retire_boot_case=corrupt
+		retire_reset
+		rm "$tmp/retire-quarantine"
+		printf changed >"$WAL/fields/2/old"
+		if (lock) >"$tmp/retire-lock-error" 2>&1; then printf 'early boot ignored failed retirement\n' >&2; exit 1; fi
+		grep -Fxq isolated "$tmp/retire-quarantine"
+		grep -Fq '不能安全收敛确认字段副本' "$tmp/retire-lock-error"
+		[ "$(cat "$WAL/fields/2/old")" = changed ] && [ ! -e "$WAL/fields-retired" ]
+	)
+	# On an already confirmed full filesystem, retirement precedes fresh pointer files.
+	retire_reset
+	sync() {
+		[ ! -e "$TX/active.new" ] && [ ! -e "$WAL/phase.new" ] || return 1
+		[ -d "$WAL/fields-retired" ] || return 1
+		if [ -n "$(find "$WAL/fields-retired" -mindepth 1)" ]; then return 0; fi
+		return 1
+	}
+	if active_publish; then printf 'expected interrupted post-retirement sync\n' >&2; exit 1; fi
+	[ -d "$WAL/fields-retired" ] && [ -z "$(find "$WAL/fields-retired" -mindepth 1)" ]
+	[ ! -e "$TX/active.new" ] && [ ! -e "$WAL/phase.new" ]
+	printf '%s\n' 'confirmed field retirement: passed (exact provenance, durable rename, partial cleanup, legacy, admission, boot isolation, traversal errors and pre-allocation ordering)'
+	# Exited archives are retired only by the completed exit's exact binding.
+	sync() { :; }
+	archive_fixture() {
+		retire_reset
+		archive_token=$retire_token
+		rm -rf "$WAL" "$tmp/retire-exited-before"
+		mkdir "$WAL"
+		cp -R "$retire_record/origin/." "$WAL/"
+		printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' >"$WAL/token"
+		printf 'exited\n' >"$WAL/phase"; printf 'exit\n' >"$WAL/kind"; printf '1\n' >"$WAL/exit-complete"
+		printf '%s\n' "$archive_token" >"$WAL/retire-active"
+		printf '%s\n' - >"$WAL/retire-source"
+		rm "$TX/active" "$TX/source"
+		mkdir "$TX/exit-review"
+		cp "$WAL/token" "$TX/exit-review/token"; cp "$WAL/retire-active" "$TX/exit-review/active"
+		mkdir -p "$retire_record/config" "$RP_ROOT/etc/config"
+		printf 'user-config\n' >"$RP_ROOT/etc/config/smartdns"
+		ln -s "$RP_ROOT/etc/config/smartdns" "$retire_record/config/rp_${archive_token}_smartdns"
+		cp -R "$WAL" "$tmp/retire-exited-before"
+	}
+	archive_fixture
+	# The flat rename can retire without allocating another directory inode.
+	( mkdir() { return 99; }; exit_archive_retire )
+	[ ! -e "$retire_record" ] && [ ! -e "$TX/retired-$archive_token" ] || exit 1
+	[ "$(cat "$RP_ROOT/etc/config/smartdns")" = user-config ]
+	diff -r "$WAL" "$tmp/retire-exited-before"
+	exit_archive_retire
+	for bad_archive in top-extra origin-extra origin-extra-partial-row origin-extra-full-row field-extra alias-target alias-tail alias-name binding-link source-missing source-link source-invalid phase-missing phase-link proof-missing proof-link field-missing field-changed field-expected field-expected-type cache-expected parent-link both retired-extra retired-link retired-token temp-short temp-long temp-dot temp-nested temp-link temp-directory; do
+		archive_fixture
+		case "$bad_archive" in
+			top-extra) printf foreign >"$retire_record/user.keep" ;;
+			origin-extra) printf foreign >"$retire_record/origin/user.keep" ;;
+			origin-extra-partial-row) mkdir "$retire_record/origin/fields/3"; printf foreign >"$retire_record/origin/fields/3/old" ;;
+			origin-extra-full-row) cp -R "$retire_record/origin/fields/1" "$retire_record/origin/fields/3" ;;
+			field-extra) printf foreign >"$retire_record/fields/1/foreign" ;;
+			alias-target) rm "$retire_record/config/rp_${archive_token}_smartdns"; ln -s "$tmp" "$retire_record/config/rp_${archive_token}_smartdns" ;;
+			alias-tail) rm "$retire_record/config/rp_${archive_token}_smartdns"; alias_target=$(printf '%s\n.' "$RP_ROOT/etc/config/smartdns"); ln -s "${alias_target%.}" "$retire_record/config/rp_${archive_token}_smartdns" ;;
+			alias-name) ln -s "$RP_ROOT/etc/config/smartdns" "$retire_record/config/foreign" ;;
+			binding-link) rm "$WAL/retire-active"; ln -s "$TX/exit-review/active" "$WAL/retire-active" ;;
+			source-missing) rm "$WAL/retire-source" ;;
+			source-link) rm "$WAL/retire-source"; ln -s "$WAL/retire-active" "$WAL/retire-source" ;;
+			source-invalid) printf invalid >"$WAL/retire-source" ;;
+			phase-missing) rm "$WAL/phase" ;;
+			phase-link) mv "$WAL/phase" "$TX/exited-phase"; ln -s "$TX/exited-phase" "$WAL/phase" ;;
+			proof-missing) rm "$WAL/exit-complete" ;;
+			proof-link) rm "$WAL/exit-complete"; ln -s "$WAL/schema" "$WAL/exit-complete" ;;
+			field-missing) rm "$WAL/fields/1/old" ;;
+			field-changed) printf changed >"$WAL/fields/1/old" ;;
+			field-expected) printf changed >"$WAL/fields/1/expected" ;;
+			field-expected-type) printf list >"$WAL/fields/1/expected-type" ;;
+			cache-expected)
+				printf 'smartdns.main.cache_file\n' >"$WAL/fields/1/key"
+				cp "$WAL/fields/1/key" "$retire_record/origin/fields/1/key"
+				printf changed >"$WAL/fields/1/expected" ;;
+			parent-link) mv "$TX/confirmed" "$TX/confirmed-owned"; ln -s "$TX/confirmed-owned" "$TX/confirmed" ;;
+			both) cp -R "$retire_record" "$TX/retired-$archive_token" ;;
+			retired-extra) mv "$retire_record" "$TX/retired-$archive_token"; printf foreign >"$TX/retired-$archive_token/user.keep" ;;
+			retired-link) mv "$retire_record" "$TX/archive-keep"; ln -s "$TX/archive-keep" "$TX/retired-$archive_token" ;;
+			retired-token) mv "$retire_record" "$TX/retired-$archive_token"; printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$TX/retired-$archive_token/token" ;;
+			temp-short) : >"$retire_record/resolver-record.abcde" ;;
+			temp-long) : >"$retire_record/origin/resolver-origin.abcdefg" ;;
+			temp-dot) : >"$retire_record/resolver-record.foo.abcdef" ;;
+			temp-nested) mkdir "$retire_record/resolver-record.abcdef"; : >"$retire_record/resolver-record.abcdef/ABCDEF" ;;
+			temp-link) ln -s "$RP_ROOT/etc/config/smartdns" "$retire_record/origin/resolver-origin.Ab12Cd" ;;
+			temp-directory) mkdir "$retire_record/dns-resolver-file-attempted.new" ;;
+		esac
+		if exit_archive_retire; then printf 'retired unsafe exited archive: %s\n' "$bad_archive" >&2; exit 1; fi
+		[ -d "$retire_record" ] || [ -d "$TX/retired-$archive_token" ] || exit 1
+		case "$bad_archive" in origin-extra-partial-row|origin-extra-full-row)
+			[ -d "$retire_record" ]
+			[ ! -e "$TX/retired-$archive_token" ] ;;
+		esac
+	done
+	# Legacy proof reads must not turn an I/O failure into permission to replace
+	# the exited WAL. Each fault emits valid bytes before reporting the error.
+	for failed_read in current/token exit-review/token exit-review/active current/phase; do
+		archive_fixture
+		rm "$WAL/retire-active" "$WAL/retire-source"
+		cp -R "$WAL" "$tmp/legacy-read-before"
+		( cat() { if [ "$1" = "$TX/$failed_read" ]; then command cat "$@"; return 87; else command cat "$@"; fi; }
+			if exit_archive_retire; then exit 1; fi )
+		[ -d "$retire_record" ]
+		diff -r "$WAL" "$tmp/legacy-read-before"
+		rm -rf "$tmp/legacy-read-before"
+		exit_archive_retire
+		[ ! -e "$retire_record" ]
+	done
+	for resolver_damage in missing changed link added; do
+		archive_fixture
+		rm "$WAL/retire-active" "$WAL/retire-source"
+		printf 'original resolver restore evidence\n' >"$retire_record/origin/dns-resolver"
+		cp "$retire_record/origin/dns-resolver" "$WAL/dns-resolver"
+		case "$resolver_damage" in
+			missing) rm "$WAL/dns-resolver" ;;
+			changed) printf replaced >"$WAL/dns-resolver" ;;
+			link) rm "$WAL/dns-resolver"; ln -s "$retire_record/origin/dns-resolver" "$WAL/dns-resolver" ;;
+			added) rm "$retire_record/origin/dns-resolver" ;;
+		esac
+		if exit_archive_retire; then printf 'lost resolver evidence: %s\n' "$resolver_damage" >&2; exit 1; fi
+		[ -d "$retire_record" ]
+	done
+	archive_fixture
+	# Partial producer files need not parse: only the published resolver is authority.
+	printf partial >"$retire_record/resolver-record.A1b2C3"
+	printf partial >"$retire_record/origin/resolver-origin.D4e5F6"
+	: >"$retire_record/dns-resolver-file-attempted.new"
+	: >"$retire_record/dns-resolver-link-attempted.new"
+	exit_archive_retire
+	[ ! -e "$retire_record" ]
+	for failed_read in retire-active retire-source phase; do
+		archive_fixture
+		printf '%s\n' "$archive_token" >"$WAL/retire-source"
+		( cat() { if [ "$1" = "$WAL/$failed_read" ]; then command cat "$@"; return 87; else command cat "$@"; fi; }
+			if exit_archive_retire; then exit 1; fi )
+		[ -d "$retire_record" ]
+	done
+	for interrupted in before-rename after-rename; do
+		archive_fixture
+		[ "$interrupted" != after-rename ] || mv "$retire_record" "$TX/retired-$archive_token"
+		( find() { command find "$@"; return 87; }; if exit_archive_retire; then exit 1; fi )
+		[ -d "$retire_record" ] || [ -d "$TX/retired-$archive_token" ] || exit 1
+	done
+	archive_fixture
+	# Repeated failed durability gates must never reach rm, including re-entry
+	# after the first rename succeeded but its sync did not.
+	(
+		sync() { return 1; }
+		rm() { : >"$tmp/retire-rm-called"; return 87; }
+		if exit_archive_retire; then exit 1; fi
+		[ ! -e "$tmp/retire-rm-called" ]
+		if exit_archive_retire; then exit 1; fi
+		[ ! -e "$tmp/retire-rm-called" ]
+	)
+	[ ! -e "$retire_record" ] && [ -d "$TX/retired-$archive_token" ] || exit 1
+	rm "$TX/retired-$archive_token/fields/1/old" "$TX/retired-$archive_token/token"
+	exit_archive_retire
+	[ ! -e "$TX/retired-$archive_token" ]
+	diff -r "$WAL" "$tmp/retire-exited-before"
+	# Start with an actual partial deletion, then damage the still-required WAL
+	# counterpart. The retired directory holds the last good original authority.
+	for resume_damage in resolver-missing resolver-changed resolver-link old-missing old-changed type-changed expected-changed expected-type-changed; do
+		archive_fixture
+		printf 'original resolver restore evidence\n' >"$retire_record/origin/dns-resolver"
+		cp "$retire_record/origin/dns-resolver" "$WAL/dns-resolver"
+		cp -R "$WAL" "$tmp/partial-wal-before"
+		(
+			rm() { command rm "$TX/retired-$archive_token/fields/1/old"; return 87; }
+			if exit_archive_retire; then exit 1; fi
+		)
+		[ -d "$TX/retired-$archive_token" ]
+		[ ! -e "$TX/retired-$archive_token/fields/1/old" ]
+		case "$resume_damage" in
+			resolver-*) damaged=dns-resolver ;;
+			old-*) damaged=fields/1/old ;;
+			type-changed) damaged=fields/1/type ;;
+			expected-changed) damaged=fields/1/expected ;;
+			expected-type-changed) damaged=fields/1/expected-type ;;
+		esac
+		case "$resume_damage" in
+			*-missing) rm "$WAL/$damaged" ;;
+			resolver-link) rm "$WAL/$damaged"; ln -s "$TX/retired-$archive_token/origin/dns-resolver" "$WAL/$damaged" ;;
+			*) printf changed >"$WAL/$damaged" ;;
+		esac
+		if exit_archive_retire; then printf 'retired last good authority after %s\n' "$resume_damage" >&2; exit 1; fi
+		[ -d "$TX/retired-$archive_token" ]
+		cmp "$TX/retired-$archive_token/origin/dns-resolver" "$tmp/partial-wal-before/dns-resolver"
+		cmp "$TX/retired-$archive_token/origin/fields/1/old" "$tmp/partial-wal-before/fields/1/old"
+		rm -f "$WAL/$damaged"
+		cp "$tmp/partial-wal-before/$damaged" "$WAL/$damaged"
+		exit_archive_retire
+		[ ! -e "$TX/retired-$archive_token" ]
+		diff -r "$WAL" "$tmp/partial-wal-before"
+		rm -rf "$tmp/partial-wal-before"
+	done
+	# Legitimate stopped-policy rebases must also survive deletion of any sibling
+	# proof component. Do not require an already-deleted key/type/value to reappear.
+	for deleted_component in key expected expected-type; do
+		archive_fixture
+		printf 'smartdns.main.conf_files\n' >"$retire_record/origin/fields/1/key"
+		cp "$retire_record/origin/fields/1/key" "$WAL/fields/1/key"
+		printf /etc/smartdns/conf.d/90-routepolicy.conf >"$retire_record/origin/fields/1/expected"
+		printf list >"$retire_record/origin/fields/1/expected-type"
+		printf '%s' - >"$WAL/fields/1/expected"; printf '0\n' >"$WAL/fields/1/expected-type"
+		(
+			rm() { command rm "$TX/retired-$archive_token/origin/fields/1/$deleted_component"; return 87; }
+			if exit_archive_retire; then exit 1; fi
+		)
+		[ ! -e "$TX/retired-$archive_token/origin/fields/1/$deleted_component" ]
+		exit_archive_retire
+		[ ! -e "$TX/retired-$archive_token" ]
+	done
+	archive_fixture
+	printf 'rolled_back\n' >"$WAL/phase"
+	cp "$WAL/retire-active" "$TX/active"; cp "$TX/active" "$TX/source"
+	( sync() { return 1; }; if exit_finish; then exit 1; fi )
+	[ -d "$retire_record" ] && [ -f "$TX/active" ] || exit 1
+	( phase() { printf 'exited\n' >"$WAL/phase"; return 1; }; if exit_finish; then exit 1; fi )
+	[ -d "$retire_record" ] && [ ! -e "$TX/active" ] || exit 1
+	exit_archive_retire
+	[ ! -e "$retire_record" ]
+	archive_fixture
+	rm "$WAL/retire-active" "$WAL/retire-source"
+	printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$TX/exit-review/token"
+	exit_archive_retire; [ -d "$retire_record" ]
+	cp "$WAL/token" "$TX/exit-review/token"
+	mkdir "$TX/confirmed/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	printf foreign >"$TX/confirmed/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/user.keep"
+	exit_archive_retire
+	[ ! -e "$retire_record" ] && [ -f "$TX/confirmed/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/user.keep" ] || exit 1
+	# Exited describes network state; background completion still needs its result.
+	(
+		# job_status is sourced above and consumes these globals through this stub.
+		# shellcheck disable=SC2034
+		job_current() { job_kind='exit'; job_token=$(cat "$WAL/token"); }
+		job_running() { return 1; }
+		job_error_detail() { printf 'retirement failed'; }
+		printf '%s failed\n' "$(cat "$WAL/token")" >"$TX/job-result"
+		job_status >"$tmp/retire-job-status"
+		grep -Fq '"state":"failed"' "$tmp/retire-job-status"
+		grep -Fq '网络已退出' "$tmp/retire-job-status"
+		grep -Fq 'retirement failed' "$tmp/retire-job-status"
+		rm "$TX/job-result"
+		job_running() { return 0; }
+		job_status >"$tmp/retire-job-status"
+		grep -Fq '"state":"running"' "$tmp/retire-job-status"
+		job_running() { return 1; }
+		printf '%s failed\n' "$(cat "$WAL/token")" >"$TX/job-result.new"
+		job_status >"$tmp/retire-job-status"
+		grep -Fq '"state":"failed"' "$tmp/retire-job-status"
+		grep -Fq '网络已退出' "$tmp/retire-job-status"
+		printf '%s done\n' "$(cat "$WAL/token")" >"$TX/job-result"
+		job_status >"$tmp/retire-job-status"
+		grep -Fq '"state":"done","error":""' "$tmp/retire-job-status"
+	)
+	printf '%s\n' 'exited archive retirement: passed (exact binding, immutable recovery evidence, zero directory allocation, alias boundaries, unknown entries, read/traversal failures and interrupted cleanup)'
+	# Keep the real dispatch, FD9 gate and boot coordinator; replace only native effects.
+	mkdir "$tmp/cold-lib"
+	cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$tmp/cold-lib/"
+	cp "$tmp/transaction-functions" "$tmp/cold-entry"
+	cat >>"$tmp/cold-entry" <<'EOF'
+rp_config_admit() { :; }
+load_args() { :; }
+uci_layout() { :; }
+no_pending() { [ ! -e "$TEST_DNS_TMP/cold-staged" ]; }
+rp_uci_get() { [ "$*" = 'main enabled 0' ] && printf '1\n'; }
+init_dns_managed() { rp_writer_owned && [ "$ROUTEPOLICY_WRITER_KIND" = init ]; }
+init_dns_managed_admit() { init_dns_managed; }
+init_resolver_required() { :; }
+init_resolver_prepare() { [ "$1" = boot ]; }
+init_resolver_origin() { :; }
+init_dns_stop() { :; }
+uci_committed() { [ "$*" = 'get routepolicy.main.enabled' ] && printf '1\n'; }
+init_dns_policy_adapter() { return 1; }
+rp_smartdns_set_registration() { :; }
+policy_verify_runtime() { [ -f "$TEST_DNS_TMP/cold-policy-ready" ]; }
+init_dns_call() {
+    if [ "$1:$2" = smartdns:start ]; then
+        [ -f "$TEST_DNS_TMP/cold-policy-ready" ] || return 1
+        printf 'dns-start\n' >>"$TEST_DNS_TMP/cold-trace"
+    fi
+}
+init_resolver_install() {
+    printf 'resolver-install\n' >>"$TEST_DNS_TMP/cold-trace"
+    : >"$TEST_DNS_TMP/cold-resolver-ready"
+}
+init_dns_coordinate() {
+    case "$1" in
+        quarantine-boot)
+            ! rp_smartdns_package_pending && rp_writer_owned || return 1
+            printf 'quarantine\n' >>"$TEST_DNS_TMP/cold-trace" ;;
+        verify)
+            [ -f "$TEST_DNS_TMP/cold-resolver-ready" ] || return 1
+            printf 'dns-verify\n' >>"$TEST_DNS_TMP/cold-trace" ;;
+        *) return 1 ;;
+    esac
+}
+status_json() { :; }
+sync() { :; }
+EOF
+	awk 'found || /^operation=/ {found=1; print}' "$REAL_LIB/init-transaction" >>"$tmp/cold-entry"
+	cat >"$tmp/cold-lib/apply" <<'EOF'
+#!/bin/sh
+set -eu
+. "$ROUTEPOLICY_LIBEXEC/common"
+if [ -z "${ROUTEPOLICY_WRITER_OWNER:-}" ]; then
+    rp_writer_enter apply
+    printf 'watch-apply\n' >>"$TEST_DNS_TMP/cold-trace"
+    if [ "${1:-}" = reconcile-event ]; then
+        rp_writer_event_take || exit 0
+        rp_writer_event_done
+    fi
+    exit 0
+fi
+rp_writer_owned
+[ "$ROUTEPOLICY_WRITER_KIND:$ROUTEPOLICY_DNS_DEFER" = init:1 ]
+[ ! -e "$TEST_DNS_TMP/cold-policy-fail" ] || exit 1
+printf 'policy\n' >>"$TEST_DNS_TMP/cold-trace"
+: >"$TEST_DNS_TMP/cold-policy-ready"
+EOF
+	cat >"$tmp/cold-lib/smartdns-package" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1" = package-recover ] || [ "$1" = package-recover-early ]
+[ ! -e "$TEST_DNS_TMP/cold-conflict" ] || exit 1
+rm -rf "$ROUTEPOLICY_ROOT/etc/routepolicy/state/smartdns-package/current"
+printf 'package-clear\n' >>"$TEST_DNS_TMP/cold-trace"
+EOF
+	mkdir -p "$tmp/cold-bin" "$RP_ROOT/etc/init.d"
+	cat >"$tmp/cold-bin/ubus" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$*" = 'call service delete {"name":"routepolicy-initguard","instance":"guard"}' ]
+printf 'guard-stop\n' >>"$TEST_DNS_TMP/cold-trace"
+EOF
+	cat >"$RP_ROOT/etc/init.d/routepolicy" <<'EOF'
+#!/bin/sh
+set -eu
+# Keep the actual init preamble/start_service and model rc.common's lock order.
+case "$*" in start|boot|stop) ;; *) exit 1 ;; esac
+[ -z "${ROUTEPOLICY_WRITER_OWNER:-}" ] && [ -z "${ROUTEPOLICY_WRITER_KIND:-}" ]
+(exec 9>"$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/lock"; flock -n 9)
+action=$1
+shift
+ROUTEPOLICY_INIT_TRANSACTION="$TEST_DNS_TMP/cold-entry"
+ROUTEPOLICY_CTL="$ROUTEPOLICY_LIBEXEC/apply"
+ROUTEPOLICY_APPLY="$ROUTEPOLICY_LIBEXEC/apply"
+config_load() { :; }
+config_get_bool() { enabled=1; }
+procd_open_instance() { :; }
+procd_set_param() { :; }
+procd_close_instance() {
+    printf 'watch-register\n' >>"$TEST_DNS_TMP/cold-trace"
+    : >"$TEST_DNS_TMP/cold-watch-running"
+}
+. "$TEST_DNS_REAL_INIT"
+exec 8>"$TEST_DNS_TMP/cold-procd-lock"
+flock -n 8
+if [ "$action" = stop ]; then
+    stop_service
+    rm -f "$TEST_DNS_TMP/cold-watch-running"
+else start_service; fi
+EOF
+	chmod +x "$tmp/cold-bin/ubus" "$RP_ROOT/etc/init.d/routepolicy"
+	PATH="$tmp/cold-bin:$PATH"; export PATH
+	chmod +x "$tmp/cold-entry" "$tmp/cold-lib/apply" "$tmp/cold-lib/smartdns-package"
+	cold_entry() { ROUTEPOLICY_LIBEXEC="$tmp/cold-lib" "$tmp/cold-entry" "$@"; }
+	cold_reset() {
+		retire_reset
+		mkdir -p "$RP_ROOT/proc/sys/kernel/random"
+		printf '11111111-1111-1111-1111-111111111111\n' >"$WAL/boot-id"
+		cp "$WAL/boot-id" "$retire_record/boot-id"
+		printf '22222222-2222-2222-2222-222222222222\n' >"$RP_ROOT/proc/sys/kernel/random/boot_id"
+		rm -f "$tmp/cold-policy-ready" "$tmp/cold-resolver-ready" "$tmp/cold-policy-fail" "$tmp/cold-conflict"
+		rm -f "$tmp/cold-watch-running" "$tmp/cold-staged"
+		: >"$tmp/cold-trace"
+	}
+	cold_assert_order() {
+		[ "$(grep -E '^(policy|dns-start|resolver-install|dns-verify)$' "$tmp/cold-trace")" = "$(printf 'policy\ndns-start\nresolver-install\ndns-verify')" ]
+		cmp "$retire_record/dns-boot-ready" "$RP_ROOT/proc/sys/kernel/random/boot_id"
+		[ ! -e "$retire_record/dns-boot-pending" ]
+	}
+	cold_reset
+	mkdir -p "$RP_SMARTDNS_PACKAGE_STATE/current"
+	: >"$tmp/cold-conflict"
+	if cold_entry recover-early >"$tmp/cold-error" 2>&1; then exit 1; fi
+	[ ! -e "$retire_record/dns-boot-pending" ] && [ ! -e "$retire_record/dns-boot-ready" ]
+	# Until package recovery clears current, normal init admission remains closed.
+	if cold_entry boot-dns >"$tmp/cold-error" 2>&1; then exit 1; fi
+	if cold_entry recover-startup >"$tmp/cold-error" 2>&1; then exit 1; fi
+	[ ! -s "$tmp/cold-trace" ]
+	# Real S95 preamble/start_service registers watch without taking the busy
+	# init lock or applying policy; ordinary start still cannot bypass the gate.
+	(
+		exec 9>"$TX/lock"; flock -n 9
+		[ "$(cold_entry recover-startup boot)" = boot-policy-coordinated ]
+	)
+	ROUTEPOLICY_LIBEXEC="$tmp/cold-lib" "$RP_ROOT/etc/init.d/routepolicy" boot
+	[ "$(cat "$tmp/cold-trace")" = watch-register ]
+	[ -f "$tmp/cold-watch-running" ]
+	[ ! -e "$retire_record/dns-boot-pending" ] && [ ! -e "$retire_record/dns-boot-ready" ]
+	rm "$tmp/cold-conflict"
+	cold_entry guard
+	cold_assert_order
+	[ ! -e "$RP_SMARTDNS_PACKAGE_STATE/current" ]
+	[ -f "$tmp/cold-watch-running" ]
+	[ "$(grep -c '^watch-register$' "$tmp/cold-trace")" = 1 ]
+	# A user's normal stop must remain stopped when hotplug wakes the guard.
+	ROUTEPOLICY_LIBEXEC="$tmp/cold-lib" "$RP_ROOT/etc/init.d/routepolicy" stop
+	[ ! -e "$tmp/cold-watch-running" ]
+	: >"$tmp/cold-trace"
+	: >"$RP_RUN_DIR/events.pending"
+	cold_entry guard
+	[ ! -e "$tmp/cold-watch-running" ] && [ ! -e "$RP_RUN_DIR/events.pending" ]
+	if grep -Fxq watch-register "$tmp/cold-trace"; then exit 1; fi
+	if cold_entry guard-needed; then exit 1; fi
+	# Drive the real watch loop across package WAL, its cleanup gap, DNS pending,
+	# and ready. Business stand-ins record even an attempted invocation so the
+	# test cannot pass merely because the ordinary writer gate refused it later.
+	mkdir "$tmp/cold-watch-lib" "$tmp/cold-watch-bin"
+	cp "$REAL_LIB/common" "$tmp/cold-watch-lib/common"
+	cat >>"$tmp/cold-watch-lib/common" <<'EOF'
+rp_uci_get() { case "$2" in enabled|auto_update) printf 1 ;; *) printf 0 ;; esac; }
+rp_schedule_due() { return 0; }
+EOF
+	cat >"$tmp/cold-watch-lib/init-transaction" <<'EOF'
+#!/bin/sh
+exec env ROUTEPOLICY_LIBEXEC="$TEST_DNS_TMP/cold-lib" "$TEST_DNS_TMP/cold-entry" "$@"
+EOF
+	cat >"$tmp/cold-watch-lib/apply" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'event\n' >>"$TEST_DNS_TMP/cold-watch-business"
+[ "$*" = reconcile-event ] && [ -f "$TEST_DNS_TMP/cold-watch-ready" ]
+rm "$ROUTEPOLICY_ROOT/tmp/routepolicy/events.pending"
+EOF
+	cat >"$tmp/cold-watch-lib/update" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'download\n' >>"$TEST_DNS_TMP/cold-watch-business"
+[ "$*" = scheduled ] && [ -f "$TEST_DNS_TMP/cold-watch-ready" ]
+date +%Y-%m-%d >"$ROUTEPOLICY_ROOT/etc/routepolicy/state/last-update-attempt-day"
+EOF
+	cat >"$tmp/cold-watch-bin/sleep" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$*" = 30 ]
+step=$(cat "$TEST_DNS_TMP/cold-watch-step"); step=$((step+1))
+printf '%s\n' "$step" >"$TEST_DNS_TMP/cold-watch-step"
+if [ "$step" -le 3 ]; then
+    [ ! -s "$TEST_DNS_TMP/cold-watch-business" ]
+    [ -f "$ROUTEPOLICY_ROOT/tmp/routepolicy/events.pending" ]
+    [ ! -e "$ROUTEPOLICY_ROOT/etc/routepolicy/state/last-update-attempt-day" ]
+    [ -f "$TEST_DNS_TMP/cold-staged" ]
+fi
+case "$step" in
+    1) rm -rf "$ROUTEPOLICY_ROOT/etc/routepolicy/state/smartdns-package/current" ;;
+    2) cp "$ROUTEPOLICY_ROOT/proc/sys/kernel/random/boot_id" "$TEST_COLD_RECORD/dns-boot-pending" ;;
+    3)
+        cp "$TEST_COLD_RECORD/dns-boot-pending" "$TEST_COLD_RECORD/dns-boot-ready"
+        rm "$TEST_COLD_RECORD/dns-boot-pending" "$TEST_DNS_TMP/cold-staged"
+        : >"$TEST_DNS_TMP/cold-watch-ready" ;;
+    4)
+        [ "$(cat "$TEST_DNS_TMP/cold-watch-business")" = "$(printf 'event\ndownload')" ]
+        [ ! -e "$ROUTEPOLICY_ROOT/tmp/routepolicy/events.pending" ]
+        [ -s "$ROUTEPOLICY_ROOT/etc/routepolicy/state/last-update-attempt-day" ]
+        : >"$TEST_DNS_TMP/cold-watch-complete"
+        exit 1 ;;
+    *) exit 1 ;;
+esac
+EOF
+	chmod +x "$tmp/cold-watch-lib/"* "$tmp/cold-watch-bin/sleep"
+	cold_reset
+	mkdir -p "$RP_SMARTDNS_PACKAGE_STATE/current"
+	: >"$RP_RUN_DIR/events.pending"; : >"$tmp/cold-staged"
+	printf '0\n' >"$tmp/cold-watch-step"
+	TEST_COLD_RECORD="$retire_record" PATH="$tmp/cold-watch-bin:$PATH" \
+		ROUTEPOLICY_LIBEXEC="$tmp/cold-watch-lib" "$REAL_LIB/watch"
+	[ -f "$tmp/cold-watch-complete" ] && [ "$(cat "$tmp/cold-watch-step")" = 4 ]
+	# Only the cold managed boot handoff may register through a package WAL.
+	cold_reset
+	mkdir -p "$RP_SMARTDNS_PACKAGE_STATE/current"
+	cp "$RP_ROOT/proc/sys/kernel/random/boot_id" "$retire_record/boot-id"
+	if cold_entry recover-startup boot >"$tmp/cold-error" 2>&1; then exit 1; fi
+	rm "$TX/active"
+	if cold_entry recover-startup boot >"$tmp/cold-error" 2>&1; then exit 1; fi
+	rm -rf "$RP_SMARTDNS_PACKAGE_STATE/current"
+	# Model a killed guard after package cleanup but before publishing DNS pending.
+	cold_reset
+	cold_entry guard-needed
+	cold_entry boot-pending
+	cold_entry guard
+	cold_assert_order
+	# S95 also derives the missing handoff, and a failed policy never starts DNS.
+	cold_reset
+	[ "$(cold_entry recover-startup boot)" = boot-policy-coordinated ]
+	[ -f "$retire_record/dns-boot-pending" ]
+	: >"$tmp/cold-policy-fail"
+	if cold_entry boot-dns >"$tmp/cold-error" 2>&1; then exit 1; fi
+	if grep -Fqx dns-start "$tmp/cold-trace"; then exit 1; fi
+	[ -f "$retire_record/dns-boot-pending" ]
+	rm "$tmp/cold-policy-fail"
+	cold_entry guard
+	cold_assert_order
+	: >"$tmp/cold-trace"
+	if cold_entry guard-needed || cold_entry boot-pending; then exit 1; fi
+	cold_entry boot-dns
+	[ ! -s "$tmp/cold-trace" ]
+	cold_reset
+	cp "$RP_ROOT/proc/sys/kernel/random/boot_id" "$WAL/boot-id"
+	cp "$WAL/boot-id" "$retire_record/boot-id"
+	if cold_entry guard-needed || cold_entry boot-pending; then exit 1; fi
+	cold_entry boot-dns
+	[ ! -s "$tmp/cold-trace" ]
+	rm -rf "$TX"
+	printf '%s\n' 'cold package reentry: passed (early failure, real gate, S95 watch-only admission, boot wait without consumption, manual stop, lost wakeup, policy before DNS and same-boot no-op)'
+)
+[ ! -e "$tmp/root/tmp" ]
+case "${1:-}" in --confirmed-fields|--cold-reentry) exit 0 ;; esac
+
 if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
 	cat >"$tmp/bin/native-uci" <<'EOF'
 #!/bin/sh
@@ -121,6 +800,13 @@ EOF
 cat >"$tmp/bin/sync" <<'EOF'
 #!/bin/sh
 wal="$ROUTEPOLICY_ROOT/etc/routepolicy/state/init-transaction/current"
+if [ -f "$TEST_DNS_TMP/retire-final-sync-fail" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = exited ]; then
+	retired_token=$(cat "$TEST_DNS_TMP/retire-final-sync-fail") || exit 1
+	if [ ! -e "${wal%/current}/confirmed/$retired_token" ] && [ ! -e "${wal%/current}/retired-$retired_token" ]; then
+		printf 'after-retirement\n' >>"$TEST_DNS_TMP/retire-final-sync-reached"
+		exit 87
+	fi
+fi
 if [ -f "$TEST_DNS_TMP/kill-confirm" ] && [ "$(cat "$wal/phase" 2>/dev/null)" = confirming ]; then
 	point=$(cat "$TEST_DNS_TMP/kill-confirm")
 	if [ "$point" = intent ] || { [ "$point" = pointer ] && [ "$(cat "${wal%/current}/active" 2>/dev/null)" = "$(cat "$wal/token")" ]; }; then
@@ -485,6 +1171,7 @@ EOF
 cp "$tmp/root/etc/init.d/network" "$tmp/root/usr/sbin/smartdns"
 chmod +x "$tmp/bin/"* "$tmp/lib/"* "$tmp/root/etc/init.d/"* "$tmp/root/usr/sbin/smartdns"
 export PATH="$tmp/bin:$PATH"
+[ "$(init_dns_service_state routepolicy-initguard)" = 1 ]
 TX="$tmp/lib/init-transaction"
 canonical() {
 	exported=$(native-uci -c "$tmp/root/etc/config" export "$1") || return 1
@@ -539,6 +1226,31 @@ confirm_dns() {
 	"$TX" apply "$token" >/dev/null
 	if ! SSH_CONNECTION='198.51.100.9 1234 192.0.2.1 22' "$TX" confirm "$token" >"$tmp/confirm-result"; then cat "$tmp/confirm-result" >&2; return 1; fi
 }
+exited_origin_preserved() (
+	# exit_apply flattens origin into current. Its expected values and current
+	# DNS snapshots may be rebased for an explicitly stopped policy; the original
+	# values, types and service/file restore evidence must remain byte-for-byte.
+	saved=$1; exited="$RP_STATE_DIR/init-transaction/current"
+	for item in schema count policy-active smartdns-enabled smartdns-running dnsmasq-enabled dnsmasq-running routepolicy-enabled smartdns-listeners dnsmasq-listeners dns-file-old dns-file-absent dns90-old dns90-absent; do
+		[ ! -e "$saved/$item" ] || cmp "$saved/$item" "$exited/$item"
+	done
+	if [ -e "$saved/dns-resolver" ] || [ -L "$saved/dns-resolver" ]; then
+		[ -f "$exited/dns-resolver" ] && [ ! -L "$exited/dns-resolver" ] || exit 1
+		cmp "$saved/dns-resolver" "$exited/dns-resolver"
+	else [ ! -e "$exited/dns-resolver" ] && [ ! -L "$exited/dns-resolver" ] || exit 1; fi
+	row=0; count=$(cat "$saved/count")
+	while [ "$row" -lt "$count" ]; do
+		row=$((row+1))
+		for item in key existed old type attempted; do cmp "$saved/fields/$row/$item" "$exited/fields/$row/$item"; done
+		if ! cmp -s "$saved/fields/$row/expected" "$exited/fields/$row/expected" ||
+			! cmp -s "$saved/fields/$row/expected-type" "$exited/fields/$row/expected-type"; then
+			key=$(cat "$saved/fields/$row/key")
+			case "$key" in routepolicy.main.enabled|smartdns.*.conf_files) ;; *) exit 1 ;; esac
+			[ "$(cat "$exited/fields/$row/expected-type")" = "$(awk -F '\t' -v key="$key" '$1==key{print $2}' "$RP_STATE_DIR/init-transaction/exit-review/baseline")" ]
+			[ "$(cat "$exited/fields/$row/expected")" = "$(awk -F '\t' -v key="$key" '$1==key{print $3}' "$RP_STATE_DIR/init-transaction/exit-review/baseline")" ]
+		fi
+	done
+)
 test_boot() {
 	test_boot_sequence=$(( ${test_boot_sequence:-10} + 1 ))
 	printf '00000000-0000-4000-8000-%012d\n' "$test_boot_sequence" >"$tmp/root/proc/sys/kernel/random/boot_id"
@@ -604,6 +1316,10 @@ SH
 #!/bin/sh
 rc=0
 if [ "$1" = recover-startup ]; then printf '%s\n' "$PPID" >"$TEST_DNS_TMP/boot-rc-pid"; fi
+if [ "$1" = boot-policy-enabled ]; then
+    pid=$(cat "$TEST_DNS_TMP/boot-rc-pid") || exit 96
+    [ ! -e "/proc/$pid/fd/1000" ] || exit 97
+fi
 if [ "$1:${2:-}" != recover-startup:boot ]; then
 	"$TEST_BOOT_TX" "$@" || rc=$?
 	printf '%s %s\n' "$1" "$rc" >>"$TEST_DNS_TMP/boot-tx-trace"
@@ -691,6 +1407,57 @@ SH
 		done
 	}
 	boot_link="$rc_root/etc/rc.d/S95routepolicy"
+	# S18 can fail on the package WAL before writing DNS pending. Native S95
+	# must register exactly one waiting watcher, without recovery/apply writes.
+	cp "$ready" "$tmp/package-boot-ready"
+	rm "$ready"
+	mkdir -p "$RP_SMARTDNS_PACKAGE_STATE/current"
+	mkdir "$tmp/boot-read-tmp"
+	for committed_enabled in 1 0; do
+		uci set "routepolicy.main.enabled=$committed_enabled"; uci commit routepolicy
+		staged_enabled=$((1-committed_enabled))
+		uci set "routepolicy.main.enabled=$staged_enabled"
+		cp "$tmp/external/routepolicy" "$tmp/boot-delta-before"
+		cp -R "$RP_ROOT/etc/config" "$tmp/boot-config-before"
+		TMPDIR="$tmp/boot-read-tmp" run_boot_entry "$boot_link" boot
+		if [ "$committed_enabled" = 1 ]; then check_watcher
+		elif jsonfilter -i "$tmp/boot-procd" -e '@.instances.*.command[0]' | grep -Fxq "$tmp/watch"; then exit 1; fi
+		[ "$(cat "$tmp/boot-recovery-result")" = boot-policy-coordinated ] &&
+			[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] && [ ! -s "$tmp/boot-coordinator-apply" ]
+		grep -Fxq 'boot-policy-enabled 0' "$tmp/boot-tx-trace"
+		[ -d "$RP_SMARTDNS_PACKAGE_STATE/current" ] &&
+			[ ! -e "$active/dns-boot-pending" ] && [ ! -e "$ready" ]
+		cmp "$tmp/external/routepolicy" "$tmp/boot-delta-before"
+		diff -r "$RP_ROOT/etc/config" "$tmp/boot-config-before"
+		[ -z "$(find "$tmp/boot-read-tmp" -mindepth 1 -print)" ]
+		# The ordinary start/restart path still fails its package admission;
+		# it must not invoke the new read-only cold handoff or register watch.
+		for action in start restart; do
+			if run_boot_entry "$TEST_DNS_REAL_INIT" "$action"; then exit 1; fi
+			[ ! -s "$tmp/boot-procd" ] && [ ! -s "$tmp/boot-apply" ]
+			if grep -q '^boot-policy-enabled ' "$tmp/boot-tx-trace"; then exit 1; fi
+			cmp "$tmp/external/routepolicy" "$tmp/boot-delta-before"
+		done
+		rm -rf "$tmp/boot-config-before"
+		uci revert routepolicy.main.enabled
+	done
+	# Malformed or unreadable committed state fails before procd, and every
+	# ephemeral alias namespace is removed on failure as well as success.
+	for invalid_enabled in invalid missing; do
+		if [ "$invalid_enabled" = missing ]; then uci delete routepolicy.main.enabled
+		else uci set routepolicy.main.enabled=invalid; fi
+		uci commit routepolicy
+		if TMPDIR="$tmp/boot-read-tmp" run_boot_entry "$boot_link" boot; then exit 1; fi
+		[ ! -s "$tmp/boot-procd" ] && [ ! -s "$tmp/boot-apply" ]
+		grep -Fxq 'boot-policy-enabled 1' "$tmp/boot-tx-trace"
+		[ -z "$(find "$tmp/boot-read-tmp" -mindepth 1 -print)" ]
+	done
+	if TMPDIR="$tmp/boot-read-tmp" "$TX" boot-policy-enabled extra >/dev/null 2>&1; then exit 1; fi
+	[ -z "$(find "$tmp/boot-read-tmp" -mindepth 1 -print)" ]
+	uci set routepolicy.main.enabled=1; uci commit routepolicy
+	rmdir "$RP_SMARTDNS_PACKAGE_STATE/current"
+	mv "$tmp/package-boot-ready" "$ready"
+	printf '%s\n' 'cold boot: committed enabled controls waiting watcher despite either staged value; no apply/config/delta writes, failed reads reject, ordinary start/restart unchanged'
 	run_contended_boot() {
 		for marker in before-held recovery-wait lock-window lock-held lock-release procd-lock; do rm -f "$tmp/boot-$marker"; done
 		(
@@ -753,6 +1520,7 @@ SH
 	done
 	if "$TX" recover-startup boot extra >/dev/null || "$TX" recover-startup invalid >/dev/null || "$TX" recover boot >/dev/null; then exit 1; fi
 	for edge in missing-ready old-ready malformed-ready ready-link pending-link same-boot disabled legacy; do
+		expected_boot_result=boot-policy-deferred
 		case "$edge" in
 			missing-ready) rm "$ready" ;;
 			old-ready) cp "$tmp/old-boot" "$ready" ;;
@@ -763,10 +1531,14 @@ SH
 			disabled) uci set routepolicy.main.enabled=0; uci commit routepolicy ;;
 			legacy) mv "$txroot" "$tmp/boot-saved-tx" ;;
 		esac
+		case "$edge" in missing-ready|old-ready|malformed-ready|ready-link) expected_boot_result=boot-policy-coordinated ;; esac
 		: >"$tmp/boot-inner-apply"
-		[ "$("$TX" recover-startup boot)" = boot-policy-deferred ] && [ ! -s "$tmp/boot-inner-apply" ] || {
+		[ "$("$TX" recover-startup boot)" = "$expected_boot_result" ] && [ ! -s "$tmp/boot-inner-apply" ] || {
 			printf 'unexpected pre-procd apply: %s\n' "$edge" >&2; exit 1;
 		}
+		if [ "$expected_boot_result" = boot-policy-coordinated ]; then
+			[ -f "$active/dns-boot-pending" ] && [ ! -L "$active/dns-boot-pending" ]
+		fi
 		case "$edge" in
 			disabled) run_boot_entry "$rc_root/etc/rc.d/S95routepolicy" boot
 				[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] || exit 1
@@ -1038,7 +1810,8 @@ SH
 		[ "$(cat "$RP_STATE_DIR/init-transaction/current/phase")" = exited ]
 		[ ! -e "$RP_SMARTDNS_FILE" ] && [ ! -e "$RP_SMARTDNS_EXTRA_FILE" ]
 		grep -Fxq '203.0.114.30 firmware-local.lab19.test' "$RP_LOCAL_HOSTS"
-		diff -r "$active/origin" "$tmp/managed-origin-$managed_case"
+		exited_origin_preserved "$tmp/managed-origin-$managed_case"
+		[ ! -e "$active" ]
 	done
 	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
 	uci add_list 'smartdns.@smartdns[0].conf_files=/etc/smartdns/conf.d/90-routepolicy.conf'
@@ -1432,18 +2205,56 @@ SH
 		if [ "$original_file" = 1 ]; then cmp "$RP_SMARTDNS_FILE" "$tmp/original90"
 		else [ ! -e "$RP_SMARTDNS_FILE" ]; fi
 		for package in network dhcp smartdns routepolicy firewall; do canonical "$package" >"$tmp/$package.after"; cmp "$tmp/$package.before" "$tmp/$package.after"; done
-		diff -r "$active/origin" "$tmp/origin-disabled-$disabled_case"
+		exited_origin_preserved "$tmp/origin-disabled-$disabled_case"
+		[ ! -e "$active" ]
 	done
 	printf '%s\n' 'disabled exit: passed (native teardown, original policy/file, foreign edits/runtime, private-stage and cold recovery)'
 	exit 0
 fi
 if [ "${1:-}" = --exit-archive ]; then
-	for archive_case in sameboot reboot conflict; do
+	TEST_RETIRE_MV=$(command -v mv); export TEST_RETIRE_MV
+	cat >"$tmp/bin/mv" <<'SH'
+#!/bin/sh
+set -eu
+if [ -f "$TEST_DNS_TMP/resolver-publish-fault" ]; then
+	mode=$(cat "$TEST_DNS_TMP/resolver-publish-fault")
+	case "$mode:$1" in
+		record:*/resolver-record.??????|origin:*/origin/resolver-origin.??????|file:*/dns-resolver-file-attempted.new|link:*/dns-resolver-link-attempted.new)
+			printf '%s\n' "$1" >"$TEST_DNS_TMP/resolver-unpublished"
+			kill -KILL "$PPID"
+			exit 87 ;;
+	esac
+fi
+exec "$TEST_RETIRE_MV" "$@"
+SH
+	chmod +x "$tmp/bin/mv"
+	for archive_case in sameboot reboot resolver-retry conflict; do
 		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
 		txroot="$RP_STATE_DIR/init-transaction"
 		rm -rf "$txroot/current"
 		if [ "$archive_case" = reboot ]; then test_boot; "$TX" recover-early >/dev/null; "$TX" boot-dns >/dev/null; fi
-		origin="$txroot/confirmed/$(cat "$txroot/active")/origin"
+		if [ "$archive_case" = resolver-retry ]; then
+			test_boot; "$TX" recover-early >/dev/null
+			# Kill the actual producer's shell immediately before each mv.
+			# Record/origin leftovers survive retry; attempted.new is overwritten.
+			for publish_fault in record origin file link; do
+				printf '%s\n' "$publish_fault" >"$tmp/resolver-publish-fault"
+				rm -f "$tmp/resolver-unpublished"
+				if "$TX" boot-dns >"$tmp/resolver-publish-error" 2>&1; then exit 1; fi
+				[ -s "$tmp/resolver-unpublished" ]
+				unpublished=$(cat "$tmp/resolver-unpublished")
+				[ -f "$unpublished" ]
+				[ ! -L "$unpublished" ]
+				case "$publish_fault" in record) record_leftover=$unpublished ;; origin) origin_leftover=$unpublished ;; esac
+			done
+			rm "$tmp/resolver-publish-fault"
+			"$TX" boot-dns >/dev/null
+			[ -f "$record_leftover" ]
+			[ -f "$origin_leftover" ]
+			[ ! -e "$unpublished" ]
+		fi
+		archive_token=$(cat "$txroot/active")
+		origin="$txroot/confirmed/$archive_token/origin"
 		cp -R "$origin" "$tmp/origin-$archive_case"
 		"$TX" exit-preview >"$tmp/archive-preview"; [ ! -e "$txroot/current" ]
 		output=$("$TX" exit-prepare); [ ! -e "$txroot/current" ]
@@ -1453,17 +2264,167 @@ if [ "${1:-}" = --exit-archive ]; then
 			cp "$RP_SMARTDNS_UCI" "$tmp/archive-conflict.before"
 			if "$TX" exit-apply "$exit_token" >"$tmp/archive-conflict" 2>&1; then printf 'archive exit overwrote unknown child\n' >&2; exit 1; fi
 			cmp "$RP_SMARTDNS_UCI" "$tmp/archive-conflict.before"
-			[ ! -e "$txroot/current" ] && [ -f "$txroot/active" ]
+			[ ! -e "$txroot/current" ] && [ -f "$txroot/active" ] || exit 1
+			[ -d "$txroot/confirmed/$archive_token" ]
 			diff -r "$origin" "$tmp/origin-$archive_case"
 			continue
 		fi
 		"$TX" exit-apply "$exit_token" >"$tmp/archive-exit"
-		[ "$(cat "$txroot/current/phase")" = exited ] && [ "$(cat "$txroot/current/kind")" = exit ]
+		[ "$(cat "$txroot/current/phase")" = exited ] && [ "$(cat "$txroot/current/kind")" = exit ] || exit 1
 		[ ! -e "$txroot/active" ]; [ ! -f "$tmp/policy-running" ]
 		[ "$(cat "$tmp/svc/dnsmasq.running")$(cat "$tmp/svc/dnsmasq.enabled")" = 11 ]
-		diff -r "$origin" "$tmp/origin-$archive_case"
+		# The finished exit retires its own archive; the recovery journal itself stays.
+		[ ! -e "$txroot/confirmed/$archive_token" ] && [ ! -e "$txroot/retired-$archive_token" ] || exit 1
+		exited_origin_preserved "$tmp/origin-$archive_case"
+		if [ "$archive_case" = resolver-retry ]; then
+			[ ! -e "$record_leftover" ]
+			[ ! -e "$origin_leftover" ]
+			prepare_dns 192.0.2.53; confirm_dns
+			[ "$(ls "$txroot/confirmed" | wc -l)" = 1 ]
+		fi
 	done
-	printf '%s\n' 'confirmed-only exit: passed (no current, same/new boot, preview/prepare create no current, real exit, unknown child preserved)'
+	rm "$tmp/bin/mv"
+	# Retire both exact pointers when reconfiguration has separated source/active.
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	source_token=$(cat "$txroot/source")
+	prepare_dns 192.0.2.53; confirm_dns
+	active_token=$(cat "$txroot/active")
+	[ "$source_token" != "$active_token" ] && [ "$(cat "$txroot/source")" = "$source_token" ] || exit 1
+	"$TX" exit-prepare >/dev/null
+	printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$txroot/source"
+	cp -R "$RP_ROOT/etc/config" "$tmp/source-bind-before"
+	if "$TX" exit-apply "$(cat "$txroot/exit-review/token")" >"$tmp/source-bind-error" 2>&1; then exit 1; fi
+	[ "$(cat "$txroot/current/phase")" = confirmed ] && [ "$(cat "$txroot/active")" = "$active_token" ] || exit 1
+	diff -r "$RP_ROOT/etc/config" "$tmp/source-bind-before"
+	printf '%s\n' "$source_token" >"$txroot/source"
+	"$TX" exit-apply "$(cat "$txroot/exit-review/token")" >/dev/null
+	[ "$(cat "$txroot/current/retire-active")" = "$active_token" ] && [ "$(cat "$txroot/current/retire-source")" = "$source_token" ] || exit 1
+	[ -z "$(find "$txroot/confirmed" -mindepth 1 -print)" ]
+	prepare_dns 192.0.2.53; confirm_dns
+	[ "$(ls "$txroot/confirmed" | wc -l)" = 1 ]
+	# A released-version exited WAL can bind only its retained review's active.
+	legacy_exited() {
+		baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+		legacy_token=$(cat "$txroot/active")
+		rm -rf "$tmp/legacy-archive"; cp -R "$txroot/confirmed/$legacy_token" "$tmp/legacy-archive"
+		"$TX" exit-prepare >/dev/null
+		"$TX" exit-apply "$(cat "$txroot/exit-review/token")" >/dev/null
+		[ "$(cat "$txroot/current/phase")" = exited ] && [ ! -e "$txroot/confirmed/$legacy_token" ] || exit 1
+		rm "$txroot/current/retire-active" "$txroot/current/retire-source"
+		cp -R "$tmp/legacy-archive" "$txroot/confirmed/$legacy_token"
+	}
+	legacy_exited
+	# The public prepare must preserve a matching legacy exit proof on each read
+	# failure, before allocating preparing. Removing the fault permits one retry.
+	TEST_RETIRE_CAT=$(command -v cat); export TEST_RETIRE_CAT
+	cat >"$tmp/bin/cat" <<'SH'
+#!/bin/sh
+if [ -f "$TEST_DNS_TMP/legacy-read-fault" ]; then
+	IFS= read -r fault <"$TEST_DNS_TMP/legacy-read-fault" || exit 1
+	if [ "$1" = "$fault" ]; then "$TEST_RETIRE_CAT" "$@"; exit 87; fi
+fi
+exec "$TEST_RETIRE_CAT" "$@"
+SH
+	chmod +x "$tmp/bin/cat"
+	old_exit=$(cat "$txroot/current/token")
+	for legacy_read in current/token exit-review/token exit-review/active; do
+		printf '%s\n' "$txroot/$legacy_read" >"$tmp/legacy-read-fault"
+		if prepare_dns 192.0.2.53; then exit 1; fi
+		rm "$tmp/legacy-read-fault"
+		[ "$(cat "$txroot/current/token")" = "$old_exit" ]
+		[ "$(cat "$txroot/current/phase")" = exited ]
+		[ ! -e "$txroot/preparing" ]
+		[ -d "$txroot/confirmed/$legacy_token" ]
+	done
+	rm "$tmp/bin/cat"
+	prepare_dns 192.0.2.53
+	[ ! -e "$txroot/confirmed/$legacy_token" ] && [ ! -e "$txroot/retired-$legacy_token" ] || exit 1
+	confirm_dns
+	[ "$(ls "$txroot/confirmed" | wc -l)" = 1 ]
+	legacy_exited
+	rm -rf "$txroot/exit-review"
+	prepare_dns 192.0.2.53
+	[ -d "$txroot/confirmed/$legacy_token" ]
+	# A corrupt new binding is a hard failure before preparing is allocated or
+	# the exited WAL is replaced, rather than an unproven legacy archive to skip.
+	legacy_exited
+	printf invalid >"$txroot/current/retire-active"
+	printf '%s\n' - >"$txroot/current/retire-source"
+	old_exit=$(cat "$txroot/current/token")
+	if prepare_dns 192.0.2.53; then exit 1; fi
+	[ "$(cat "$txroot/current/token")" = "$old_exit" ] && [ "$(cat "$txroot/current/phase")" = exited ] || exit 1
+	[ ! -e "$txroot/preparing" ] && [ -d "$txroot/confirmed/$legacy_token" ] || exit 1
+	# Interrupt deletion after rename and one field removal. Neither that partial
+	# tree nor an unexpected leftover may let prepare discard the exit evidence.
+	TEST_RM=$(command -v rm); export TEST_RM
+	cat >"$tmp/bin/rm" <<'SH'
+#!/bin/sh
+for argument do
+	case "$argument" in */retired-*)
+		if [ -f "$TEST_DNS_TMP/retire-rm-fail" ]; then
+			"$TEST_RM" -f "$argument/fields/1/old"
+			exit 1
+		fi ;;
+	esac
+ done
+exec "$TEST_RM" "$@"
+SH
+	chmod +x "$tmp/bin/rm"
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	fail_token=$(cat "$txroot/active")
+	"$TX" exit-prepare >/dev/null
+	: >"$tmp/retire-rm-fail"
+	exit_token=$(cat "$txroot/exit-review/token")
+	"$TX" start-exit "$exit_token" >"$tmp/retire-start-exit"
+	polls=0
+	while ! grep -q "^$exit_token " "$txroot/job-result" 2>/dev/null; do
+		polls=$((polls + 1)); [ "$polls" -lt 600 ] || { "$TX" status; exit 1; }
+		sleep 0.05
+	done
+	grep -Fxq "$exit_token failed" "$txroot/job-result"
+	"$TX" status >"$tmp/retire-failed-exit"
+	[ "$(jsonfilter -i "$tmp/retire-failed-exit" -e '@.phase')" = exited ]
+	[ "$(jsonfilter -i "$tmp/retire-failed-exit" -e '@.job.state')" = failed ]
+	grep -Fq '网络已退出' "$tmp/retire-failed-exit"
+	[ "$(cat "$txroot/current/phase")" = exited ] && [ ! -e "$txroot/active" ] || exit 1
+	[ ! -e "$txroot/confirmed/$fail_token" ] && [ -d "$txroot/retired-$fail_token" ] || exit 1
+	[ ! -e "$txroot/retired-$fail_token/fields/1/old" ]
+	old_exit=$(cat "$txroot/current/token")
+	if prepare_dns 192.0.2.53; then exit 1; fi
+	[ "$(cat "$txroot/current/token")" = "$old_exit" ] && [ ! -e "$txroot/preparing" ] || exit 1
+	rm "$tmp/retire-rm-fail"
+	printf foreign >"$txroot/retired-$fail_token/user.keep"
+	if prepare_dns 192.0.2.53; then exit 1; fi
+	[ "$(cat "$txroot/retired-$fail_token/user.keep")" = foreign ]
+	[ "$(cat "$txroot/current/token")" = "$old_exit" ] && [ ! -e "$txroot/preparing" ] || exit 1
+	rm "$txroot/retired-$fail_token/user.keep"
+	prepare_dns 192.0.2.53
+	[ ! -e "$txroot/retired-$fail_token" ]
+	confirm_dns
+	[ "$(ls "$txroot/confirmed" | wc -l)" = 1 ]
+	"$TEST_RM" -f "$tmp/bin/rm"
+	# A completed rm followed by failed sync leaves neither exact archive path.
+	# Public prepare must still settle that deletion before allocating preparing.
+	baseline 0 0 1 1; prepare_dns 192.0.2.53; confirm_dns
+	final_sync_token=$(cat "$txroot/active")
+	"$TX" exit-prepare >/dev/null
+	printf '%s\n' "$final_sync_token" >"$tmp/retire-final-sync-fail"
+	if "$TX" exit-apply "$(cat "$txroot/exit-review/token")" >"$tmp/retire-final-sync-exit" 2>&1; then exit 1; fi
+	[ "$(cat "$txroot/current/phase")" = exited ]
+	[ ! -e "$txroot/active" ]
+	[ ! -e "$txroot/confirmed/$final_sync_token" ]
+	[ ! -e "$txroot/retired-$final_sync_token" ]
+	[ "$(wc -l <"$tmp/retire-final-sync-reached")" -eq 1 ]
+	cp -pR "$txroot/current" "$tmp/retire-final-sync-wal"
+	if prepare_dns 192.0.2.53; then exit 1; fi
+	printf '%s\n' "$output" | grep -Fq '不能安全退休已退出的确认归档'
+	[ "$(wc -l <"$tmp/retire-final-sync-reached")" -eq 2 ]
+	[ ! -e "$txroot/preparing" ]
+	diff -r "$txroot/current" "$tmp/retire-final-sync-wal"
+	rm "$tmp/retire-final-sync-fail"
+	prepare_dns 192.0.2.53; confirm_dns
+	[ "$(ls "$txroot/confirmed" | wc -l)" = 1 ]
+	printf '%s\n' 'confirmed-only exit: passed (flat restore evidence, exact source/active retirement, legacy binding, no accumulation, pre-allocation rejection and interrupted cleanup)'
 	exit 0
 fi
 if [ "${1:-}" = --cache-reinit ]; then
@@ -1582,7 +2543,11 @@ SH
 			changed-config) uci set 'smartdns.@smartdns[0].cache_file=/etc/smartdns/other.cache'; uci commit smartdns ;;
 		esac
 		if prepare_dns 192.0.2.53; then printf 'accepted conflicting cache: %s\n' "$edge" >&2; exit 1; fi
-		printf '%s\n' "$output" | grep -Fq '未移动缓存'
+		if [ "$edge" = forged ]; then
+			# Retirement now rejects the damaged completed-exit proof before a
+			# fresh preparation (and its cache admission) may even be allocated.
+			printf '%s\n' "$output" | grep -Fq '不能安全退休已退出的确认归档'
+		else printf '%s\n' "$output" | grep -Fq '未移动缓存'; fi
 		[ "$(cat "$wal/phase")" = exited ]
 		case "$edge" in
 			symlink) [ -L "$cache" ]; rm "$cache"; mv "$tmp/cache-displaced" "$cache" ;;
@@ -2145,6 +3110,10 @@ if sh -c '. "$ROUTEPOLICY_LIBEXEC/common"; rp_writer_enter init || exit 1; exec 
 uci revert routepolicy; uci set routepolicy.main.enabled=1; uci commit routepolicy; printf 1 >"$tmp/svc/routepolicy.running"
 mkdir -p "$tmp/watch-lib"
 cp "$REAL_LIB/common" "$tmp/watch-lib/common"
+cat >"$tmp/watch-lib/init-transaction" <<'EOF'
+#!/bin/sh
+exec env ROUTEPOLICY_LIBEXEC="$TEST_DNS_TMP/lib" "$TEST_DNS_TMP/lib/init-transaction" "$@"
+EOF
 cat >"$tmp/watch-lib/update" <<'EOF'
 #!/bin/sh
 set -eu
@@ -2153,7 +3122,7 @@ set -eu
 rp_writer_enter update
 printf updated >"$TEST_DNS_TMP/watch-updated"
 EOF
-chmod +x "$tmp/watch-lib/update"
+chmod +x "$tmp/watch-lib/init-transaction" "$tmp/watch-lib/update"
 uci set routepolicy.main.auto_update=1; uci set routepolicy.main.update_hour=0; uci set routepolicy.main.update_minute=0; uci commit routepolicy
 watch_result=0
 (unset ROUTEPOLICY_WRITER_OWNER ROUTEPOLICY_WRITER_KIND; exec 9>&-; ROUTEPOLICY_LIBEXEC="$tmp/watch-lib" timeout -k 1 2 "$REAL_LIB/watch") || watch_result=$?

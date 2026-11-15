@@ -316,7 +316,7 @@ async function statusContract(filename) {
 	for (const expected of [
 		'RoutePolicy LuCI 版本', '0.3.1-r1', 'SmartDNS 版本', '46.1-r2',
 		'升级与启用命令', 'sysupgrade -b /tmp/before-routepolicy.tar.gz',
-		'apk add --allow-untrusted', "uci set routepolicy.main.enabled='1'"
+		'sha256sum -c SHA256SUMS', 'sh install.sh --allow-local-unsigned', "uci set routepolicy.main.enabled='1'"
 	])
 		assert.ok(nodeText(root).includes(expected), 'status page must display version or command guidance: ' + expected);
 	const validate = buttons.find(function(button) { return nodeText(button) === '验证候选配置'; });
