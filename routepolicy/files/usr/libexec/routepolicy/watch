@@ -7,6 +7,13 @@ LIBEXEC=${ROUTEPOLICY_LIBEXEC:-/usr/libexec/routepolicy}
 trap 'exit 0' TERM INT
 mkdir -p "$RP_RUN_DIR"
 while :; do
+	# S95 can register us before package recovery publishes DNS pending. The
+	# coordinator also derives that wait from the confirmed active boot identity.
+	if "$LIBEXEC/init-transaction" boot-pending >/dev/null 2>&1; then
+		sleep 30 &
+		wait $! || exit 0
+		continue
+	fi
 	if rp_writer_event_pending; then "$LIBEXEC/apply" reconcile-event >"$RP_RUN_DIR/event-reconcile.log" 2>&1 || true; fi
 	if [ "$(rp_uci_get main enabled 0)" = 1 ] && [ "$(rp_uci_get main auto_update 1)" = 1 ]; then
 		now_date=$(date +%Y-%m-%d)
