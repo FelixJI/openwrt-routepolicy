@@ -230,7 +230,8 @@ fi
 	printf '0\n{}\nextra\n' >"$wal"
 	if dnsmasq_state_matches "$wal"; then exit 1; fi
 	# A failed collection is a hard failure, never a quiet pass.
-	save_dnsmasq() { return 1; }
+	printf '0\n{}\n' >"$wal"
+	save_dnsmasq() { printf '0\n{}\n'; return 1; }
 	if dnsmasq_state_matches "$wal"; then exit 1; fi
 	# Without the declared ucode dependency comparisons fail closed.
 	save_dnsmasq() { printf '0\n%s\n' "$snapshot"; }
