@@ -12,6 +12,8 @@ operation=${1:-}; [ "$#" = 0 ] || shift
 STATE=$RP_SMARTDNS_PACKAGE_STATE
 JOURNAL=$STATE/current
 TAB=$(printf '\t')
+NL=$(printf '\nx')
+NL=${NL%x}
 
 fail() { rp_output_error "smartdns-$operation" "$*"; exit 1; }
 apk_local() { apk_indexed /dev/null "$@"; }
@@ -474,6 +476,43 @@ save_dnsmasq() {
 	printf '%s\n%s\n' "$settings" "$services"
 }
 
+dnsmasq_services_empty() {
+	# ubus answers an unloaded dnsmasq with "{}", while a native smartdns start
+	# reloads disabled dnsmasq into an empty container. Instances, unknown keys,
+	# arrays, null and broken JSON stay real state and never count as empty;
+	# json() parse failures raise and fail the whole comparison.
+	ucode -e '
+		let data = json(ARGV[0]);
+		if (type(data) != "object")
+			exit(1);
+		if (length(data) == 0)
+			exit(0);
+		if (length(data) == 1 && type(data["dnsmasq"]) == "object" && length(data["dnsmasq"]) == 0)
+			exit(0);
+		exit(1);
+	' -- "$1"
+}
+
+dnsmasq_state_matches() {
+	local journal=$1 saved current saved_settings saved_services current_settings current_services
+	# Collect both snapshots first: a pipeline would hide a failed save_dnsmasq.
+	saved=$(cat "$journal") || return 1
+	current=$(save_dnsmasq) || return 1
+	# Beyond that only the two empty snapshots above may differ, and only with
+	# an unchanged enabled flag; anything else stays a hard mismatch.
+	rp_have ucode || { rp_err '需要 OpenWrt 自带的 ucode 才能比对 dnsmasq 空容器状态'; return 1; }
+	saved_settings=${saved%%"$NL"*}
+	saved_services=${saved#*"$NL"}
+	current_settings=${current%%"$NL"*}
+	current_services=${current#*"$NL"}
+	# The first line is the enabled flag; ubus emits multi-line JSON after it.
+	case "$saved" in *"$NL"*) ;; *) return 1 ;; esac
+	case "$current" in *"$NL"*) ;; *) return 1 ;; esac
+	case "$saved_settings:$current_settings" in 0:0|1:1) ;; *) return 1 ;; esac
+	[ "$saved" = "$current" ] && return 0
+	dnsmasq_services_empty "$saved_services" && dnsmasq_services_empty "$current_services"
+}
+
 publish_phase() {
 	printf '%s\n' "$1" >"$JOURNAL/phase.new" && mv -f "$JOURNAL/phase.new" "$JOURNAL/phase" && sync
 }
@@ -692,7 +731,7 @@ recover_transaction() {
 				[ ! -L "$RP_RUN_DIR/smartdns.cache" ] && mv -f "$RP_RUN_DIR/smartdns-package.cache" "$RP_RUN_DIR/smartdns.cache" || return 1
 		fi
 		restore_service "$role" "$JOURNAL/old.files" && preserve_config verify "$JOURNAL/old.files" &&
-			save_dnsmasq | cmp -s "$JOURNAL/dnsmasq" - || return 1
+			dnsmasq_state_matches "$JOURNAL/dnsmasq" || return 1
 	fi
 	publish_phase rolled-back && finish_transaction rolled-back
 }
@@ -702,7 +741,7 @@ switch_package() {
 	quiesce && { [ "$role" != managed ] || cache_isolate; } &&
 		boot_links_absent && publish_phase apk-attempted && current=$(installed_id) && reconcile_package new "$current" &&
 		native_elf_x86_64 && restore_service "$role" "$JOURNAL/new.files" &&
-		preserve_config verify "$JOURNAL/new.files" && save_dnsmasq | cmp -s "$JOURNAL/dnsmasq" -
+		preserve_config verify "$JOURNAL/new.files" && dnsmasq_state_matches "$JOURNAL/dnsmasq"
 }
 
 prepare_media() {

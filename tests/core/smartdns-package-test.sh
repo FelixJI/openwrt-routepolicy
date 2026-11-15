@@ -133,18 +133,36 @@ export ROUTEPOLICY_LIBEXEC=$LIBEXEC
 	test -d "$STATE/.stage.DEF456"
 )
 
-# Host-only core jobs run before the OpenWrt SDK supplies a real ucode binary.
+# Host-only runs may lack a real ucode binary. The stand-in below emulates
+# the exact fixed programs this suite invokes; it is not a ucode interpreter
+# and proves nothing about real json() parsing, which must be exercised with a
+# real OpenWrt ucode on the target runtime.
 if ! command -v ucode >/dev/null 2>&1; then
 	mkdir "$tmp/bin"
 	cat >"$tmp/bin/ucode" <<'EOF'
 #!/usr/bin/env python3
 import base64
+import json
 import re
 import sys
 
 assert len(sys.argv) == 5 and sys.argv[1] == "-e" and sys.argv[3] == "--"
 assert sys.argv[2].strip()
-value = sys.argv[4]
+program, value = sys.argv[2], sys.argv[4]
+if "json(ARGV[0])" in program:
+    # Mirror dnsmasq_services_empty's fixed program: strict empty object, or a
+    # single "dnsmasq" key holding an empty object; anything else mismatches.
+    try:
+        data = json.loads(value)
+    except ValueError:
+        sys.exit(1)
+    if not isinstance(data, dict):
+        sys.exit(1)
+    if len(data) == 0:
+        sys.exit(0)
+    if len(data) == 1 and isinstance(data.get("dnsmasq"), dict) and len(data["dnsmasq"]) == 0:
+        sys.exit(0)
+    sys.exit(1)
 if re.fullmatch(r"[0-9a-f]{64}", value):
     print(base64.b64encode(bytes.fromhex(value[:40])).decode("ascii"), end="")
 else:
@@ -154,6 +172,72 @@ EOF
 	chmod +x "$tmp/bin/ucode"
 	export PATH="$tmp/bin:$PATH"
 fi
+
+# Only the two empty dnsmasq snapshots may differ in a restored WAL.
+(
+	wal="$tmp/dnsmasq-wal"
+	snapshot='{"dnsmasq":{"instances":{"dnsmasq1":{"running":false}}}}'
+	save_dnsmasq() { printf '%s\n%s\n' "$enabled" "$snapshot"; }
+	matches() { printf '%s\n%s\n' "$1" "$2" >"$wal"; dnsmasq_state_matches "$wal"; }
+
+	enabled=0
+	matches 0 "$snapshot"
+	enabled=1
+	matches 1 "$snapshot"
+	# The empty pair is interchangeable in both directions and for both flags.
+	for form in '{}' '{"dnsmasq":{}}'; do
+		enabled=0; snapshot='{}'
+		matches 0 "$form"
+		enabled=1
+		matches 1 "$form"
+		snapshot="$form"
+		matches 1 '{}'
+		enabled=0
+		matches 0 '{}'
+	done
+	# Real ubus output is pretty-printed, including when it has no instances.
+	snapshot=$(printf '{\n\t"dnsmasq": {\n\t\t\n\t}\n}')
+	matches 0 "$(printf '{\n\t\n}')"
+	snapshot=$(printf '{\n\t\n}')
+	matches 0 "$(printf '{\n\t"dnsmasq": {\n\t\t\n\t}\n}')"
+	enabled=invalid
+	if matches invalid '{}'; then exit 1; fi
+	enabled=0
+	# An enabled flag change is never tolerated.
+	snapshot='{}'
+	if matches 1 '{}'; then exit 1; fi
+	# Instances (running=false included), unknown keys, arrays, null, non-object
+	# or broken JSON stay hard mismatches in either direction.
+	for variant in \
+		'{"dnsmasq":{"instances":{}}}' \
+		'{"dnsmasq":{"instances":{"dnsmasq1":{"running":false}}}}' \
+		'{"dnsmasq":[]}' \
+		'{"dnsmasq":null}' \
+		'{"dnsmasq":{},"unknown":{}}' \
+		'{"other":{}}' \
+		'{"dnsmasq":' \
+		'0'
+	do
+		snapshot='{}'
+		if matches 0 "$variant"; then exit 1; fi
+		snapshot="$variant"
+		if matches 0 '{}'; then exit 1; fi
+	done
+	# Malformed WALs never match, not even against an empty current state.
+	snapshot='{}'
+	printf '0\n' >"$wal"
+	if dnsmasq_state_matches "$wal"; then exit 1; fi
+	printf '0\n{}\nextra\n' >"$wal"
+	if dnsmasq_state_matches "$wal"; then exit 1; fi
+	# A failed collection is a hard failure, never a quiet pass.
+	save_dnsmasq() { return 1; }
+	if dnsmasq_state_matches "$wal"; then exit 1; fi
+	# Without the declared ucode dependency comparisons fail closed.
+	save_dnsmasq() { printf '0\n%s\n' "$snapshot"; }
+	rp_have() { [ "$1" != ucode ]; }
+	if matches 0 '{}'; then exit 1; fi
+	if matches 0 '{"dnsmasq":{}}'; then exit 1; fi
+)
 
 cat >"$tmp/package" <<'EOF'
 info:
@@ -251,7 +335,7 @@ same_boot() { [ "$recovery_boot" = same ]; }
 init_dns_enabled() { [ "$1" = dnsmasq ] && printf '0\n'; }
 restore_service() { [ "$1" = managed ] && touch "$dns_restored"; }
 preserve_config() { :; }
-save_dnsmasq() { printf 'unchanged\n'; }
+save_dnsmasq() { printf '0\n%s\n' "$services_snapshot"; }
 
 schema=1
 operation=$expected_action
@@ -259,7 +343,9 @@ rp_writer_enter smartdns-package
 mkdir -p "$JOURNAL" "$RP_STATE_DIR/init-transaction/declarations"
 printf 'apk-attempted\n' >"$JOURNAL/phase"
 printf 'managed\n' >"$JOURNAL/role"
-printf 'unchanged\n' >"$JOURNAL/dnsmasq"
+# The saved WAL holds the bare "{}" form; the reload leaves an empty container.
+printf '0\n{}\n' >"$JOURNAL/dnsmasq"
+services_snapshot='{"dnsmasq":{}}'
 installed_id >"$JOURNAL/old.id"
 printf 'candidate\n' >"$JOURNAL/new.id"
 package_restored="$RP_ROOT/package-restored"
