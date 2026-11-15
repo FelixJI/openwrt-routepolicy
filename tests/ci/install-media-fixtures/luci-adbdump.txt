@@ -1,0 +1,23 @@
+# Extracted info section from the OpenWrt 25.12.0 SDK candidate APK.
+#%SCHEMA: 676B6370
+# ADB block, size: 6576, compat: 0, ver: 0
+info:
+  name: luci-app-routepolicy
+  version: 0.3.3-r2
+  hashes: 57e87c5e246764ac1ef16b29fa7f29e22d56d977
+  description: Safe operational interface for RoutePolicy policy routing
+  arch: noarch
+  license: MIT
+  origin: feeds/base/luci-app-routepolicy
+  maintainer: OpenWrt LuCI community
+  url: https://github.com/openwrt/luci
+  installed-size: 170351
+  depends: # 6 items
+    - libc
+    - luci-base
+    - routepolicy
+    - rpcd-mod-ucode
+    - uhttpd
+    - uhttpd-mod-ubus
+  provides: # 1 items
+    - luci-app-routepolicy-any

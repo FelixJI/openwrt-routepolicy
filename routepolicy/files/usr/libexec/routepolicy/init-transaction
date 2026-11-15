@@ -61,9 +61,16 @@ lock() {
 	prepared_finish_locked || fail 'prepared 记录不能证明零变更；已保留候选与门禁'
 	if [ "${operation:-}" = recover-early ]; then
 		case "$(read_phase)" in confirmed|confirming)
-			if init_dns_managed && ! early_dns_boot_ready; then
+			local early_quarantine=0 early_retire_failed=0
+			if init_dns_managed && ! early_dns_boot_ready; then early_quarantine=1; fi
+			if [ "$(read_phase)" = confirmed ] && init_dns_owned && [ "$(cat "$TX/active" 2>/dev/null)" = "$(cat "$WAL/token")" ]; then
+				confirmed_fields_retire || early_retire_failed=1
+			fi
+			# Isolation still runs when retirement cannot validate or release storage.
+			if [ "$early_quarantine" = 1 ]; then
 				init_dns_coordinate quarantine-boot || fail '不能隔离已确认或提升中的 DNS 自启动'
-			fi ;;
+			fi
+			[ "$early_retire_failed" = 0 ] || fail '不能安全收敛确认字段副本；已保留启动恢复记录' ;;
 		esac
 	fi
 	if [ -e "$TX/active" ] || [ -L "$TX/active" ]; then rp_init_active_record >/dev/null || fail '已确认接管合同路径或内容不安全'; fi
@@ -97,7 +104,7 @@ prepared_finish_locked() {
 	if [ -d "$WAL/fields" ]; then
 		prepared_attempts=$(find "$WAL/fields" \( -name attempted -o -type l \) -print) && [ -z "$prepared_attempts" ] || return 1
 	fi
-	for prepared_marker in link-attempted dns-service-attempted dns-attempted policy-attempted dns90-attempted dns-cache-move dns-boot-quarantined dns-resolver-file-attempted dns-resolver-link-attempted stage; do
+	for prepared_marker in link-attempted dns-service-attempted dns-attempted policy-attempted dns90-attempted dns-cache-move dns-boot-quarantined dns-resolver-file-attempted dns-resolver-link-attempted stage fields-retired; do
 		[ ! -e "$WAL/$prepared_marker" ] && [ ! -L "$WAL/$prepared_marker" ] || return 1
 	done
 	# No resource was touched: invalidate the candidate, never run rollback/service writers.
@@ -113,10 +120,11 @@ origin_read_value() {
 }
 origin_validate() {
 	# The same typed field journal serves rollback and eventual explicit exit.
-	[ -d "$1" ] && [ ! -L "$1" ] && [ -z "$(find "$1" -type l)" ] || return 1
-	[ "$(cat "$1/schema" 2>/dev/null)" = 1 ] || return 1
-	local n i entry item key existed origin_value newline='
+	local n i entry item key existed origin_value origin_links newline='
 '
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	origin_links=$(find "$1" -type l) && [ -z "$origin_links" ] || return 1
+	[ "$(cat "$1/schema" 2>/dev/null)" = 1 ] || return 1
 	n=$(cat "$1/count") && rp_uint_between "$n" 1 2048 || return 1
 	# Keep one row per journal field. A short or malformed stream cannot pass plan_valid.
 	(
@@ -483,6 +491,65 @@ exit_apply() {
 	WAL=$original
 	rollback_fields && exit_finish
 }
+confirmed_fields_retire() {
+	local record retired="$WAL/fields-retired" n i item entry unknown listing
+	[ "$WAL" = "$TX/current" ] && [ "$(read_phase)" = confirmed ] || return 1
+	record=$(rp_init_active_record) || return 1
+	for item in token candidate count; do
+		[ -f "$WAL/$item" ] && [ ! -L "$WAL/$item" ] && [ -f "$record/$item" ] && [ ! -L "$record/$item" ] &&
+			cmp -s "$WAL/$item" "$record/$item" || return 1
+	done
+	# Legacy contracts still need their original journal for origin migration.
+	if [ ! -e "$record/origin" ] && [ ! -L "$record/origin" ]; then
+		[ ! -e "$retired" ] && [ ! -L "$retired" ]; return
+	fi
+	if [ -e "$retired" ] || [ -L "$retired" ]; then
+		[ -d "$retired" ] && [ ! -L "$retired" ] && [ ! -e "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+		listing=$(find "$retired" -mindepth 1) || return 1
+		[ -n "$listing" ] || return 0
+	fi
+	origin_validate "$record/origin" || return 1
+	n=$(cat "$WAL/count") && rp_uint_between "$n" 1 2048 || return 1
+	[ -d "$record/fields" ] && [ ! -L "$record/fields" ] || return 1
+	listing=$(find "$record/fields" ! -type d ! -type f) && [ -z "$listing" ] || return 1
+	listing=$(find "$record/fields" -mindepth 1 -type d) && [ "$(printf '%s\n' "$listing" | wc -l)" -eq "$n" ] || return 1
+	listing=$(find "$record/fields" -type f) && [ "$(printf '%s\n' "$listing" | wc -l)" -eq "$((n * 7))" ] || return 1
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		i=$((i+1)); entry="$record/fields/$i"
+		[ -d "$entry" ] && [ ! -L "$entry" ] || return 1
+		for item in key existed old type expected expected-type attempted; do [ -f "$entry/$item" ] && [ ! -L "$entry/$item" ] || return 1; done
+	done
+	if [ -e "$retired" ] || [ -L "$retired" ]; then
+		[ -d "$retired" ] && [ ! -L "$retired" ] && [ ! -e "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+	else
+		[ -d "$WAL/fields" ] && [ ! -L "$WAL/fields" ] || return 1
+		listing=$(find "$WAL/fields" ! -type d ! -type f) && [ -z "$listing" ] || return 1
+		listing=$(find "$WAL/fields" -mindepth 1 -type d) && [ "$(printf '%s\n' "$listing" | wc -l)" -eq "$n" ] || return 1
+		listing=$(find "$WAL/fields" -type f) && [ "$(printf '%s\n' "$listing" | wc -l)" -eq "$((n * 7))" ] || return 1
+		i=0
+		while [ "$i" -lt "$n" ]; do
+			i=$((i+1))
+			for item in key existed old type expected expected-type attempted; do
+				[ -f "$WAL/fields/$i/$item" ] && [ ! -L "$WAL/fields/$i/$item" ] && cmp -s "$WAL/fields/$i/$item" "$record/fields/$i/$item" || return 1
+			done
+		done
+		# Rename uses the existing directory inode; a full inode table can still retire it.
+		mv "$WAL/fields" "$retired" && sync || return 1
+	fi
+	# A killed cleanup may leave a subset, but foreign entries are never disposable.
+	listing=$(find "$retired" ! -type d ! -type f) && [ -z "$listing" ] || return 1
+	unknown=$(find "$retired" -mindepth 1 -exec sh -c '
+		base=$1; source=$2; shift 2
+		for path do
+			relative=${path#"$base"/}
+			if [ -d "$path" ]; then [ -d "$source/$relative" ] && [ ! -L "$source/$relative" ] || printf "unknown\n"
+			else [ -f "$source/$relative" ] && [ ! -L "$source/$relative" ] && cmp -s "$path" "$source/$relative" || printf "unknown\n"; fi
+		done' routepolicy-retired "$retired" "$record/fields" '{}' +) || return 1
+	[ -z "$unknown" ] || return 1
+	find "$retired" -mindepth 1 -maxdepth 1 -exec rm -rf '{}' + || return 1
+	listing=$(find "$retired" -mindepth 1) && [ -z "$listing" ] && sync
+}
 active_publish() {
 	# shellcheck disable=SC3043
 	local token record stage item prior source
@@ -492,6 +559,9 @@ active_publish() {
 	safe_dir "$TX/confirmed"
 	record="$TX/confirmed/$token"; stage="$WAL/confirmed-record"
 	[ ! -L "$record" ] && [ ! -L "$stage" ] && [ ! -L "$TX/active" ] && [ ! -L "$TX/source" ] && [ ! -L "$TX/active.new" ] && [ ! -L "$TX/source.new" ] || return 1
+	if [ "$(read_phase)" = confirmed ] && [ "$(cat "$TX/active" 2>/dev/null)" = "$token" ]; then
+		confirmed_fields_retire || return 1
+	fi
 	if [ ! -e "$record" ]; then
 		[ ! -e "$stage" ] || { [ -d "$stage" ] && [ -z "$(find "$stage" -type l)" ] && rm -rf "$stage"; } || return 1
 		mkdir "$stage" || return 1
@@ -517,6 +587,7 @@ active_publish() {
 	fi
 	# This atomic pointer replacement is the sole durable confirmation commit point.
 	printf '%s\n' "$token" >"$TX/active.new" && mv "$TX/active.new" "$TX/active" && sync && phase confirmed || return 1
+	confirmed_fields_retire || return 1
 	rm -f "$WAL/dns-boot-pending" || return 1
 	prior=$(cat "$WAL/prior-active") || return 1
 	if [ "$prior" != - ] && [ "$prior" != "$token" ] && [ "$prior" != "$source" ]; then
@@ -1203,6 +1274,7 @@ guard_stop_if_inactive() (
 	# Recheck under the writer lock so an old guard cannot delete a newly started instance.
 	exec 9>"$TX/lock"
 	flock -n 9 || exit 1
+	! rp_smartdns_package_pending || exit 1
 	case "$(read_phase)" in
 		applying|rolling_back|pending|confirming) exit 1 ;;
 		prepared)
@@ -1211,6 +1283,7 @@ guard_stop_if_inactive() (
 		conflict) rp_native_run 3 ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1; exit $? ;;
 	esac
 	! rp_dns_boot_pending || exit 1
+	! active_boot_recovery_due || exit 1
 	! rp_writer_event_pending || exit 1
 	rp_native_run 3 ubus call service delete '{"name":"routepolicy-initguard","instance":"guard"}' >/dev/null 2>&1
 )
@@ -1455,6 +1528,13 @@ dns_boot_ready_marker() {
 	[ -n "$2" ] && [ -f "$1/dns-boot-ready" ] && [ ! -L "$1/dns-boot-ready" ] &&
 		printf '%s\n' "$2" | cmp -s "$1/dns-boot-ready" -
 }
+active_boot_recovery_due() (
+	WAL=$(rp_init_active_record) || return 1
+	init_dns_owned || return 1
+	[ -f "$WAL/boot-id" ] && [ ! -L "$WAL/boot-id" ] || return 1
+	record_boot=$(cat "$WAL/boot-id") && boot_now=$(init_resolver_boot) && [ -n "$record_boot" ] && [ -n "$boot_now" ] || return 1
+	[ "$record_boot" != "$boot_now" ] && ! dns_boot_ready_marker "$WAL" "$boot_now"
+)
 boot_recovery_ready() {
 	local record boot_now record_boot marker
 	record=$(rp_init_active_record) && boot_now=$(cat "$RP_ROOT/proc/sys/kernel/random/boot_id") || return 1
@@ -1501,6 +1581,17 @@ active_boot_early() (
 
 operation=${1:-}; [ "$#" -eq 0 ] || shift
 case "$operation" in
+	package-dns-admit|package-dns-verify)
+		[ "$#" = 0 ] && [ "${ROUTEPOLICY_WRITER_KIND:-}" = smartdns-package ] && rp_writer_owned || exit 1
+		# The existing DNS contract checks require a real inherited init writer.
+		ROUTEPOLICY_WRITER_KIND=init
+		WAL=$(rp_init_active_record) && load_args && uci_layout && init_dns_managed_admit &&
+			[ "$(init_dns_service_state dnsmasq)$(init_dns_enabled dnsmasq)" = 00 ] || exit 1
+		if [ "$operation" = package-dns-verify ]; then
+			[ "$(init_dns_enabled smartdns)" = 1 ] || exit 1
+			operation='boot-dns'
+			init_dns_coordinate verify
+		fi ;;
 	archive-migrate)
 		[ "$#" = 0 ] || fail 'archive-migrate 不接受参数'
 		lock
@@ -1855,9 +1946,11 @@ case "$operation" in
 			[ "$(read_phase)" = confirmed ] && transaction_same_boot && ! rp_dns_boot_pending && uci_layout && [ "$(uci_committed get routepolicy.main.enabled)" = 1 ] && init_dns_managed &&
 			watch_record=$(rp_init_active_record) && [ "$(cat "$watch_record/token")" = "$(cat "$WAL/token")" ] || exit 1
 		;;
-	boot-pending) [ "$#" -eq 0 ] || exit 1; rp_dns_boot_pending ;;
+	boot-pending) [ "$#" -eq 0 ] || exit 1; rp_dns_boot_pending || active_boot_recovery_due ;;
 	guard-needed)
+		rp_smartdns_package_pending && exit 0
 		rp_dns_boot_pending && exit 0
+		active_boot_recovery_due && exit 0
 		rp_writer_event_pending && exit 0
 		if job_current && [ "$job_kind" = exit ] && job_running; then exit 0; fi
 		case "$(read_phase)" in
@@ -1868,9 +1961,10 @@ case "$operation" in
 		;;
 	boot-dns)
 		[ "$#" = 0 ] || fail 'boot-dns 不接受参数'
-		rp_dns_boot_pending || exit 0
+		rp_dns_boot_pending || active_boot_recovery_due || exit 0
 		lock
 		recover_locked || fail '启动事务恢复失败；DNS 保持隔离'
+		active_boot_early || fail '不能按已确认接管合同隔离启动 DNS'
 		boot_dns_locked || fail '启动策略/DNS 验证失败；SmartDNS 保持停用，自有 WAL 已保留'
 		;;
 	recover|recover-startup|recover-auto|recover-early)
@@ -1880,11 +1974,17 @@ case "$operation" in
 			*:0:) ;;
 			*) fail '恢复参数非法' ;;
 		esac
+		if rp_smartdns_package_pending && [ "$operation" = recover-early ]; then
+			"$LIBEXEC/smartdns-package" package-recover-early || fail 'SmartDNS 软件包早期恢复失败'
+		fi
 		if [ ! -e "$WAL" ] && [ ! -L "$WAL" ] && [ ! -e "$TX/previous" ] && [ ! -L "$TX/previous" ] && [ ! -e "$TX/active" ] && [ ! -L "$TX/active" ]; then
 			if [ "$startup_boot" = 1 ]; then printf 'boot-policy-deferred\n'; exit $?; fi
 			status_json; exit 0
 		fi
 		lock
+		if [ "$operation" = recover-startup ] && active_boot_recovery_due; then
+			active_boot_early || fail '不能按已确认接管合同隔离启动 DNS'
+		fi
 		if [ "$operation" = recover-early ]; then
 			case "$(read_phase)" in
 				applying|rolling_back|pending)
@@ -1924,9 +2024,13 @@ case "$operation" in
 	guard)
 		[ "$#" -eq 0 ] || fail 'guard 不接受参数'
 		while :; do
-			if rp_dns_boot_pending; then
-				"$0" boot-dns >/dev/null 2>&1 || true
-				if rp_dns_boot_pending; then sleep 10; continue; fi
+			if rp_smartdns_package_pending; then
+				"$LIBEXEC/smartdns-package" package-recover >/dev/null 2>&1 || true
+				if rp_smartdns_package_pending; then sleep 10; continue; fi
+			fi
+			if rp_dns_boot_pending || active_boot_recovery_due; then
+				"$0" boot-dns >/dev/null 2>&1 || { sleep 10; continue; }
+				if rp_dns_boot_pending || active_boot_recovery_due; then sleep 10; continue; fi
 			fi
 			if rp_writer_event_pending; then "$LIBEXEC/apply" reconcile-event >"$RP_RUN_DIR/event-reconcile.log" 2>&1 || true; fi
 			case "$(read_phase)" in

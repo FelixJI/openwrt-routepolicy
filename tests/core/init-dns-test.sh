@@ -68,6 +68,313 @@ rm -f "$tmp/root/etc/smartdns/smartdns.cache" "$tmp/root/etc/smartdns/custom.cac
 printf '%s\n' 'init DNS native cache/cron preflight: passed'
 if [ "${1:-}" = --native-side-effects ]; then exit 0; fi
 
+# Run the real retirement and admission functions without native UCI or services.
+(
+	# Dispatcher-created private directories must not alter the later native fixture.
+	export ROUTEPOLICY_ROOT="$tmp/control-root"
+	awk '/^operation=/{exit} {print}' "$REAL_LIB/init-transaction" >"$tmp/transaction-functions"
+	# shellcheck disable=SC1091
+	. "$tmp/transaction-functions"
+	sync() { :; }
+	retire_reset() {
+		rm -rf "$TX"
+		retire_token=11111111111111111111111111111111
+		retire_record="$TX/confirmed/$retire_token"
+		mkdir -p "$WAL/fields/1" "$WAL/fields/2" "$retire_record"
+		printf '%s\n' "$retire_token" >"$WAL/token"
+		printf 'confirmed\n' >"$WAL/phase"
+		printf '2\n' >"$WAL/count"
+		printf 'set\tsmartdns.main.port\t53\nset\tnetwork.lan.ipaddr\t192.0.2.2\n' >"$WAL/candidate"
+		for row in 1 2; do
+			entry="$WAL/fields/$row"
+			if [ "$row" = 1 ]; then key=smartdns.main.port; value=53; old=6053
+			else key=network.lan.ipaddr; value=192.0.2.2; old=192.0.2.1; fi
+			printf '%s\n' "$key" >"$entry/key"; printf '%s' "$value" >"$entry/expected"
+			printf '%s' "$old" >"$entry/old"; printf 1 >"$entry/existed"
+			printf scalar >"$entry/type"; printf scalar >"$entry/expected-type"; : >"$entry/attempted"
+		done
+		cp -R "$WAL/." "$retire_record/"
+		mkdir "$retire_record/origin"
+		cp -R "$WAL/fields" "$WAL/count" "$retire_record/origin/"
+		printf '1\n' >"$retire_record/origin/schema"
+		printf '%s\n' "$retire_token" >"$TX/active"; cp "$TX/active" "$TX/source"
+	}
+	retire_bad() { if confirmed_fields_retire; then printf 'retired unsafe journal: %s\n' "$1" >&2; exit 1; fi; }
+	retire_reset
+	cp -R "$retire_record" "$tmp/retire-authority"
+	confirmed_fields_retire
+	[ ! -e "$WAL/fields" ] && [ -d "$WAL/fields-retired" ] && [ -z "$(find "$WAL/fields-retired" -mindepth 1)" ]
+	init_dns_applied_record smartdns.main.port 53
+	confirmed_fields_retire
+	diff -r "$retire_record" "$tmp/retire-authority"
+	retire_reset
+	printf 'confirming\n' >"$WAL/phase"; rm "$TX/active" "$TX/source"
+	active_publish
+	[ "$(read_phase)" = confirmed ] && [ ! -e "$WAL/fields" ] && [ -d "$WAL/fields-retired" ]
+	init_dns_applied_record smartdns.main.port 53
+	for broken in value missing extra symlink token candidate count phase origin; do
+		retire_reset
+		case "$broken" in
+			value) printf 54 >"$WAL/fields/1/expected" ;;
+			missing) rm "$WAL/fields/1/old" ;;
+			extra) : >"$WAL/fields/foreign" ;;
+			symlink) rm "$WAL/fields/1/old"; ln -s "$retire_record/fields/1/old" "$WAL/fields/1/old" ;;
+			token) printf '22222222222222222222222222222222\n' >"$WAL/token" ;;
+			candidate) printf 'set\tsmartdns.main.port\t54\n' >"$WAL/candidate" ;;
+			count) printf '1\n' >"$WAL/count" ;;
+			phase) printf 'pending\n' >"$WAL/phase" ;;
+			origin) rm "$retire_record/origin/fields/1/old" ;;
+		esac
+		retire_bad "$broken"
+		[ -d "$WAL/fields" ] && [ ! -e "$WAL/fields-retired" ]
+	done
+	# A sync failure after rename leaves the durable retry identity and original files.
+	retire_reset
+	sync() { return 1; }
+	retire_bad rename-sync
+	[ -d "$WAL/fields-retired/1" ] && [ ! -e "$WAL/fields" ]
+	init_dns_applied_record smartdns.main.port 53
+	sync() { :; }
+	printf changed >"$WAL/fields-retired/1/old"
+	retire_bad changed-leftover
+	[ "$(cat "$WAL/fields-retired/1/old")" = changed ]
+	cp "$retire_record/fields/1/old" "$WAL/fields-retired/1/old"
+	rm "$WAL/fields-retired/1/old"
+	rm -rf "$WAL/fields-retired/2"
+	confirmed_fields_retire
+	[ -z "$(find "$WAL/fields-retired" -mindepth 1)" ]
+	# A retirement marker never authorizes another phase, generation or candidate.
+	for broken in phase token candidate count both marker-link foreign-leftover; do
+		retire_reset
+		confirmed_fields_retire
+		case "$broken" in
+			phase) printf 'prepared\n' >"$WAL/phase" ;;
+			token) printf '22222222222222222222222222222222\n' >"$WAL/token" ;;
+			candidate) printf 'set\tsmartdns.main.port\t54\n' >"$WAL/candidate" ;;
+			count) printf '1\n' >"$WAL/count" ;;
+			both) mkdir "$WAL/fields" ;;
+			marker-link) rmdir "$WAL/fields-retired"; ln -s "$tmp" "$WAL/fields-retired" ;;
+			foreign-leftover) printf foreign >"$WAL/fields-retired/user.keep" ;;
+		esac
+		retire_bad "$broken"
+		if [ "$broken" = phase ]; then
+			# shellcheck disable=SC2034
+			operation=recover
+			if prepared_finish_locked; then printf 'expired retired prepared journal\n' >&2; exit 1; fi
+			[ "$(read_phase)" = prepared ]
+		fi
+		if [ "$broken" != foreign-leftover ]; then
+			if init_dns_applied_record smartdns.main.port 53; then printf 'admitted unsafe retired journal: %s\n' "$broken" >&2; exit 1; fi
+		else [ "$(cat "$WAL/fields-retired/user.keep")" = foreign ]; fi
+	done
+	retire_reset
+	rm -rf "$retire_record/origin"
+	confirmed_fields_retire
+	[ -d "$WAL/fields" ] && [ ! -e "$WAL/fields-retired" ]
+	init_dns_applied_record smartdns.main.port 53
+	# Every traversal failure must propagate, even after producing a plausible listing.
+	find() (
+		calls=$(cat "$tmp/retire-find-count"); calls=$((calls+1))
+		printf '%s\n' "$calls" >"$tmp/retire-find-count"
+		if [ "$calls" = "$find_fail" ]; then
+			[ "$find_error_output" != partial ] || command find "$@"
+			return 87
+		fi
+		command find "$@"
+	)
+	for find_layout in fresh empty-retired partial-retired; do
+		retire_reset
+		case "$find_layout" in
+			empty-retired) rm -rf "$WAL/fields"; mkdir "$WAL/fields-retired" ;;
+			partial-retired) mv "$WAL/fields" "$WAL/fields-retired"; rm "$WAL/fields-retired/1/old" ;;
+		esac
+		printf '0\n' >"$tmp/retire-find-count"; find_fail=0; find_error_output=empty
+		confirmed_fields_retire
+		find_total=$(cat "$tmp/retire-find-count")
+		for find_error_output in empty partial; do
+			find_fail=1
+			while [ "$find_fail" -le "$find_total" ]; do
+				retire_reset
+				case "$find_layout" in
+					empty-retired) rm -rf "$WAL/fields"; mkdir "$WAL/fields-retired" ;;
+					partial-retired) mv "$WAL/fields" "$WAL/fields-retired"; rm "$WAL/fields-retired/1/old" ;;
+				esac
+				printf '0\n' >"$tmp/retire-find-count"
+				retire_bad "$find_layout/$find_error_output/find-$find_fail"
+				[ "$(cat "$tmp/retire-find-count")" = "$find_fail" ]
+				diff -r "$retire_record" "$tmp/retire-authority"
+				find_fail=$((find_fail+1))
+			done
+		done
+	done
+	unset -f find
+	# Exercise lock's actual early-boot ordering with a bounded service stand-in.
+	(
+		writer_lock() { :; }
+		init_dns_managed() { return 0; }
+		early_dns_boot_ready() { return 1; }
+		init_dns_coordinate() {
+			[ "$1" = quarantine-boot ] || return 1
+			if [ "$retire_boot_case" = full ]; then
+				[ -d "$WAL/fields-retired" ] && [ ! -e "$WAL/fields" ] && [ -z "$(find "$WAL/fields-retired" -mindepth 1)" ] || return 1
+			fi
+			printf 'isolated\n' >"$tmp/retire-quarantine"
+		}
+		# shellcheck disable=SC2034
+		operation=recover-early
+		retire_boot_case=full
+		retire_reset
+		lock
+		grep -Fxq isolated "$tmp/retire-quarantine"
+		[ -d "$WAL/fields-retired" ] && [ ! -e "$WAL/fields" ]
+		retire_boot_case=corrupt
+		retire_reset
+		rm "$tmp/retire-quarantine"
+		printf changed >"$WAL/fields/2/old"
+		if (lock) >"$tmp/retire-lock-error" 2>&1; then printf 'early boot ignored failed retirement\n' >&2; exit 1; fi
+		grep -Fxq isolated "$tmp/retire-quarantine"
+		grep -Fq '不能安全收敛确认字段副本' "$tmp/retire-lock-error"
+		[ "$(cat "$WAL/fields/2/old")" = changed ] && [ ! -e "$WAL/fields-retired" ]
+	)
+	# On an already confirmed full filesystem, retirement precedes fresh pointer files.
+	retire_reset
+	sync() {
+		[ ! -e "$TX/active.new" ] && [ ! -e "$WAL/phase.new" ] || return 1
+		[ -d "$WAL/fields-retired" ] || return 1
+		if [ -n "$(find "$WAL/fields-retired" -mindepth 1)" ]; then return 0; fi
+		return 1
+	}
+	if active_publish; then printf 'expected interrupted post-retirement sync\n' >&2; exit 1; fi
+	[ -d "$WAL/fields-retired" ] && [ -z "$(find "$WAL/fields-retired" -mindepth 1)" ]
+	[ ! -e "$TX/active.new" ] && [ ! -e "$WAL/phase.new" ]
+	printf '%s\n' 'confirmed field retirement: passed (exact provenance, durable rename, partial cleanup, legacy, admission, boot isolation, traversal errors and pre-allocation ordering)'
+	# Keep the real dispatch, FD9 gate and boot coordinator; replace only native effects.
+	mkdir "$tmp/cold-lib"
+	cp "$REAL_LIB/common" "$REAL_LIB/init-dns" "$tmp/cold-lib/"
+	cp "$tmp/transaction-functions" "$tmp/cold-entry"
+	cat >>"$tmp/cold-entry" <<'EOF'
+rp_config_admit() { :; }
+load_args() { :; }
+uci_layout() { :; }
+no_pending() { :; }
+init_dns_managed() { rp_writer_owned && [ "$ROUTEPOLICY_WRITER_KIND" = init ]; }
+init_dns_managed_admit() { init_dns_managed; }
+init_resolver_required() { :; }
+init_resolver_prepare() { [ "$1" = boot ]; }
+init_resolver_origin() { :; }
+init_dns_stop() { :; }
+uci_committed() { [ "$*" = 'get routepolicy.main.enabled' ] && printf '1\n'; }
+init_dns_policy_adapter() { return 1; }
+rp_smartdns_set_registration() { :; }
+policy_verify_runtime() { [ -f "$TEST_DNS_TMP/cold-policy-ready" ]; }
+init_dns_call() {
+    if [ "$1:$2" = smartdns:start ]; then
+        [ -f "$TEST_DNS_TMP/cold-policy-ready" ] || return 1
+        printf 'dns-start\n' >>"$TEST_DNS_TMP/cold-trace"
+    fi
+}
+init_resolver_install() {
+    printf 'resolver-install\n' >>"$TEST_DNS_TMP/cold-trace"
+    : >"$TEST_DNS_TMP/cold-resolver-ready"
+}
+init_dns_coordinate() {
+    case "$1" in
+        quarantine-boot)
+            ! rp_smartdns_package_pending && rp_writer_owned || return 1
+            printf 'quarantine\n' >>"$TEST_DNS_TMP/cold-trace" ;;
+        verify)
+            [ -f "$TEST_DNS_TMP/cold-resolver-ready" ] || return 1
+            printf 'dns-verify\n' >>"$TEST_DNS_TMP/cold-trace" ;;
+        *) return 1 ;;
+    esac
+}
+rp_native_run() {
+    [ "$*" = '3 ubus call service delete {"name":"routepolicy-initguard","instance":"guard"}' ] || return 1
+    printf 'guard-stop\n' >>"$TEST_DNS_TMP/cold-trace"
+}
+status_json() { :; }
+sync() { :; }
+EOF
+	awk 'found || /^operation=/ {found=1; print}' "$REAL_LIB/init-transaction" >>"$tmp/cold-entry"
+	cat >"$tmp/cold-lib/apply" <<'EOF'
+#!/bin/sh
+set -eu
+. "$ROUTEPOLICY_LIBEXEC/common"
+rp_writer_owned
+[ "$ROUTEPOLICY_WRITER_KIND:$ROUTEPOLICY_DNS_DEFER" = init:1 ]
+[ ! -e "$TEST_DNS_TMP/cold-policy-fail" ] || exit 1
+printf 'policy\n' >>"$TEST_DNS_TMP/cold-trace"
+: >"$TEST_DNS_TMP/cold-policy-ready"
+EOF
+	cat >"$tmp/cold-lib/smartdns-package" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1" = package-recover ] || [ "$1" = package-recover-early ]
+[ ! -e "$TEST_DNS_TMP/cold-conflict" ] || exit 1
+rm -rf "$ROUTEPOLICY_ROOT/etc/routepolicy/state/smartdns-package/current"
+printf 'package-clear\n' >>"$TEST_DNS_TMP/cold-trace"
+EOF
+	chmod +x "$tmp/cold-entry" "$tmp/cold-lib/apply" "$tmp/cold-lib/smartdns-package"
+	cold_entry() { ROUTEPOLICY_LIBEXEC="$tmp/cold-lib" "$tmp/cold-entry" "$@"; }
+	cold_reset() {
+		retire_reset
+		mkdir -p "$RP_ROOT/proc/sys/kernel/random"
+		printf '11111111-1111-1111-1111-111111111111\n' >"$WAL/boot-id"
+		cp "$WAL/boot-id" "$retire_record/boot-id"
+		printf '22222222-2222-2222-2222-222222222222\n' >"$RP_ROOT/proc/sys/kernel/random/boot_id"
+		rm -f "$tmp/cold-policy-ready" "$tmp/cold-resolver-ready" "$tmp/cold-policy-fail" "$tmp/cold-conflict"
+		: >"$tmp/cold-trace"
+	}
+	cold_assert_order() {
+		[ "$(grep -E '^(policy|dns-start|resolver-install|dns-verify)$' "$tmp/cold-trace")" = "$(printf 'policy\ndns-start\nresolver-install\ndns-verify')" ]
+		cmp "$retire_record/dns-boot-ready" "$RP_ROOT/proc/sys/kernel/random/boot_id"
+		[ ! -e "$retire_record/dns-boot-pending" ]
+	}
+	cold_reset
+	mkdir -p "$RP_SMARTDNS_PACKAGE_STATE/current"
+	: >"$tmp/cold-conflict"
+	if cold_entry recover-early >"$tmp/cold-error" 2>&1; then exit 1; fi
+	[ ! -e "$retire_record/dns-boot-pending" ] && [ ! -e "$retire_record/dns-boot-ready" ]
+	# Until package recovery clears current, normal init admission remains closed.
+	if cold_entry boot-dns >"$tmp/cold-error" 2>&1; then exit 1; fi
+	[ ! -s "$tmp/cold-trace" ]
+	rm "$tmp/cold-conflict"
+	cold_entry guard
+	cold_assert_order
+	[ ! -e "$RP_SMARTDNS_PACKAGE_STATE/current" ]
+	# Model a killed guard after package cleanup but before publishing DNS pending.
+	cold_reset
+	cold_entry guard-needed
+	cold_entry boot-pending
+	cold_entry guard
+	cold_assert_order
+	# S95 also derives the missing handoff, and a failed policy never starts DNS.
+	cold_reset
+	[ "$(cold_entry recover-startup boot)" = boot-policy-coordinated ]
+	[ -f "$retire_record/dns-boot-pending" ]
+	: >"$tmp/cold-policy-fail"
+	if cold_entry boot-dns >"$tmp/cold-error" 2>&1; then exit 1; fi
+	if grep -Fqx dns-start "$tmp/cold-trace"; then exit 1; fi
+	[ -f "$retire_record/dns-boot-pending" ]
+	rm "$tmp/cold-policy-fail"
+	cold_entry guard
+	cold_assert_order
+	: >"$tmp/cold-trace"
+	if cold_entry guard-needed || cold_entry boot-pending; then exit 1; fi
+	cold_entry boot-dns
+	[ ! -s "$tmp/cold-trace" ]
+	cold_reset
+	cp "$RP_ROOT/proc/sys/kernel/random/boot_id" "$WAL/boot-id"
+	cp "$WAL/boot-id" "$retire_record/boot-id"
+	if cold_entry guard-needed || cold_entry boot-pending; then exit 1; fi
+	cold_entry boot-dns
+	[ ! -s "$tmp/cold-trace" ]
+	rm -rf "$TX"
+	printf '%s\n' 'cold package reentry: passed (early failure, real gate, lost wakeup, S94/S95, policy before DNS, resolver ordering and same-boot no-op)'
+)
+[ ! -e "$tmp/root/tmp" ]
+case "${1:-}" in --confirmed-fields|--cold-reentry) exit 0 ;; esac
+
 if [ -n "${TEST_UCI_SDK_ROOT:-}" ]; then
 	cat >"$tmp/bin/native-uci" <<'EOF'
 #!/bin/sh
@@ -485,6 +792,7 @@ EOF
 cp "$tmp/root/etc/init.d/network" "$tmp/root/usr/sbin/smartdns"
 chmod +x "$tmp/bin/"* "$tmp/lib/"* "$tmp/root/etc/init.d/"* "$tmp/root/usr/sbin/smartdns"
 export PATH="$tmp/bin:$PATH"
+[ "$(init_dns_service_state routepolicy-initguard)" = 1 ]
 TX="$tmp/lib/init-transaction"
 canonical() {
 	exported=$(native-uci -c "$tmp/root/etc/config" export "$1") || return 1
@@ -753,6 +1061,7 @@ SH
 	done
 	if "$TX" recover-startup boot extra >/dev/null || "$TX" recover-startup invalid >/dev/null || "$TX" recover boot >/dev/null; then exit 1; fi
 	for edge in missing-ready old-ready malformed-ready ready-link pending-link same-boot disabled legacy; do
+		expected_boot_result=boot-policy-deferred
 		case "$edge" in
 			missing-ready) rm "$ready" ;;
 			old-ready) cp "$tmp/old-boot" "$ready" ;;
@@ -763,10 +1072,14 @@ SH
 			disabled) uci set routepolicy.main.enabled=0; uci commit routepolicy ;;
 			legacy) mv "$txroot" "$tmp/boot-saved-tx" ;;
 		esac
+		case "$edge" in missing-ready|old-ready|malformed-ready|ready-link) expected_boot_result=boot-policy-coordinated ;; esac
 		: >"$tmp/boot-inner-apply"
-		[ "$("$TX" recover-startup boot)" = boot-policy-deferred ] && [ ! -s "$tmp/boot-inner-apply" ] || {
+		[ "$("$TX" recover-startup boot)" = "$expected_boot_result" ] && [ ! -s "$tmp/boot-inner-apply" ] || {
 			printf 'unexpected pre-procd apply: %s\n' "$edge" >&2; exit 1;
 		}
+		if [ "$expected_boot_result" = boot-policy-coordinated ]; then
+			[ -f "$active/dns-boot-pending" ] && [ ! -L "$active/dns-boot-pending" ]
+		fi
 		case "$edge" in
 			disabled) run_boot_entry "$rc_root/etc/rc.d/S95routepolicy" boot
 				[ ! -s "$tmp/boot-apply" ] && [ ! -s "$tmp/boot-inner-apply" ] || exit 1

@@ -72,4 +72,33 @@ if grep -R -n -E 'cleanup-legacy-splitroute-after-package-install\.sh' \
     fail '公开发布树引用了本地清理脚本'
 fi
 
+# 离线安装介质单入口契约
+[ -f scripts/install.sh ] || fail '缺少离线介质单入口 scripts/install.sh'
+case "$(sed -n '1p' scripts/install.sh)" in '#!'*sh*) ;; *) fail 'install.sh 缺少 POSIX shell shebang' ;; esac
+grep -Fq -- '--allow-local-unsigned' scripts/install.sh || fail '安装入口必须要求显式的本地未签名确认参数'
+grep -Fq 'sha256sum -c SHA256SUMS' scripts/install.sh || fail '安装入口必须先完整消费 SHA256SUMS 清单'
+grep -Fq 'apk adbdump' scripts/install.sh || fail '安装入口必须用 apk adbdump 解析本地 APK 元数据'
+if grep -Fq 'tar -x' scripts/install.sh; then fail '安装入口不得假定 APK 是 tar 归档'; fi
+grep -Fq -- '--network=no' scripts/install.sh || fail '未签名豁免必须限定在无网络阶段'
+grep -Fq -- '--repositories-file /dev/null' scripts/install.sh || fail '未签名豁免阶段必须切断软件源'
+grep -Fq -- '--simulate' scripts/install.sh || fail '离线安装前必须 simulate 预检'
+grep -Fq 'apk add --allow-untrusted' scripts/install.sh || fail '离线阶段必须以 apk add 安装两个本地 APK'
+if grep -Eq 'apk[[:space:]]+upgrade' scripts/install.sh; then fail '安装入口不得批量升级系统包'; fi
+grep -Fq 'DISTRIB_RELEASE' scripts/install.sh || fail '安装入口必须校验 OpenWrt 版本'
+grep -Fq -- '--print-arch' scripts/install.sh || fail '安装入口必须校验设备架构'
+grep -Fq 'routepolicy.main.enabled=1' scripts/install.sh || fail '升级已启用实例时不得宣称默认禁用或未接管'
+grep -Fq '"$OUT_DIR/install.sh"' scripts/ci/prepare-release.sh || fail 'Release 介质必须包含离线安装入口 install.sh'
+grep -Fq '+uhttpd +uhttpd-mod-ubus' luci-app-routepolicy/Makefile || fail 'LuCI 包必须显式依赖 uhttpd 与 uhttpd-mod-ubus'
+grep -Fq '+ucode' routepolicy/Makefile || fail '核心包必须显式依赖 ucode（rpcd ucode 插件运行时）'
+[ -f tests/ci/install-media-fixtures/core-adbdump.txt ] || fail '缺少真实 ADB 元数据测试夹具'
+grep -Fq 'arch: noarch' tests/ci/install-media-fixtures/luci-adbdump.txt || fail 'LuCI 夹具必须反映真实 noarch 架构'
+grep -Fq 'sh install.sh --allow-local-unsigned' README.md || fail 'README 安装流程必须使用介质单入口'
+grep -Fq 'sha256sum -c SHA256SUMS' luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status.js || fail '升级命令必须先校验介质'
+grep -Fq 'APK_CONFIG=/dev/null' scripts/install.sh || fail 'apk 调用必须命令级隔离 APK_CONFIG'
+grep -Fq 'distfeeds.list' scripts/install.sh || fail '阶段一官方源必须取自实际 distfeeds 文件'
+grep -Fq 'list --manifest --installed' scripts/install.sh || fail 'world 比较必须使用原生 manifest 精确 name/version'
+grep -Fq 'downloads.openwrt.org/releases' scripts/install.sh || fail '阶段一必须限定当前官方 distfeeds'
+grep -Fq 'routepolicyctl diagnose' luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status.js && fail '升级命令不得保留重复的 diagnose 行'
+sh tests/ci/install-media-tests.sh || fail '离线安装介质功能契约测试失败'
+
 printf '%s\n' '软件包安全契约测试通过。'

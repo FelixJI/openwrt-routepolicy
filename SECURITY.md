@@ -14,6 +14,8 @@
 
 RoutePolicy 的路由能力只管理自己的 nftables 表、策略规则和路由表。SmartDNS 页面可以在管理员明确授权后精确修改 `/etc/config/smartdns` 的标准字段和上游，并管理 90/91 自有片段；它不会把浏览器直接授权为整个 SmartDNS UCI 的写入者。
 
+SmartDNS 包切换由管理员在 SSH 显式执行。`smartdns-package-check` 和 `smartdns-package-switch` 接受固定 GitHub 来源的本地目标 APK，以及当前来源的精确旧包。OpenWrt 软件源旧包的目录须包含原签名 `packages.adb` 与 `smartdns-<已安装版本>.apk`，设备用现有信任密钥、APK 原生包身份和离线取包验证整条来源。官方 Release48.4 固定制品仍因安装元数据使非 root 用户可写包文件而拒绝；修改版只准入 README 指定的、已修复归属和架构标记的固定 CI 制品，不自动信任未来版本。切换使用单人维护窗口与统一写锁，关闭包脚本、提交钩子和 apk 网络访问。已接管时需要 dnsmasq 已停用且禁用自启动。未接管时仅允许替换已停止且 UCI 未启用的 SmartDNS，保留其原有自启动链接状态。失败恢复介质和事务记录由 root 保管，终态可显式执行 `smartdns-package-rollback`，中断可执行 `smartdns-package-recover`。发现外部配置冲突时保留文件和恢复记录。
+
 安全接口是枚举的 RPC 方法和仓库控制的固定完整命令字符串。请求只能包含有限协议、三态、受限长度字符串、数字范围、结构化服务器字段和固定用途的本地主机内容；任何请求字段都不会拼入 shell，动态正文只通过 stdin 传递。不提供任意命令、任意 SmartDNS 配置文本、`addition_arg`、任意 nft 文本或任意路径读写。缓存文件只允许 `/etc/smartdns/`、`/tmp/`、`/var/cache/` 下的普通非符号链接文件，候选与基线以 0600 保存并限制大小。
 
 观测 RPC 只暴露接口快照、集合摘要和枚举 dataset 查询。调用者不能指定 sysfs 路径、nft family/table/set 或任意文件；设备只能来自 RoutePolicy 配置经 ubus 解析并校验的实际设备。`query`、`cursor`、`limit`、`sort` 和返回条数都有硬上限，64 位累计计数以十进制字符串传输。源 IP nft set 同时设置 size、timeout 和 GC 上限，容量饱和不得改变 accept/route 行为。

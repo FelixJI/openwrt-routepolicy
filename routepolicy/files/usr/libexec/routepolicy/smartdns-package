@@ -1,0 +1,797 @@
+#!/bin/sh
+# OpenWrt ash supports function-local variables.
+# shellcheck disable=SC3043,SC1091
+set -u
+umask 077
+export LC_ALL=C
+LIBEXEC=${ROUTEPOLICY_LIBEXEC:-$(dirname "$0")}
+. "$LIBEXEC/common"
+. "$LIBEXEC/init-dns"
+
+operation=${1:-}; [ "$#" = 0 ] || shift
+STATE=$RP_SMARTDNS_PACKAGE_STATE
+JOURNAL=$STATE/current
+TAB=$(printf '\t')
+
+fail() { rp_output_error "smartdns-$operation" "$*"; exit 1; }
+apk_local() { apk_indexed /dev/null "$@"; }
+apk_indexed() {
+	local repositories=$1 applet=$2
+	shift 2
+	# Synchronous APK writers inherit FD9 and keep it until the native DB writer exits.
+	case "$applet" in
+		add|fix) set -- --scripts=no --commit-hooks=no "$@" ;;
+	esac
+	APK_CONFIG=/dev/null apk --progress=no --network=no --repositories-file "$repositories" "$applet" "$@"
+}
+
+source_pin() {
+	# Fixed repository build/release locator, asset, native version and verified APK identity.
+	case "$1" in
+		official) set -- pymumu/smartdns Release48.4 365407991 502435965 smartdns.1.2026.08.05-0921.x86_64-openwrt-all.apk 1.2026.08.05-r0921 dddc39bb2c20a430b2384eaa9abd4b2b81cde10e03cded88d0d81abb4b9c6a36 unavailable ;;
+		# APK digest is derived from the GitHub-digest-verified CI archive; see the integration record.
+		fork) set -- FelixJI/smartdns actions-run-43664354495 0 14141796762 smartdns.1.2026.11.15-2.x86_64-openwrt-all.apk 1.2026.11.15-r2 3d27484fa8f188dd6ed58d3db6eacb427def08a8f40c170c275c545153aa041c Q1xQ+vWwIV27WrxUCgRXiGCvuoTh8= ;;
+		*) return 1 ;;
+	esac
+	pin_version=$6 pin_digest=$7 pin_id=$8
+}
+
+safe_input() {
+	local details
+	[ -f "$1" ] && [ ! -L "$1" ] && details=$(path_details "$1") &&
+		rp_uint_between "${details##* }" 1 33554432
+}
+
+asset_digest() {
+	local output
+	output=$(sha256sum <"$1") || return 1
+	printf '%s\n' "${output%% *}"
+}
+
+installed_id() {
+	local database="$RP_ROOT/lib/apk/db/installed" identity
+	owned_regular "$database" && [ -s "$database" ] || return 1
+	identity=$(awk -v RS='' -F '\n' '
+		{ name=version=arch=id=""; p=v=a=c=0; for (i=1;i<=NF;i++) {
+			key=substr($i,1,2); value=substr($i,3)
+			if(key!~/^[A-Za-z]:$/) invalid=1
+			if(key=="P:"){name=value;p++} if(key=="V:"){version=value;v++}
+			if(key=="A:"){arch=value;a++} if(key=="C:"){id=value;c++}
+		}
+		if(p!=1 || v!=1 || a!=1 || c!=1 || name!~/^[0-9A-Za-z.+_-]+$/ ||
+			version!~/^[0-9A-Za-z.+_~-]+$/ || arch!~/^[0-9A-Za-z_]+$/ || id!~/^[0-9A-Za-z+\/=]+$/) invalid=1
+		if(name=="smartdns") { found++; identity=version "\t" arch "\t" id } }
+		END {
+			if (!NR || invalid || found>1) exit 1
+			if (!found) print "absent"
+			else print identity
+		}
+	' "$database") || return 1
+	[ "$identity" != absent ] || return 2
+	printf '%s\n' "$identity"
+}
+
+apk_identity() {
+	local version arch
+	version=$(sed -n 's/^  version: //p' "$1") && arch=$(sed -n 's/^  arch: //p' "$1") || return 1
+	[ "$(sed -n 's/^  name: //p' "$1")" = smartdns ] || return 1
+	case "$version" in ''|*[!0-9A-Za-z.+_-]*) return 1 ;; esac
+	case "$arch" in noarch|x86_64) ;; *) return 1 ;; esac
+	printf '%s\t%s\n' "$version" "$arch"
+}
+
+apk_file_list() {
+	# Read only APK's own ADB paths. The package may ship its own init and code,
+	# but cannot claim RoutePolicy fragments, system config or unrelated paths.
+	awk '
+		function emit(    full) {
+			if (!node) return
+			full=(is_file ? dir "/" name : name)
+			if (full ~ /(^|\/)\.\.?($|\/)/ || full ~ /[^A-Za-z0-9_.+\/-]/ || full ~ /\/\// || seen[full]++) bad=1
+			if (user!="root" || group!="root" || mode!~/^0[0-7][0-7][0-7]$/ ||
+				(target=="" && mode!~/^0[0-7][0145][0145]$/)) bad=1
+			if (!is_file) {
+				if (target!="" || (full!="" && full!~/^(etc|etc\/config|etc\/init.d|etc\/smartdns(\/.*)?|lib|lib\/apk|lib\/apk\/packages|usr|usr\/sbin|usr\/lib|usr\/lib\/smartdns(\/.*)?|usr\/local|usr\/local\/lib|usr\/local\/lib\/smartdns(\/.*)?|usr\/share|usr\/share\/smartdns(\/.*)?)$/)) bad=1
+				return
+			}
+			if (full!~/^(etc\/config\/smartdns|etc\/init.d\/smartdns|etc\/smartdns\/.+|lib\/apk\/packages\/smartdns\.(conffiles|conffiles_static|list)|usr\/sbin\/smartdns|usr\/local\/lib\/smartdns\/.+|usr\/lib\/smartdns\/.+|usr\/share\/smartdns\/.+)$/ ||
+				full~/^etc\/smartdns\/conf.d\/(90-routepolicy|91-routepolicy-smartdns-extra)\.conf$/) bad=1
+			if (full=="etc/init.d/smartdns" && target=="") init=1
+			if (full=="usr/sbin/smartdns") binary=1
+			if (target!="") {
+				# Only the audited APK wrapper symlink is supported.
+				if (!(full=="usr/sbin/smartdns" && target=="00a02f7573722f6c6f63616c2f6c69622f736d617274646e732f72756e2d736d617274646e73") &&
+					!(full=="usr/local/lib/smartdns/lib/ld-linux.so" && target=="00a06c642d6d75736c2d7838365f36342e736f2e31") &&
+					!(full=="usr/local/lib/smartdns/lib/ld-musl-x86_64.so.1" && target=="00a06c6962632e736f")) bad=1
+			} else if (length(hash)!=64 || hash~/[^0-9a-f]/) bad=1
+			print full "\t" mode "\t" (target!="" ? target : hash)
+		}
+		function reset() { node=1; user=group=mode=target=hash="" }
+		/^paths: / { if (paths++)bad=1; inpaths=1; next }
+		inpaths && /^[^ #]/ { emit(); node=0; inpaths=0 }
+		!inpaths { next }
+		/^  - name: / { emit(); reset(); is_file=0; name=substr($0,11); dir=name; next }
+		/^  - acl:$/ { emit(); reset(); is_file=0; name=dir=""; next }
+		/^      - name: / { emit(); reset(); is_file=1; name=substr($0,15); next }
+		/^      (user|group|mode): |^          (user|group|mode): / {
+			if ($1=="user:")user=$2; if($1=="group:")group=$2; if($1=="mode:")mode=$2
+		}
+		/^        hash: / { hash=$2 }
+		/^        target: / { target=$2 }
+		END { if(inpaths)emit(); if(bad || !paths || !init || !binary)exit 1 }
+	' "$1"
+}
+
+read_apk() {
+	local apk=$1 record=$2 digest mode=$3
+	safe_input "$apk" || return 1
+	if [ "$mode" != feed ]; then
+		digest=$(asset_digest "$apk") || return 1
+		if [ "$mode" != current ]; then
+			source_pin "$mode" && [ "$digest" = "$pin_digest" ] || return 1
+		elif source_pin official && [ "$digest" = "$pin_digest" ]; then mode=official
+		elif source_pin fork && [ "$digest" = "$pin_digest" ]; then mode=fork
+		else rp_err '旧 APK 不在已证实的来源与包身份清单中'; return 1; fi
+	fi
+	apk_local adbdump "$apk" >"$record.adb" && apk_identity "$record.adb" >"$record.package" || return 1
+	apk_file_list "$record.adb" >"$record.files" || { rp_err 'APK 安装路径、属主、权限或链接不符合 SmartDNS 准入条件'; return 1; }
+	printf '%s\n' "$mode" >"$record.source" || return 1
+	if [ "$mode" != feed ]; then
+		[ "$(cut -f 1 "$record.package")" = "$pin_version" ] && [ "$pin_id" != unavailable ] || return 1
+		printf '%s\t%s\n' "$(cat "$record.package")" "$pin_id" >"$record.id"
+	fi
+}
+
+apk_size_kib() {
+	local bytes
+	bytes=$(awk '
+		/^info:$/ {info=1; next}
+		info && /^[^ ]/ {info=0}
+		info && /^  installed-size: / {count++; size=$2; if(NF!=2) bad=1}
+		END {if(count!=1 || bad || size!~/^[1-9][0-9]*$/) exit 1; print size}
+	' "$1") && rp_uint_between "$bytes" 1 2147483647 || return 1
+	printf '%s\n' "$(((bytes + 1023) / 1024))"
+}
+
+disk_usage_kib() {
+	local usage
+	usage=$(du -sk "$1") || return 1
+	usage=${usage%%[[:space:]]*}
+	rp_uint_between "$usage" 0 2147483647 && printf '%s\n' "$usage"
+}
+
+probe_inodes() {
+	local directory=$1 count=$2 i=0
+	mkdir "$directory" || return 1
+	while [ "$i" -lt "$count" ]; do
+		printf '' >"$directory/$i" || return 1
+		i=$((i + 1))
+	done
+	rm -rf -- "$directory"
+}
+
+recovery_space_available() {
+	local work=$1 staged=$2 old_size new_size wal database config=0 available required entries payload_entries
+	old_size=$(apk_size_kib "$work/old.adb") && new_size=$(apk_size_kib "$work/new.adb") &&
+		wal=$(disk_usage_kib "$staged") && database=$(disk_usage_kib "$RP_ROOT/lib/apk/db") || return 1
+	if [ -d "$staged/config" ]; then config=$(disk_usage_kib "$staged/config") || return 1; fi
+	available=$(df -Pk "$STATE") || return 1
+	available=$(printf '%s\n' "$available" | awk 'NR==2 {print $4} END {if(NR!=2) exit 1}') &&
+		rp_uint_between "$available" 0 2147483647 || return 1
+	# WAL already occupies disk: reserve unpacking both images, a cached copy, DB/config rewrites and 4 MiB for block/metadata overhead.
+	required=$((old_size + new_size + wal + 2 * database + config + 4096))
+	[ "$available" -ge "$required" ] || return 1
+	entries=$(find "$staged" "$RP_ROOT/lib/apk/db" -print) || return 1
+	entries=$(printf '%s\n' "$entries" | wc -l | tr -d '[:space:]')
+	payload_entries=$(awk '/^  - (name:|acl:)|^      - name:/ {n++} END {print n+0}' "$work/old.adb" "$work/new.adb") || return 1
+	# OpenWrt lacks df -i: verify allocation on the same filesystem before stopping DNS.
+	probe_inodes "$staged/inode-check" "$((payload_entries + 2 * entries + 128))"
+}
+
+cleanup_staging() {
+	local pending suffix
+	[ "$(owned_mode "$STATE" d)" = 0700 ] && [ ! -e "$JOURNAL" ] && [ ! -L "$JOURNAL" ] || return 1
+	# Under the shared writer lock, this private namespace contains only unpublished temporary data.
+	for pending in "$STATE"/.stage.??????; do
+		[ -e "$pending" ] || [ -L "$pending" ] || continue
+		suffix=${pending##*/}; suffix=${suffix#.stage.}
+		case "$suffix" in *[!A-Za-z0-9]*) return 1 ;; esac
+		[ ! -L "$pending" ] && [ "$(owned_mode "$pending" d)" = 0700 ] || return 1
+		rm -rf -- "$pending" || return 1
+	done
+}
+
+package_plan() {
+	local log=$1 artifact=$2 version=$3 action=${4:-replace}
+	apk_local add --simulate --allow-untrusted "$artifact" >"$log" 2>&1 &&
+		check_plan "$log" "$version" "$action"
+}
+
+index_identity() {
+	local metadata=$1 version=$2 arch=$3 hex id
+	hex=$(awk -v version="$version" -v arch="$arch" '
+		function flush() {
+			if (name=="smartdns" && v==version && a==arch) {count++; print hashes}
+			name=v=a=hashes=""
+		}
+		/^  - name: / {flush(); name=$3; next}
+		/^    version: / {v=$2}
+		/^    arch: / {a=$2}
+		/^    hashes: / {hashes=$2}
+		END {flush(); if(count!=1) exit 1}
+	' "$metadata") || return 1
+	[ "${#hex}" -eq 64 ] || return 1
+	case "$hex" in *[!0-9a-f]*) return 1 ;; esac
+	# apk db C: uses the first 20 bytes of the signed index's hash, encoded as Q1.
+	rp_have ucode || { rp_err '需要 OpenWrt 自带的 ucode 才能读取签名索引中的 APK 原生身份'; return 1; }
+	id=$(ucode -e '
+		let hex = ARGV[0];
+		let bytes = "";
+		for (let i = 0; i < 40; i += 2)
+			bytes += chr(int(substr(hex, i, 2), 16));
+		print(b64enc(bytes));
+	' -- "$hex") || return 1
+	[ "${#id}" -eq 28 ] || return 1
+	printf 'Q1%s\n' "$id"
+}
+
+prepare_indexed_media() {
+	local from=$1 work=$2 slot=$3 installed=$4 repo version arch id
+	IFS="$TAB" read -r version arch id <<EOF
+$installed
+EOF
+	case "$version" in ''|*[!0-9A-Za-z.+_-]*) return 1 ;; esac
+	[ "$arch" = x86_64 ] && [ -d "$from" ] && [ ! -L "$from" ] || return 1
+	repo="$work/$slot-repo"
+	mkdir "$repo" && safe_input "$from/packages.adb" && safe_input "$from/smartdns-$version.apk" &&
+		cp "$from/packages.adb" "$from/smartdns-$version.apk" "$repo/" || return 1
+	apk_local verify "$repo/packages.adb" && apk_local adbdump "$repo/packages.adb" >"$work/$slot-index.adb" &&
+		[ "$(index_identity "$work/$slot-index.adb" "$version" "$arch")" = "$id" ] || return 1
+	printf '%s\n' "$repo/packages.adb" >"$work/$slot-repositories" &&
+		apk_indexed "$work/$slot-repositories" fetch --stdout smartdns >"$work/$slot-fetched.apk" &&
+		cmp -s "$repo/smartdns-$version.apk" "$work/$slot-fetched.apk" || return 1
+	rm "$work/$slot-fetched.apk" || return 1
+	read_apk "$repo/smartdns-$version.apk" "$work/$slot" feed &&
+		[ "$(cat "$work/$slot.package")" = "$version$TAB$arch" ] || return 1
+	printf '%s\n' "$installed" >"$work/$slot.id"
+}
+
+indexed_add_plan() {
+	local repositories=$1 selector=$2 version=$3 log=$4 expected_action=${5:-selector}
+	apk_indexed "$repositories" add --simulate "$selector" >"$log" 2>&1 &&
+		check_plan "$log" "$version" "$expected_action"
+}
+
+check_plan() {
+	awk -v version="$2" -v expected="$3" '
+		/^[[:blank:]]*\(/ {
+			if (!sub(/^[[:blank:]]*\([[:blank:]]*1[[:blank:]]*\/[[:blank:]]*1[[:blank:]]*\)[[:blank:]]+/, "")) {bad=1; next}
+			n++
+			if ($2!="smartdns" || ($NF!=version ")" && $NF!="(" version ")")) bad=1
+			if (expected=="install" && $1!="Installing") bad=1
+			if (expected=="reinstall" && $1!="Reinstalling") bad=1
+			if (expected~/^(replace|selector)$/ && $1!~/^(Upgrading|Downgrading|Reinstalling|Replacing)$/) bad=1
+		}
+		END {exit bad || n>1 || (expected!="selector" && n!=1)}
+	' "$1"
+}
+
+world_others() {
+	local selectors
+	selectors=$(awk '!/^smartdns($|[<>=~@])/' "$RP_ROOT/etc/apk/world") || return 1
+	printf '%s\n' "$selectors" | sort
+}
+original_selectors() { awk '/^smartdns($|[<>=~@])/' "$RP_ROOT/etc/apk/world"; }
+world_matches() {
+	local selector=$1 selectors
+	selectors=$(awk '/^smartdns($|[<>=~@])/' "$RP_ROOT/etc/apk/world") || return 1
+	[ "$selectors" = "$selector" ] && world_others | cmp -s "$JOURNAL/world" -
+}
+
+path_details() {
+	local listing
+	listing=$(ls -ldn -- "$1") || return 1
+	printf '%s\n' "$listing" | awk '
+		function bits(start) {
+			return 4*(substr($1,start,1)=="r") + 2*(substr($1,start+1,1)=="w") + (substr($1,start+2,1)=="x")
+		}
+		NR!=1 || NF<9 || $1!~/^[-dl][r-][w-][x-][r-][w-][x-][r-][w-][x-]$/ ||
+			$2!~/^[0-9]+$/ || $3!~/^[0-9]+$/ || $4!~/^[0-9]+$/ || $5!~/^[0-9]+$/ {bad=1; next}
+		{printf "%s 0%d%d%d %s %s %s\n", substr($1,1,1),bits(2),bits(5),bits(8),$3,$4,$5}
+		END {exit bad || NR!=1}
+	'
+}
+
+owned_mode() {
+	local details kind mode uid gid
+	details=$(path_details "$1") || return 1
+	read -r kind mode uid gid _ <<EOF
+$details
+EOF
+	[ "$kind:$uid:$gid" = "$2:0:0" ] || return 1
+	case "$kind:$mode" in
+		l:0[0-7][0-7][0-7]|[-d]:0[0-7][0145][0145]) printf '%s\n' "$mode" ;;
+		*) return 1 ;;
+	esac
+}
+
+owned_regular() { [ -f "$1" ] && [ ! -L "$1" ] && owned_mode "$1" - >/dev/null; }
+
+owned_parents() {
+	local path=${1%/*}
+	while [ -n "$path" ] && [ "$path" != "$RP_ROOT" ]; do
+		[ ! -L "$path" ] || return 1
+		if [ -e "$path" ]; then
+			[ -d "$path" ] || return 1
+			owned_mode "$path" d >/dev/null || return 1
+		fi
+		path=${path%/*}
+	done
+}
+
+digest_in_manifests() {
+	local path=$1 file=$2 digest
+	digest=$(asset_digest "$file") || return 1
+	awk -F '\t' -v path="$path" -v digest="$digest" '$1==path && $3==digest {found=1} END {exit !found}' \
+		"$JOURNAL/old.files" "$JOURNAL/new.files"
+}
+
+config_paths() {
+	printf '%s\n' etc/config/smartdns etc/smartdns/conf.d/90-routepolicy.conf etc/smartdns/conf.d/91-routepolicy-smartdns-extra.conf
+	awk -F '\t' '$1~/^etc\/smartdns\// {print $1; print $1 ".apk-new"} $1=="etc/config/smartdns" {print $1 ".apk-new"}' "$1/old.files" "$1/new.files"
+}
+
+snapshot_config() {
+	local work=$1 relative path
+	config_paths "$work" | sort -u >"$work/config-paths" || return 1
+	while IFS= read -r relative; do
+		path="$RP_ROOT/$relative"
+		owned_parents "$path" && [ ! -L "$path" ] || return 1
+		[ -e "$path" ] || continue
+		owned_regular "$path" && mkdir -p "$work/config/${relative%/*}" && cp -p "$path" "$work/config/$relative" || return 1
+	done <"$work/config-paths"
+	for relative in network dhcp firewall routepolicy; do
+		owned_regular "$RP_ROOT/etc/config/$relative" && cp -p "$RP_ROOT/etc/config/$relative" "$work/$relative" || return 1
+	done
+	if [ -e "$RP_ROOT/etc/crontabs/root" ] || [ -L "$RP_ROOT/etc/crontabs/root" ]; then
+		owned_regular "$RP_ROOT/etc/crontabs/root" && cp -p "$RP_ROOT/etc/crontabs/root" "$work/crontab" || return 1
+	fi
+}
+
+other_config_unchanged() {
+	local config
+	for config in network dhcp firewall routepolicy; do
+		owned_regular "$RP_ROOT/etc/config/$config" && cmp -s "$JOURNAL/$config" "$RP_ROOT/etc/config/$config" || return 1
+	done
+	if [ -f "$JOURNAL/crontab" ]; then
+		owned_regular "$RP_ROOT/etc/crontabs/root" && cmp -s "$JOURNAL/crontab" "$RP_ROOT/etc/crontabs/root"
+	else [ ! -e "$RP_ROOT/etc/crontabs/root" ] && [ ! -L "$RP_ROOT/etc/crontabs/root" ]; fi
+}
+
+preserve_config() {
+	local action=$1 relative path saved temp template manifest=$2 path_mode saved_mode
+	other_config_unchanged || return 1
+	while IFS= read -r relative; do
+		case "$relative" in etc/config/smartdns|etc/config/smartdns.apk-new|etc/smartdns/*) ;; *) return 1 ;; esac
+		path="$RP_ROOT/$relative"; saved="$JOURNAL/config/$relative"
+		owned_parents "$path" && [ ! -L "$path" ] || return 1
+		if [ -e "$path" ]; then
+			path_mode=$(owned_mode "$path" -) || return 1
+			if [ -f "$saved" ]; then
+				saved_mode=$(owned_mode "$saved" -) || return 1
+				if [ "$saved_mode" = "$path_mode" ] && cmp -s "$saved" "$path"; then continue; fi
+			fi
+			if [ ! -f "$saved" ] && digest_in_manifests "$relative" "$path" &&
+				grep -Fq "$relative$TAB" "$manifest"; then continue; fi
+			[ "$action" = restore ] || return 1
+			template=${relative%.apk-new}
+			digest_in_manifests "$template" "$path" || {
+				[ -f "$saved" ] && cmp -s "$saved" "$path" || return 1
+			}
+		elif [ ! -f "$saved" ]; then continue
+		else
+			[ "$action" = restore ] && grep -Fq "$relative$TAB" "$JOURNAL/old.files" "$JOURNAL/new.files" || return 1
+		fi
+		if [ -f "$saved" ]; then
+			mkdir -p "${path%/*}" && temp=$(mktemp "$path.routepolicy.XXXXXX") || return 1
+			cp -p "$saved" "$temp" && mv -f "$temp" "$path" || { rm -f "$temp"; return 1; }
+		else
+			rm -f "$path" || return 1
+		fi
+	done <"$JOURNAL/config-paths"
+}
+
+native_payload_matches() {
+	local manifest=$1 relative mode stamp path target
+	while IFS="$TAB" read -r relative mode stamp; do
+		case "$relative" in etc/config/smartdns|etc/smartdns/*) continue ;; esac
+		path="$RP_ROOT/$relative"
+		owned_parents "$path" || return 1
+		case "$relative:$stamp" in
+			usr/sbin/smartdns:00a0*) target=/usr/local/lib/smartdns/run-smartdns ;;
+			usr/local/lib/smartdns/lib/ld-linux.so:00a0*) target=ld-musl-x86_64.so.1 ;;
+			usr/local/lib/smartdns/lib/ld-musl-x86_64.so.1:00a0*) target=libc.so ;;
+			*) target= ;;
+		esac
+		if [ -n "$target" ]; then
+			[ -L "$path" ] && owned_mode "$path" l >/dev/null && [ "$(readlink "$path")" = "$target" ] || return 1
+		else
+			[ "$(owned_mode "$path" -)" = "$mode" ] && [ "$(asset_digest "$path")" = "$stamp" ] || return 1
+		fi
+	done <"$manifest"
+}
+
+native_elf_x86_64() {
+	local path="$RP_ROOT/usr/sbin/smartdns" header
+	[ ! -L "$path" ] || path="$RP_ROOT/usr/local/lib/smartdns/smartdns"
+	header=$(hexdump -v -n 20 -e '1/1 "%02x"' "$path") || return 1
+	case "$header" in 7f454c46020101??????????????????????3e00) return 0 ;; *) return 1 ;; esac
+}
+
+target_paths_admit() {
+	local work=$1 relative path
+	while IFS="$TAB" read -r relative _; do
+		path="$RP_ROOT/$relative"
+		owned_parents "$path" || return 1
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		case "$relative" in etc/config/smartdns|etc/smartdns/*) ;; *)
+			grep -Fq "$relative$TAB" "$work/old.files" || return 1 ;;
+		esac
+	done <"$work/new.files"
+}
+
+no_pending_config() {
+	local config delta path
+	for config in network dhcp firewall routepolicy smartdns; do
+		delta=$(uci -q changes "$config") && [ -z "$delta" ] || return 1
+	done
+	for path in "$RP_ROOT/var/run/rpcd/snapshot-files" "$RP_ROOT/var/run/rpcd/snapshot-delta"; do
+		[ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+	done
+}
+
+admit_services() {
+	local root enabled running
+	root=$(rp_smartdns_single_root) && enabled=$(init_dns_enabled smartdns) && running=$(init_dns_service_state smartdns) || return 1
+	if rp_init_active_record >/dev/null; then
+		[ "$enabled:$running" = 1:1 ] && "$LIBEXEC/init-transaction" package-dns-verify || return 1
+		printf 'managed\n'
+	else
+		[ "$running" = 0 ] && [ "$(uci -q get "smartdns.$root.enabled")" = 0 ] || return 1
+		case "$enabled" in
+			0) printf 'inactive\n' ;;
+			1) printf 'inactive-enabled\n' ;;
+			*) return 1 ;;
+		esac
+	fi
+}
+
+save_dnsmasq() {
+	local settings services
+	settings=$(init_dns_enabled dnsmasq) || return 1
+	services=$(ubus -t 3 call service list '{"name":"dnsmasq"}') || return 1
+	case "$services" in \{*\}) ;; *) return 1 ;; esac
+	printf '%s\n%s\n' "$settings" "$services"
+}
+
+publish_phase() {
+	printf '%s\n' "$1" >"$JOURNAL/phase.new" && mv -f "$JOURNAL/phase.new" "$JOURNAL/phase" && sync
+}
+
+same_boot() { cmp -s "$JOURNAL/boot-id" "$RP_ROOT/proc/sys/kernel/random/boot_id"; }
+
+cache_isolate() {
+	local cache="$RP_RUN_DIR/smartdns.cache"
+	[ ! -L "$cache" ] || return 1
+	[ -e "$cache" ] || return 0
+	[ -f "$cache" ] && [ ! -e "$RP_RUN_DIR/smartdns-package.cache" ] && [ ! -L "$RP_RUN_DIR/smartdns-package.cache" ] &&
+		mv "$cache" "$RP_RUN_DIR/smartdns-package.cache"
+}
+
+ensure_guards() {
+	rp_native_service routepolicy-prerecover enable >/dev/null &&
+		rp_native_service routepolicy-initguard enable >/dev/null &&
+		rp_native_run 15 "$RP_ROOT/etc/init.d/routepolicy-initguard" start event >/dev/null || return 1
+	[ "$(init_dns_enabled routepolicy-prerecover)$(init_dns_enabled routepolicy-initguard)" = 11 ] &&
+		[ "$(init_dns_service_state routepolicy-initguard)" = 1 ]
+}
+
+quiesce() {
+	local dir="$RP_ROOT/etc/rc.d" link
+	owned_parents "$dir/smartdns" || return 1
+	for link in "$dir"/[SK][0-9][0-9]smartdns; do
+		[ -e "$link" ] || [ -L "$link" ] || continue
+		[ -L "$link" ] && owned_mode "$link" l >/dev/null || return 1
+		case "$(readlink "$link")" in ../init.d/smartdns|/etc/init.d/smartdns) ;; *) return 1 ;; esac
+	done
+	for link in "$dir"/[SK][0-9][0-9]smartdns; do
+		[ -L "$link" ] || continue
+		rm "$link" || return 1
+	done
+	# Persist removal before touching APK state or any conflict check that may fail.
+	boot_links_absent && sync && init_dns_stop
+}
+
+boot_links_absent() {
+	local link
+	for link in "$RP_ROOT"/etc/rc.d/[SK][0-9][0-9]smartdns; do
+		[ ! -e "$link" ] && [ ! -L "$link" ] || return 1
+	done
+}
+
+running_payload_matches() {
+	local pid expected
+	pid=$(ubus -t 3 call service list '{"name":"smartdns"}' | jsonfilter -e '@.smartdns.instances[@.running=true].pid') || return 1
+	rp_uint_between "$pid" 1 4194304 || return 1
+	expected=/usr/sbin/smartdns
+	[ ! -L "$RP_ROOT$expected" ] || expected=/usr/local/lib/smartdns/smartdns
+	[ "$(readlink "$RP_ROOT/proc/$pid/exe")" = "$expected" ]
+}
+
+restore_service() {
+	local role=$1 remaining=8 root
+	case "$role" in
+		managed)
+			"$LIBEXEC/init-transaction" package-dns-admit && init_dns_call smartdns start || return 1
+			until running_payload_matches; do
+				[ "$remaining" -gt 0 ] || return 1
+				sleep 1; remaining=$((remaining-1))
+			done
+			init_dns_call smartdns enable && "$LIBEXEC/init-transaction" package-dns-verify
+			;;
+		inactive) [ "$(init_dns_enabled smartdns)$(init_dns_service_state smartdns)" = 00 ] ;;
+		inactive-enabled)
+			# The official package enables boot links even when UCI disables DNS.
+			root=$(rp_smartdns_single_root) && [ "$(uci -q get "smartdns.$root.enabled")" = 0 ] &&
+				preserve_config verify "${2:-}" && init_dns_call smartdns enable &&
+				[ "$(init_dns_enabled smartdns)$(init_dns_service_state smartdns)" = 10 ] ;;
+		*) return 1 ;;
+	esac
+}
+
+reconcile_package() {
+	local slot=$1 current=$2 expected version source selector action=replace
+	expected=$(cat "$JOURNAL/$slot.id") || return 1
+	version=${expected%%"$TAB"*}; selector="smartdns><${expected##*"$TAB"}"
+	source=$(cat "$JOURNAL/$slot.source") || return 1
+	case "$source" in
+		feed) selector="smartdns=$version" ;;
+		official|fork)
+			source_pin "$source" && [ "$version" = "$pin_version" ] && [ "${expected##*"$TAB"}" = "$pin_id" ] &&
+				safe_input "$JOURNAL/$slot.apk" && [ "$(asset_digest "$JOURNAL/$slot.apk")" = "$pin_digest" ] || return 1
+			;;
+		*) return 1 ;;
+	esac
+	if [ "$slot" = old ] && [ "$current" = "$expected" ]; then
+		# An interrupted APK may have written files without changing its DB identity.
+		world_matches "$selector" || {
+			world_others | cmp -s "$JOURNAL/world" - && original_selectors | cmp -s "$JOURNAL/smartdns-selector" - || return 1
+		}
+		if ! native_payload_matches "$JOURNAL/$slot.files"; then
+			if [ "$source" = feed ]; then
+				restore_indexed_apk "$slot" "$version" "$current" "$expected" "$selector" && world_matches "$selector" || return 1
+			else
+				reinstall_fixed_apk "$JOURNAL/$slot.apk" "$version" "$pin_id" || return 1
+			fi
+			[ "$(installed_id)" = "$expected" ] && world_others | cmp -s "$JOURNAL/world" - &&
+				native_payload_matches "$JOURNAL/$slot.files" || return 1
+		fi
+	else
+		if [ "$source" = feed ]; then
+			restore_indexed_apk "$slot" "$version" "$current" "$expected" "$selector" || return 1
+		else
+			[ -n "$current" ] || action=install
+			package_plan "$JOURNAL/$slot.plan" "$JOURNAL/$slot.apk" "$version" "$action" &&
+				apk_local add --allow-untrusted "$JOURNAL/$slot.apk" || return 1
+		fi
+		[ "$(installed_id)" = "$expected" ] && world_matches "$selector" &&
+			native_payload_matches "$JOURNAL/$slot.files" || return 1
+	fi
+	preserve_config restore "$JOURNAL/$slot.files"
+}
+
+reinstall_fixed_apk() {
+	local artifact=$1 version=$2 id=$3 suffix cache status=0 selectors log
+	[ "${#id}" -eq 30 ] || return 1
+	case "$id" in Q1*[!A-Za-z0-9+/=]*) return 1 ;; Q1*=) ;; *) return 1 ;; esac
+	rp_have ucode || { rp_err '需要 OpenWrt 自带的 ucode 才能读取 APK 缓存身份'; return 1; }
+	suffix=$(ucode -e '
+		let bytes = b64dec(ARGV[0]);
+		for (let i = 0; i < 4; i++)
+			printf("%02x", ord(bytes, i));
+	' -- "${id#Q1}") || return 1
+	[ "${#suffix}" -eq 8 ] || return 1
+	case "$suffix" in *[!0-9a-f]*) return 1 ;; esac
+	[ "$(owned_mode "$JOURNAL" d)" = 0700 ] || return 1
+	selectors=$(original_selectors) || return 1
+	cache=$(mktemp -d "$JOURNAL/reinstall.XXXXXX") || return 1
+	# apk 3 uses ${name}-${version}.${hash:8}.apk in its native cache.
+	cp "$artifact" "$cache/smartdns-$version.$suffix.apk" &&
+		apk_local fix --cache-dir "$cache" --simulate --reinstall --allow-untrusted smartdns >"$cache/plan" 2>&1 &&
+		check_plan "$cache/plan" "$version" reinstall &&
+		apk_local fix --cache-dir "$cache" --reinstall --allow-untrusted smartdns >"$cache/result" 2>&1 &&
+		check_plan "$cache/result" "$version" reinstall &&
+		[ "$(original_selectors)" = "$selectors" ] || status=1
+	if [ "$status" != 0 ]; then
+		for log in "$cache/plan" "$cache/result"; do
+			[ ! -f "$log" ] || cat "$log" >&2
+		done
+	fi
+	rm -rf "$cache" || return 1
+	return "$status"
+}
+
+restore_indexed_apk() {
+	local slot=$1 version=$2 current=$3 expected=$4 selector=$5 repos="$JOURNAL/repositories" action=selector
+	[ -n "$current" ] || action=install
+	printf '%s\n' "$JOURNAL/$slot-repo/packages.adb" >"$repos" || return 1
+	if [ "$current" != "$expected" ] || [ "$(original_selectors)" != "$selector" ]; then
+		indexed_add_plan "$repos" "$selector" "$version" "$JOURNAL/indexed-plan" "$action" &&
+			apk_indexed "$repos" add "$selector" || return 1
+	fi
+	if ! native_payload_matches "$JOURNAL/$slot.files"; then
+		apk_indexed "$repos" fix --simulate --reinstall smartdns >"$JOURNAL/indexed-plan" 2>&1 &&
+			check_plan "$JOURNAL/indexed-plan" "$version" reinstall &&
+			apk_indexed "$repos" fix --reinstall smartdns
+	fi
+}
+
+finish_transaction() {
+	local phase=$1
+	# The same directory rename publishes the cached pair and clears the writer gate.
+	case "$phase" in
+		committed)
+			if [ -e "$STATE/previous" ] || [ -L "$STATE/previous" ]; then
+				[ -d "$STATE/previous" ] && [ ! -L "$STATE/previous" ] && rm -rf "$STATE/previous" || return 1
+			fi
+			mv "$JOURNAL" "$STATE/previous" && sync ;;
+		prepared|rolled-back)
+			if [ -e "$STATE/recovered" ] || [ -L "$STATE/recovered" ]; then
+				[ -d "$STATE/recovered" ] && [ ! -L "$STATE/recovered" ] && rm -rf "$STATE/recovered" || return 1
+			fi
+			mv "$JOURNAL" "$STATE/recovered" && sync && rm -rf "$STATE/recovered" ;;
+		*) return 1 ;;
+	esac
+}
+
+recover_transaction() {
+	local operation=$operation phase role current db_status=0
+	case "$operation" in package-switch|package-rollback) operation='package-recover' ;; esac
+	[ -d "$JOURNAL" ] && [ ! -L "$JOURNAL" ] && owned_regular "$JOURNAL/phase" || return 1
+	phase=$(cat "$JOURNAL/phase") || return 1
+	case "$phase" in prepared|committed|rolled-back) finish_transaction "$phase"; return ;; armed|apk-attempted) ;; *) return 1 ;; esac
+	quiesce || return 1
+	rp_writer_enter smartdns-package || return 1
+	role=$(cat "$JOURNAL/role") || return 1
+	case "$role" in inactive|inactive-enabled|managed) ;; *) return 1 ;; esac
+	current=$(installed_id) || db_status=$?
+	if [ "$db_status" = 2 ]; then
+		[ "$phase" = apk-attempted ] || return 1
+		current=
+	elif [ "$db_status" != 0 ] || { [ "$current" != "$(cat "$JOURNAL/old.id")" ] && [ "$current" != "$(cat "$JOURNAL/new.id")" ]; }; then
+		rp_err '已安装 SmartDNS 包的身份发生外部变化，已保留现场'; return 1
+	fi
+	if [ "$phase" = armed ]; then
+		[ "$current" = "$(cat "$JOURNAL/old.id")" ] && native_payload_matches "$JOURNAL/old.files" || return 1
+	fi
+	no_pending_config && other_config_unchanged || return 1
+	if [ "$phase" = apk-attempted ]; then reconcile_package old "$current" || return 1; fi
+	if [ "$operation" = package-recover-early ]; then
+		# The existing S18/S94 coordinator restores managed DNS after policy setup.
+		case "$role" in
+			inactive) : ;;
+			inactive-enabled) restore_service "$role" "$JOURNAL/old.files" || return 1 ;;
+			managed) [ "$(init_dns_enabled dnsmasq)" = 0 ] || return 1 ;;
+		esac
+	elif [ "$role" = managed ] && ! same_boot; then
+		# S18 may have failed before publishing pending; the boot coordinator owns DNS.
+		[ "$(init_dns_enabled dnsmasq)" = 0 ] || return 1
+	else
+		if [ -e "$RP_RUN_DIR/smartdns-package.cache" ]; then
+			[ -f "$RP_RUN_DIR/smartdns-package.cache" ] && [ ! -L "$RP_RUN_DIR/smartdns-package.cache" ] &&
+				[ ! -L "$RP_RUN_DIR/smartdns.cache" ] && mv -f "$RP_RUN_DIR/smartdns-package.cache" "$RP_RUN_DIR/smartdns.cache" || return 1
+		fi
+		restore_service "$role" "$JOURNAL/old.files" && preserve_config verify "$JOURNAL/old.files" &&
+			save_dnsmasq | cmp -s "$JOURNAL/dnsmasq" - || return 1
+	fi
+	publish_phase rolled-back && finish_transaction rolled-back
+}
+
+switch_package() {
+	local role=$1 current
+	quiesce && { [ "$role" != managed ] || cache_isolate; } &&
+		boot_links_absent && publish_phase apk-attempted && current=$(installed_id) && reconcile_package new "$current" &&
+		native_elf_x86_64 && restore_service "$role" "$JOURNAL/new.files" &&
+		preserve_config verify "$JOURNAL/new.files" && save_dnsmasq | cmp -s "$JOURNAL/dnsmasq" -
+}
+
+prepare_media() {
+	local source=$1 target=$2 old=$3 work=$4 previous_id current_id
+	if [ "$operation" = package-rollback ] && [ -d "$target" ] && [ ! -L "$target" ]; then
+		owned_regular "$STATE/previous/old.id" && previous_id=$(cat "$STATE/previous/old.id") &&
+			prepare_indexed_media "$target" "$work" new "$previous_id" || fail '不能验证缓存的官方签名旧 APK'
+	else
+		safe_input "$target" && cp "$target" "$work/new.apk" && read_apk "$work/new.apk" "$work/new" "$source" ||
+			fail '目标 APK 固定来源、版本或安全准入不匹配'
+	fi
+	if [ -d "$old" ] && [ ! -L "$old" ]; then
+		current_id=$(installed_id) && prepare_indexed_media "$old" "$work" old "$current_id" ||
+			fail '旧 APK 或签名索引无效，无法证明只用本地媒体恢复'
+	else
+		safe_input "$old" && cp "$old" "$work/old.apk" && read_apk "$work/old.apk" "$work/old" current ||
+			fail '缺少可证明为当前安装制品且可离线执行的旧 APK'
+	fi
+	[ "$(cat "$work/new.id")" != "$(cat "$work/old.id")" ] || fail '该 APK 已经安装'
+}
+
+copy_media() {
+	local source=$1 destination=$2 slot
+	for slot in old new; do
+		if [ -d "$source/$slot-repo" ]; then cp -R "$source/$slot-repo" "$destination/" || return 1
+		else cp "$source/$slot.apk" "$destination/" || return 1; fi
+	done
+}
+
+case "$operation:$#" in
+	package-check:3|package-switch:3)
+		source=$1; target=$2; old=$3
+		source_pin "$source" || fail '来源必须为 official 或 fork' ;;
+	package-rollback:0)
+		source=current; target="$STATE/previous/old.apk"; old="$STATE/previous/new.apk"
+		[ ! -d "$STATE/previous/old-repo" ] || target="$STATE/previous/old-repo"
+		[ ! -d "$STATE/previous/new-repo" ] || old="$STATE/previous/new-repo" ;;
+	package-recover:0|package-recover-early:0)
+		rp_smartdns_package_pending || exit 0
+		rp_writer_enter smartdns-package quarantine || fail '写锁忙，SmartDNS 恢复稍后重试'
+		recover_transaction || fail '旧 APK、配置或 DNS 尚未完全恢复；保留持久日志'
+		rp_output_ok "smartdns-$operation" 'SmartDNS 未完成的包事务已收敛'
+		exit 0 ;;
+	*) fail '参数不合法' ;;
+esac
+
+[ "$(id -u)" = 0 ] && [ "$(APK_CONFIG=/dev/null apk --print-arch)" = x86_64 ] || fail '需要 root 和 OpenWrt x86_64 APK'
+[ ! -L "$RP_RUN_DIR" ] && mkdir -p "$RP_RUN_DIR" || fail '临时目录不安全'
+work=$(mktemp -d "$RP_RUN_DIR/smartdns-package.XXXXXX") || fail '无法创建私有暂存目录'
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+prepare_media "$source" "$target" "$old" "$work"
+
+rp_writer_enter smartdns-package || fail '写锁忙或存在未完成的配置事务'
+[ "$(installed_id)" = "$(cat "$work/old.id")" ] && native_payload_matches "$work/old.files" && native_elf_x86_64 || fail '当前安装包身份、原生文件或 ELF 架构与旧 APK 不一致'
+target_paths_admit "$work" || fail '目标 APK 包含与现有程序不同归属的文件或不安全路径'
+no_pending_config && role=$(admit_services) || fail '存在暂存配置，或 DNS 服务状态不允许安全切换'
+if [ -f "$work/new.apk" ]; then
+	package_plan "$work/new.plan" "$work/new.apk" "$(cut -f 1 "$work/new.id")" || fail '离线 APK 求解无法证明仅替换 SmartDNS'
+else
+	version=$(cut -f 1 "$work/new.id")
+	indexed_add_plan "$work/new-repositories" "smartdns=$version" "$version" "$work/new.plan" ||
+		fail '签名索引离线求解无法证明仅替换 SmartDNS'
+fi
+if [ "$operation" = package-check ]; then
+	rp_output_ok smartdns-package-check 'APK、旧包、当前 DNS 与离线求解均满足切换预检'
+	exit 0
+fi
+
+owned_parents "$STATE/current" && mkdir -p "$STATE" && chmod 700 "$STATE" || fail '包事务持久目录不安全'
+cleanup_staging || fail '未发布暂存目录不安全或仍存在待恢复事务；保留现场'
+staged=$(mktemp -d "$STATE/.stage.XXXXXX") || fail '无法暂存包事务'
+trap 'rm -rf "$work" "$staged"' EXIT
+cp "$work/old.id" "$work/new.id" "$work/old.files" "$work/new.files" "$work/old.source" "$work/new.source" "$staged/" &&
+	copy_media "$work" "$staged" &&
+	snapshot_config "$staged" && save_dnsmasq >"$staged/dnsmasq" && world_others >"$staged/world" && original_selectors >"$staged/smartdns-selector" &&
+	cat "$RP_ROOT/proc/sys/kernel/random/boot_id" >"$staged/boot-id" && printf '%s\n' "$role" >"$staged/role" &&
+	printf 'prepared\n' >"$staged/phase" || fail '暂存原配置及可执行旧 APK 失败'
+recovery_space_available "$work" "$staged" || fail '持久空间不足或无法核实：必须容纳已验证 APK 的解包、缓存和恢复写入'
+sync && mv "$staged" "$JOURNAL" && sync || fail '持久保存原配置及可执行旧 APK 失败'
+ensure_guards || {
+	finish_transaction prepared || fail '守卫未就绪且无法清理预写记录；尚未停止 DNS'
+	fail '无法证明启动恢复守卫已就绪；原 DNS 继续运行'
+}
+publish_phase armed || fail '无法记录可恢复状态；原 DNS 继续运行'
+if ! switch_package "$role"; then
+	if recover_transaction; then fail '目标包切换失败；已恢复旧 APK、配置和 DNS'; fi
+	fail '目标包切换失败且旧 DNS 恢复未核实；已保留恢复日志'
+fi
+publish_phase committed && finish_transaction committed || fail '新 DNS 已验证，尚未完成事务收尾，请执行 smartdns-package-recover'
+rm -f "$RP_RUN_DIR/smartdns-package.cache"
+rp_output_ok "smartdns-$operation" '已切换并验证 SmartDNS，旧 APK 已保留供显式回退'

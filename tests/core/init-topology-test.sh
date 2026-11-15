@@ -152,10 +152,11 @@ cat >"$tmp/bin/fw4" <<'EOF'
 EOF
 cat >"$tmp/bin/netstat" <<'EOF'
 #!/bin/sh
-[ "$*" = -lnptu ] || exit 1
+case "$*" in -lntu|-lnptu) ;; *) exit 1 ;; esac
+process=''; [ "$*" != -lnptu ] || process=' 122/dnsmasq'
 [ "${TEST_NO_DNS:-0}" = 0 ] || exit 0
 if [ "${TEST_DNS_LISTENERS+x}" = x ]; then printf '%s\n' "$TEST_DNS_LISTENERS"
-else printf '%s\n' 'udp 0 0 0.0.0.0:53 0.0.0.0:* 122/dnsmasq' 'tcp 0 0 0.0.0.0:53 0.0.0.0:* LISTEN 122/dnsmasq'; fi
+else printf '%s\n' "udp 0 0 0.0.0.0:53 0.0.0.0:*$process" "tcp 0 0 0.0.0.0:53 0.0.0.0:* LISTEN$process"; fi
 EOF
 cat >"$tmp/bin/arping" <<'EOF'
 #!/bin/sh

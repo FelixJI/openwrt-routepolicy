@@ -10,6 +10,9 @@ Usage: routepolicyctl {validate|render|apply|reload|status|diagnose|update|rollb
        routepolicyctl import-legacy DIRECTORY [--json]
        routepolicyctl user-list {read|write} {domain-policy|domain-default|ipv4-policy|ipv4-default} [--json]
        routepolicyctl smartdns-{status|save|validate|apply|discard|read-local-hosts|write-local-hosts} [--json]
+       routepolicyctl smartdns-package-check {official|fork} TARGET.apk CURRENT_MEDIA
+       routepolicyctl smartdns-package-switch {official|fork} TARGET.apk CURRENT_MEDIA
+       routepolicyctl smartdns-package-{rollback|recover}
        routepolicyctl init-{discover|status|recover} [--json]
        routepolicyctl init-{preview|prepare} ACCESS DEFAULT POLICY NEW_ROLE NEW_DEVICE NEW_PROTO NEW_IP NEW_PREFIX NEW_GATEWAY MANAGEMENT_IP MANAGEMENT_PREFIX [DEFAULT_DNS POLICY_DNS]
        routepolicyctl init-{apply|confirm|cancel} TOKEN
@@ -126,6 +129,9 @@ case "$command_name" in
 			usage
 		fi
 		exec "$LIBEXEC/smartdns-control" "${command_name#smartdns-}"
+		;;
+	smartdns-package-check|smartdns-package-switch|smartdns-package-rollback|smartdns-package-recover)
+		exec "$LIBEXEC/smartdns-package" "${command_name#smartdns-}" "$@"
 		;;
 	*) usage ;;
 esac
