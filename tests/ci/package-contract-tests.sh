@@ -17,15 +17,20 @@ fail() {
 
 grep -q '^PKG_NAME:=routepolicy$' routepolicy/Makefile || fail '核心包名不正确'
 grep -q '^PKG_NAME:=luci-app-routepolicy$' luci-app-routepolicy/Makefile || fail 'LuCI 包名不正确'
-grep -q '^PKG_VERSION:=0.3.3$' routepolicy/Makefile || fail '核心包版本未升级到 0.3.3 修复版本'
-grep -q '^PKG_VERSION:=0.3.3$' luci-app-routepolicy/Makefile || fail 'LuCI 包版本未同步到 0.3.3 修复版本'
-grep -q '^PKG_RELEASE:=2$' routepolicy/Makefile || fail '生命周期修复包 release 必须为 2'
-grep -q '^PKG_RELEASE:=2$' luci-app-routepolicy/Makefile || fail 'LuCI 包 release 必须与核心同步为 2'
+core_version=$(sed -n 's/^PKG_VERSION:=//p' routepolicy/Makefile)
+luci_version=$(sed -n 's/^PKG_VERSION:=//p' luci-app-routepolicy/Makefile)
+printf '%s\n' "$core_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || fail '核心包版本必须为 X.Y.Z'
+[ "$core_version" = "$luci_version" ] || fail '两包版本必须一致'
+core_release=$(sed -n 's/^PKG_RELEASE:=//p' routepolicy/Makefile)
+luci_release=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-routepolicy/Makefile)
+printf '%s\n' "$core_release" | grep -Eq '^[1-9][0-9]*$' || fail '包发布序号必须为正整数'
+[ "$core_release" = "$luci_release" ] || fail '两包发布序号必须一致'
 grep -q "^config main 'main'$" routepolicy/files/etc/config/routepolicy || fail '缺少 main 配置段'
 grep -q "^[[:space:]]*option enabled '0'$" routepolicy/files/etc/config/routepolicy || fail '安装默认必须禁用'
 rpcd_plugin=luci-app-routepolicy/root/usr/share/rpcd/ucode/routepolicy
 [ -f "$rpcd_plugin" ] || fail 'rpcd ucode 插件未安装到正式扫描目录'
 [ ! -e luci-app-routepolicy/root/usr/libexec/rpcd/routepolicy ] || fail '包中仍保留错误的 exec 插件路径'
+grep -Fq '+kmod-nft-nat' routepolicy/Makefile || fail '核心包缺少 DNS redirect 内核依赖'
 grep -Fq '+rpcd-mod-ucode' luci-app-routepolicy/Makefile || fail 'LuCI 包缺少 rpcd ucode loader 依赖'
 grep -Fq 'define Package/$(PKG_NAME)/postinst' luci-app-routepolicy/Makefile || fail 'LuCI 包缺少显式安装生命周期'
 grep -Fq 'if ! /etc/init.d/rpcd restart; then' luci-app-routepolicy/Makefile || fail 'rpcd 重启失败必须立即终止安装脚本'
@@ -93,12 +98,17 @@ grep -Fq '+ucode' routepolicy/Makefile || fail '核心包必须显式依赖 ucod
 [ -f tests/ci/install-media-fixtures/core-adbdump.txt ] || fail '缺少真实 ADB 元数据测试夹具'
 grep -Fq 'arch: noarch' tests/ci/install-media-fixtures/luci-adbdump.txt || fail 'LuCI 夹具必须反映真实 noarch 架构'
 grep -Fq 'sh install.sh --allow-local-unsigned' README.md || fail 'README 安装流程必须使用介质单入口'
-grep -Fq 'sha256sum -c SHA256SUMS' luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status.js || fail '升级命令必须先校验介质'
+grep -Fq 'sha256sum -c SHA256SUMS' luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status-v2.js || fail '升级命令必须先校验介质'
 grep -Fq 'APK_CONFIG=/dev/null' scripts/install.sh || fail 'apk 调用必须命令级隔离 APK_CONFIG'
 grep -Fq 'distfeeds.list' scripts/install.sh || fail '阶段一官方源必须取自实际 distfeeds 文件'
 grep -Fq 'list --manifest --installed' scripts/install.sh || fail 'world 比较必须使用原生 manifest 精确 name/version'
 grep -Fq 'downloads.openwrt.org/releases' scripts/install.sh || fail '阶段一必须限定当前官方 distfeeds'
-grep -Fq 'routepolicyctl diagnose' luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status.js && fail '升级命令不得保留重复的 diagnose 行'
+grep -Fq 'routepolicyctl diagnose' luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status-v2.js && fail '升级命令不得保留重复的 diagnose 行'
 sh tests/ci/install-media-tests.sh || fail '离线安装介质功能契约测试失败'
+
+
+[ -f luci-app-routepolicy/htdocs/luci-static/resources/view/routepolicy/status-v2.js ] || fail '缺少新状态页资源'
+grep -Fq '"path": "routepolicy/status-v2"' luci-app-routepolicy/root/usr/share/luci/menu.d/luci-app-routepolicy.json || fail '菜单未使用新状态页'
+grep -Fq 'nft list chain inet routepolicy dns_prerouting' routepolicy/files/usr/libexec/routepolicy/diagnose || fail '诊断必须检查 DNS NAT 链'
 
 printf '%s\n' '软件包安全契约测试通过。'

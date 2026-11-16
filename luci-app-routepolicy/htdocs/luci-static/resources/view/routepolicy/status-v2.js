@@ -117,7 +117,6 @@ return view.extend({
 				: _('停用会删除 RoutePolicy 自有的 nftables 表、策略路由和 SmartDNS 片段。继续吗？');
 			return E('button', {
 				'class': 'cbi-button ' + (enabled ? 'cbi-button-positive important' : 'cbi-button-negative'),
-				'disabled': service.enabled === enabled ? '' : null,
 				'click': ui.createHandlerFn(self, function() {
 					if (!window.confirm(confirmation)) return Promise.resolve();
 					showPending(label);
