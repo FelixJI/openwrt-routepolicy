@@ -1,5 +1,7 @@
 # OpenWrt RoutePolicy 详细实施计划
 
+> 当前操作请使用 [操作手册](OPERATIONS.md)，发布使用 [发版手册](RELEASE.md)。下文状态与步骤保留历史语境，不代表当前实现。
+
 > 历史设计。首次配置和旁路由初始化的现行范围见 [Goal #16](https://github.com/FelixJI/openwrt-routepolicy/issues/16)。
 > 公开仓库建议名：`openwrt-routepolicy`。
 > 许可证：MIT。
