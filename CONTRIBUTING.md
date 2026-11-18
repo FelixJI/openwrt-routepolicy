@@ -9,9 +9,19 @@
 ```sh
 sh tests/ci/static-checks.sh
 sh tests/ci/validate-workflows.sh
+sh tests/ci/package-contract-tests.sh
+python3 -B tests/ci/release-version-test.py
 ```
 
 涉及包行为的修改还应在 OpenWrt 25.12 x86_64 SDK 中构建两个包。不要提交 SDK、APK、用户配置、实际上游 DNS、真实清单 URL、令牌、日志或设备地址。
+
+涉及核心运行时，执行 `sh tests/converters/run.sh` 和 `sh tests/core/run.sh`；涉及 LuCI，执行 `pwsh -File tests/luci/check-static.ps1`。Windows 可用 Git Bash 执行 shell 测试。YAML 解析需要 Ruby；缺工具时应明确记录未验证，不把跳过当成通过。真实 nft 内核、SDK 和 OpenWrt 生命周期验证见 [隔离实验室](tests/integration/openwrt-lab.md)。
+
+## 发版与文档
+
+正式发布按 [发版手册](RELEASE.md) 在默认分支选择 patch/minor/major。无需在日常改动中手动升版本；两个包版本必须一致，发布提交统一设置版本与 release 序号。既有测试中的固定旧版本夹具用于兼容性与降级场景，不随新版本机械替换。
+
+用户行为变化同时更新 [README](README.md)、[操作手册](OPERATIONS.md) 及相关 Release 安装说明。历史实施计划保持明确标识，不用旧计划中的“待实施”推断当前能力。
 
 ## 代码与安全约束
 

@@ -13,7 +13,7 @@ define Package/routepolicy
   CATEGORY:=Network
   TITLE:=Policy routing with nftables and SmartDNS
   URL:=https://github.com/FelixJI/openwrt-routepolicy
-  DEPENDS:=+nftables +ip-full +curl +ca-bundle +jsonfilter +ubus +uci +ucode +smartdns +bind-dig +flock +coreutils-timeout +iputils-arping
+  DEPENDS:=+nftables +kmod-nft-nat +ip-full +curl +ca-bundle +jsonfilter +ubus +uci +ucode +smartdns +bind-dig +flock +coreutils-timeout +iputils-arping
 endef
 
 define Package/routepolicy/description

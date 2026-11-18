@@ -2,6 +2,17 @@
 
 为 OpenWrt 提供独立的策略分流核心包 `routepolicy` 与 LuCI 管理包 `luci-app-routepolicy`。它以 UCI 配置生成自己的 nftables 表、策略路由和 SmartDNS 附加片段，并将默认路径与策略路径分开管理。
 
+## 文档入口与当前能力
+
+当前源码包含完整安装介质入口、初始化与恢复向导、SmartDNS 管理、声明备份与固件恢复、受管退出和卸载，以及本机 IPv4 分流与有界流量观测。默认分支可能领先已发布 APK；请按实际安装版本和对应 Release 说明操作。
+
+- [操作手册](OPERATIONS.md)：安装、首次配置、日常检查、恢复与卸载。
+- [发版手册](RELEASE.md)：Actions 选择 patch/minor/major 自动计算版本，或发布已有 tag。
+- [贡献指南](CONTRIBUTING.md)：本地检查、SDK 构建与隔离验证。
+- [领域术语](CONTEXT.md)：接口、策略标记与观测口径。
+
+仓库内两份实施计划是历史设计，不是当前操作指令；配置所有权与安全边界以本文、操作手册和当前代码为准。
+
 ## 支持范围
 
 当前发布物**只面向 OpenWrt 25.12 x86_64**。请勿在其它 OpenWrt 版本、架构或衍生发行版上安装；这些组合未经过构建或运行验证。
@@ -35,11 +46,11 @@
 
    `install.sh` 会先核对介质与系统（仅 OpenWrt 25.12 x86_64，拒绝缺失、损坏、重复或版本混杂），再以官方源签名安装缺失依赖（已满足依赖的既有版本与来源一律保留）、离线安装本地双包；`--allow-local-unsigned` 是对安装本仓库未签名 Release APK 的显式确认。脚本不下载并执行远程脚本、不修改网络配置、不批量升级。成功后脚本执行 `ubus list | grep -qx routepolicy` 与 `ubus call routepolicy status '{}'`（应包含 `"ok": true`）、按 manifest 精确核对双包落地，并提示 LuCI 地址；`routepolicyctl validate` 仅在已启用实例上执行，未初始化设备会得到待向导配置提示。LuCI 包脚本已同步重启 rpcd；若对象检查仍失败，不要重复安装或启用 RoutePolicy，请先运行 `logread | grep -Ei 'rpcd|ucode|routepolicy' | tail -n 100` 保存插件加载错误。apk 失败可能留下部分安装，请按 `INSTALL.txt` 核对现场。使用第三方软件源或 vendor world 与官方源不一致的设备，依赖阶段可能被 apk 原生拒绝；本入口不使用 --force-broken-world，请先恢复与官方源一致的环境。
 
-4. 新装设备在 LuCI“服务 → 路由策略”中打开配置与恢复向导，选择接口、DNS 和规则，核对预览后明确应用。已有用户仍可使用原有页面，不必重新初始化。
+4. 新装设备在 LuCI“服务 → 路由策略”中打开初始化与恢复向导，选择接口、DNS 和规则，核对预览后明确应用。已有用户仍可使用原有页面，不必重新初始化。
 
 依赖由 OpenWrt 软件包仓库解析；离线安装前请确保设备已具备发布说明所列依赖。`--allow-untrusted` 仅适用于直接安装本项目未签名的 release APK，请只从本仓库 Release 获取文件。
 
-### 配置与恢复向导
+### 初始化与恢复向导
 
 请从预览开始安排一次单人维护。初始化期间，请暂停自动改配置的脚本，也不要在其他页面或 SSH 中保存网络、DHCP、防火墙、RoutePolicy 或 SmartDNS 设置。等到确认成功或回滚完成后再修改；即使改的是不同选项，同时保存也可能丢失修改。已有暂存和可检测的配置变化仍会触发冲突检查。
 
@@ -111,7 +122,7 @@ ubus list | grep -qx routepolicy
 ubus call routepolicy status '{}'
 ```
 
-该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，任一附件缺失或 `SHA256SUMS` 校验失败都会在安装前停止；`install.sh` 阶段一失败时同样不会触碰已安装包。`install.sh` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器。基础设置页使用新的静态资源 generation，避免继续命中旧版 `form.NetworkSelect` 页面；已打开的旧标签页仍需重新载入一次菜单。
+该命令依赖 OpenWrt 自带的 `wget` 和 `jsonfilter`，任一附件缺失或 `SHA256SUMS` 校验失败都会在安装前停止；`install.sh` 阶段一失败时不会进入本地应用双包安装，但可能已安装部分缺失依赖。`install.sh` 精确更新这两个本地包，不要使用 `apk upgrade` 批量升级设备上的全部软件包。升级后无需重启路由器。基础设置页和运行状态页使用各自的新静态资源路径，避免升级后继续加载旧表单或按钮逻辑；已打开的旧标签页仍需重新载入一次菜单。
 
 升级失败时保留配置和完整介质，先用 `apk info -v routepolicy luci-app-routepolicy`、`logread | tail -n 100` 核对现场。排除缺包、存储或配置冲突后，使用同版本或更新的兼容完整介质重新执行 `sh install.sh --allow-local-unsigned`，再核对上述 RPC 检查及实际分流。安装器拒绝降级与未提交的 RoutePolicy 配置，不自动回退。确需退回旧环境时，只使用升级前已验证的完整系统备份或虚拟机快照，同时恢复相匹配的程序和配置；单独强装旧 APK 不受支持。
 
@@ -119,7 +130,7 @@ ubus call routepolicy status '{}'
 
 ### 声明备份与固件升级后恢复
 
-本轮核心与 LuCI 包均为 `0.3.3-r2`。从旧 `0.3.3-r1` 升级时，先使用旧程序显式停止分流，再安装 r2 并重建。缺少当前 boot 授权的旧回执不能认领同名运行对象；遇到对象时新程序保留并拒绝操作，不能用强制重装冒充版本升级。
+从旧 `0.3.3-r1` 升级到包含本节恢复机制的版本时，先使用旧程序显式停止分流，再使用完整介质升级并重新应用。缺少当前 boot 授权的旧回执不能认领同名运行对象；遇到对象时新程序保留并拒绝操作，不能用强制重装冒充版本升级。
 
 `routepolicyctl migrate --json` 校验兼容的 v0.3.3 配置并登记 schema 1、迁移确认记录目录；它不接管或重启网络。新程序拒绝更高的配置 schema。受支持的包迁移入口为 `printf '目标APK版本\t1\n' | routepolicyctl package-check --json`：不支持的 schema 或较旧版本会实际拒绝。该准入不能阻止管理员绕过入口、用原生 APK 强装不认识新 schema 的旧程序；这种降级不受支持。
 
@@ -179,6 +190,10 @@ routepolicyctl restore-status --json
 预检通过后只安装应用自己的声明，网络仍待确认；保存返回的 token，按 `init-apply TOKEN` → 连接目标管理地址 → `init-confirm TOKEN` 完成现有事务。声明六个固定文件有同一共享写锁下的写前记录；安装、预检、下载或确认失败时先检查 `init-status`／`restore-status`。若网络仍为未应用的 `prepared`，用 `init-cancel TOKEN` 取消该候选，再用 `restore-recover` 恢复声明；取消会核对当前 token，不会回滚已应用的网络。已应用或冲突中的网络事务用 `init-recover` 收敛，再用 `restore-recover` 逐文件恢复旧应用声明。外部已改的值不会被覆盖。
 
 恢复 RPC 与向导使用同一候选、应用和状态合同，确认传输为 `confirmation_transport=trusted-luci-or-ssh`。浏览器通过专用 LuCI POST 入口确认，要求已登录、具备 RoutePolicy 写权限、防伪标记有效，并由服务器核实实际连接地址就是候选管理地址；不信任浏览器自报地址、Host 或转发头。通用 `init_confirm` RPC 仍拒绝确认，不能用它伪造可信连接。原有 LAN SSH 的 `init-confirm` 方式继续可用。
+
+### DNS 重定向与失败重试
+
+LAN IPv4 DNS redirect 使用独立的 `dns_prerouting` NAT 链，核心包显式依赖 `kmod-nft-nat`。诊断按该链检查 DNS 重定向。旧拓扑升级使用现有规则重建流程，保留动态业务集合；不再把 redirect 放进 filter 链。运行状态页的“启用并应用”支持失败后重试，即使 UCI 已是启用状态。
 
 ## SmartDNS 管理
 

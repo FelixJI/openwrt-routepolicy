@@ -357,6 +357,15 @@ async function statusEnableSuccessContract(filename) {
 		'successful RoutePolicy lifecycle must refresh the visible runtime status');
 }
 
+function statusFailedApplyRetryContract(filename) {
+	const harness = createViewHarness();
+	const page = loadSource(filename, harness.dependencies, harness.globals);
+	const root = page.render({ service: { enabled: true, applied: false, running: false } });
+	const enable = findAll(root, node => node.tagName === 'button' && nodeText(node) === '启用并应用')[0];
+	assert.ok(enable && enable.listeners.click);
+	assert.strictEqual(enable.getAttribute('disabled'), null, 'failed apply must allow retry');
+}
+
 async function manualRuleFeedbackContract(filename) {
 	const harness = createViewHarness({ api: {
 		readUserList: function() { return Promise.resolve({ ok: true, content: '' }); },
@@ -449,19 +458,21 @@ async function main() {
 		'luci-app-routepolicy/root/usr/share/luci/menu.d/luci-app-routepolicy.json'
 	), 'utf8'));
 	const settingsView = menu['admin/services/routepolicy/settings'].action.path.split('/').pop() + '.js';
+	const statusView = menu['admin/services/routepolicy/status'].action.path.split('/').pop() + '.js';
 	const checks = [
 		[ 'RPC error visibility', function() { return loadApi(path.join(repo, 'luci-app-routepolicy/htdocs/luci-static/resources/routepolicy/api.js')); } ],
 		[ 'settings Save & Apply', function() { return formApplyContract(path.join(viewDir, settingsView)); } ],
 		[ 'sources Save & Apply', function() { return formApplyContract(path.join(viewDir, 'sources.js')); } ],
 		[ 'source names and migration', function() { return sourceSaveContract(path.join(viewDir, 'sources.js')); } ],
 		[ 'source save retries after a failed read', function() { return sourceSaveReadRetryContract(path.join(viewDir, 'sources.js')); } ],
-		[ 'status controls', function() { return statusContract(path.join(viewDir, 'status.js')); } ],
-		[ 'status enable failure feedback', function() { return statusEnableFailureContract(path.join(viewDir, 'status.js')); } ],
-		[ 'status enable success refresh', function() { return statusEnableSuccessContract(path.join(viewDir, 'status.js')); } ],
+		[ 'status failed apply retry', function() { return statusFailedApplyRetryContract(path.join(viewDir, statusView)); } ],
+		[ 'status controls', function() { return statusContract(path.join(viewDir, statusView)); } ],
+		[ 'status enable failure feedback', function() { return statusEnableFailureContract(path.join(viewDir, statusView)); } ],
+		[ 'status enable success refresh', function() { return statusEnableSuccessContract(path.join(viewDir, statusView)); } ],
 		[ 'manual rule feedback', function() { return manualRuleFeedbackContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'manual rule reserved IPv4', function() { return manualRuleReservedIpv4Contract(path.join(viewDir, 'rules.js')); } ],
 		[ 'manual rule domain length', function() { return manualRuleDomainLengthContract(path.join(viewDir, 'rules.js')); } ],
-		[ 'status phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'status.js')); } ],
+		[ 'status phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, statusView)); } ],
 		[ 'observability phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'observability.js')); } ],
 		[ 'rules phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'rules.js')); } ],
 		[ 'diagnostics phantom footer', function() { return noPhantomFormFooterContract(path.join(viewDir, 'diagnostics.js')); } ]
